@@ -255,10 +255,12 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                 print(f"Epoch {epoch+1:3d}/{config['num_epochs']}, "
                       f"Batch {batch_idx+1:3d}/{len(train_data)}, "
                       f"Loss: {loss.item():.4f}, "
-                      f"Ligand: {metrics['loss_ligand']:.4f}, "
-                      f"Pocket: {metrics['loss_pocket']:.4f}, "
-                      f"Sigma: {metrics['avg_sigma']:.3f}, "
-                      f"Scale: {metrics['avg_scale']:.3f}")
+                      f"Coord: {metrics['coord_loss']:.4f} "
+                      f"(L:{metrics['coord_loss_ligand']:.4f}, P:{metrics['coord_loss_pocket']:.4f}), "
+                      f"Cat: {metrics['categorical_loss']:.4f} "
+                      f"(L:{metrics['categorical_loss_ligand']:.4f}, P:{metrics['categorical_loss_pocket']:.4f}), "
+                      f"σ: {metrics['avg_sigma']:.3f}, "
+                      f"s: {metrics['avg_scale']:.3f}")
         
         scheduler.step()
         
