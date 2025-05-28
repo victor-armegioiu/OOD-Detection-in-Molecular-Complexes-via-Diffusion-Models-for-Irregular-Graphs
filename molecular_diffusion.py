@@ -1,12 +1,11 @@
 """
-Molecular Diffusion Schemes and Training
-
-Implements the same diffusion logic as the base framework but natively for molecular systems.
-All operations are CUDA-optimized with proper noise schedules, sampling, and weighting.
+Molecular diffusion pipeline (i'm basing this on GenCFD).
+of course with a categorical loss on top.
 """
 
 import dataclasses
 import torch
+import torch.nn.functional as F
 import numpy as np
 from typing import Callable, Tuple, Optional, Protocol
 from torch_scatter import scatter_mean
@@ -29,12 +28,12 @@ def remove_mean_batch(x: Tensor, indices: Tensor) -> Tensor:
 
 
 # ********************
-# Molecular Invertible Schedules
+# Molecular Invertible Schedules (same as before)
 # ********************
 
 @dataclasses.dataclass(frozen=True)
 class MolecularInvertibleSchedule:
-    """Molecular version of InvertibleSchedule - same logic, molecular-native"""
+    """Molecular version of InvertibleSchedule"""
     
     forward: ScheduleFn
     inverse: ScheduleFn
@@ -54,10 +53,6 @@ def _molecular_linear_rescale(in_min: float, in_max: float, out_min: float, out_
     inv = lambda y: in_min + (y - out_min) / out_range * in_range
     return MolecularInvertibleSchedule(fwd, inv, device='cuda')
 
-
-# ********************
-# Molecular Noise Schedulers 
-# ********************
 
 def molecular_exponential_noise_schedule(
     clip_max: float = 80.0,
@@ -94,47 +89,15 @@ def molecular_exponential_noise_schedule(
     return MolecularInvertibleSchedule(sigma, inverse, device='cuda')
 
 
-def molecular_power_noise_schedule(
-    clip_max: float = 80.0,
-    p: float = 1.0,
-    start: float = 0.0,
-    end: float = 1.0,
-) -> MolecularInvertibleSchedule:
-    
-    if not (0 <= start < end and p > 0):
-        raise ValueError("Must have `p` > 0 and 0 <= `start` < `end`.")
-
-    in_rescale = _molecular_linear_rescale(
-        in_min=MIN_DIFFUSION_TIME, in_max=MAX_DIFFUSION_TIME, out_min=start, out_max=end
-    )
-    out_rescale = _molecular_linear_rescale(
-        in_min=start**p, in_max=end**p, out_min=0.0, out_max=clip_max
-    )
-
-    def sigma(t):
-        t_tensor = torch.as_tensor(t, device='cuda', dtype=torch.float32)
-        return out_rescale(torch.pow(in_rescale(t_tensor), p))
-    
-    def inverse(y):
-        y_tensor = torch.as_tensor(y, device='cuda', dtype=torch.float32)
-        return in_rescale.inverse(torch.pow(out_rescale.inverse(y_tensor), 1 / p))
-
-    return MolecularInvertibleSchedule(sigma, inverse, device='cuda')
-
-
 # ********************
-# Molecular Diffusion Scheme
+# Diffusion Scheme
 # ********************
 
 @dataclasses.dataclass(frozen=True)
 class MolecularDiffusion:
     """
-    Molecular diffusion scheme.
-    
-    Handles the molecular perturbation kernel:
-    p(lig_t, pocket_t | lig_0, pocket_0) = N(molecular_t; s_t * molecular_0, s_t * σ_t * I)
-    
-    With molecular-specific normalization for coordinates and categorical features.
+    Still uses continuous diffusion for both coordinates and features during forward process,
+    but applies appropriate loss functions during training.
     """
     
     scale: ScheduleFn
@@ -144,6 +107,11 @@ class MolecularDiffusion:
     coord_norm: float = 1.0
     feature_norm: float = 1.0
     feature_bias: float = 0.0
+    
+    # Categorical handling parameters
+    categorical_temperature: float = 1.0  # Temperature for softmax
+    categorical_loss_type: str = 'cross_entropy'  # 'cross_entropy' or 'gaussian_cdf'
+    
     device: str = 'cuda'
     
     @property
@@ -158,12 +126,12 @@ class MolecularDiffusion:
         ligand_coords_norm = ligand_coords / self.coord_norm
         pocket_coords_norm = pocket_coords / self.coord_norm
         
-        # Normalize categorical features (one-hot -> continuous)
+        # Normalize categorical features (one-hot -> continuous centered around 0)
         ligand_features_norm = (ligand_features.float() - self.feature_bias) / self.feature_norm
         pocket_features_norm = (pocket_features.float() - self.feature_bias) / self.feature_norm
         
         return ligand_coords_norm, ligand_features_norm, pocket_coords_norm, pocket_features_norm
-    
+
     def unnormalize_molecular_data(self, ligand_coords: Tensor, ligand_features: Tensor,
                                   pocket_coords: Tensor, pocket_features: Tensor,
                                   discretize_features: bool = False, 
@@ -187,6 +155,64 @@ class MolecularDiffusion:
             ).float()
         
         return ligand_coords_unnorm, ligand_features_unnorm, pocket_coords_unnorm, pocket_features_unnorm
+    
+    def compute_categorical_loss(self, 
+                                pred_features: Tensor, 
+                                clean_features_onehot: Tensor,
+                                sigma: Tensor,
+                                mask: Tensor) -> Tensor:
+        """
+        Compute appropriate loss for categorical features.
+        
+        Args:
+            pred_features: Predicted noise for features [N, num_categories]
+            clean_features_onehot: Original clean one-hot features [N, num_categories]
+            sigma: Noise level [batch_size] 
+            mask: Batch mask [N]
+        
+        Returns:
+            Categorical loss
+        """
+        
+        if self.categorical_loss_type == 'cross_entropy':
+            # Method 1: Cross-entropy loss
+            # Convert predictions to logits and apply cross-entropy
+            pred_logits = pred_features / self.categorical_temperature
+            true_categories = torch.argmax(clean_features_onehot, dim=-1)
+            
+            # Apply cross-entropy loss
+            ce_loss = F.cross_entropy(pred_logits, true_categories, reduction='none')
+            
+            # Weight by noise level (higher noise -> lower weight)
+            sigma_weights = sigma[mask]
+            weighted_loss = ce_loss / (sigma_weights + 1e-8)
+            
+            return weighted_loss.mean()
+            
+        elif self.categorical_loss_type == 'gaussian_cdf':
+            # Method 2: Gaussian CDF integration (similar to original implementation)
+            sigma_cat = sigma[mask].unsqueeze(1) * self.feature_norm  # [N, 1]
+            
+            # Center predictions around integer values
+            pred_centered = pred_features - 1.0  # Assuming one-hot is normalized to 1
+            
+            # Compute CDF probabilities for each category
+            cdf_upper = 0.5 * (1 + torch.erf((pred_centered + 0.5) / (sigma_cat * np.sqrt(2))))
+            cdf_lower = 0.5 * (1 + torch.erf((pred_centered - 0.5) / (sigma_cat * np.sqrt(2))))
+            
+            # Probability of each category
+            cat_probs = torch.clamp(cdf_upper - cdf_lower, min=1e-10)
+            
+            # Normalize to valid probability distribution
+            cat_probs = cat_probs / (cat_probs.sum(dim=-1, keepdim=True) + 1e-10)
+            
+            # Compute negative log-likelihood
+            nll = -torch.sum(clean_features_onehot * torch.log(cat_probs + 1e-10), dim=-1)
+            
+            return nll.mean()
+        
+        else:
+            raise ValueError(f"Unknown categorical loss type: {self.categorical_loss_type}")
 
     @classmethod
     def create_variance_exploding(
@@ -195,6 +221,8 @@ class MolecularDiffusion:
         coord_norm: float = 1.0,
         feature_norm: float = 1.0,
         feature_bias: float = 0.0,
+        categorical_temperature: float = 1.0,
+        categorical_loss_type: str = 'cross_entropy',
     ) -> 'MolecularDiffusion':
         """Create variance exploding scheme"""
         
@@ -207,16 +235,17 @@ class MolecularDiffusion:
             coord_norm=coord_norm,
             feature_norm=feature_norm,
             feature_bias=feature_bias,
+            categorical_temperature=categorical_temperature,
+            categorical_loss_type=categorical_loss_type,
             device='cuda'
         )
 
 
 # ********************
-# Molecular Noise Sampling
+# Noise Sampling and Weighting (same as before)
 # ********************
 
 class MolecularNoiseLevelSampling(Protocol):
-    """Protocol for molecular noise sampling"""
     def __call__(self, shape: Tuple[int, ...]) -> Tensor: ...
 
 
@@ -244,62 +273,23 @@ def molecular_log_uniform_sampling(
     return _noise_sampling
 
 
-def molecular_time_uniform_sampling(
-    scheme: MolecularDiffusion,
-    clip_min: float = 1e-4,
-    uniform_grid: bool = False,
-) -> MolecularNoiseLevelSampling:
-
-    def _noise_sampling(shape: Tuple[int, ...]) -> Tensor:
-        if uniform_grid:
-            s0 = torch.rand((), dtype=torch.float32, device='cuda')
-            num_elements = int(np.prod(shape))
-            step_size = 1 / num_elements
-            grid = torch.linspace(0, 1 - step_size, num_elements, dtype=torch.float32, device='cuda')
-            samples = torch.remainder(grid + s0, 1).reshape(shape)
-        else:
-            samples = torch.rand(shape, dtype=torch.float32, device='cuda')
-        
-        min_t = scheme.sigma.inverse(clip_min)
-        samples = (MAX_DIFFUSION_TIME - min_t) * samples + min_t
-        return scheme.sigma(samples)
-
-    return _noise_sampling
-
-
-# ********************
-# Molecular Noise Weighting 
-# ********************
-
 class MolecularNoiseLossWeighting(Protocol):
     def __call__(self, sigma: Tensor) -> Tensor: ...
 
 
 def molecular_edm_weighting(data_std: float = 1.0) -> MolecularNoiseLossWeighting:
-
     def _weight_fn(sigma: Tensor) -> Tensor:
         data_std_tensor = torch.tensor(data_std, device=sigma.device, dtype=sigma.dtype)
         return (torch.square(data_std_tensor) + torch.square(sigma)) / torch.square(data_std_tensor * sigma)
-
-    return _weight_fn
-
-
-def molecular_uniform_weighting() -> MolecularNoiseLossWeighting:
-    """Uniform weighting for molecular diffusion"""
-    def _weight_fn(sigma: Tensor) -> Tensor:
-        return torch.ones_like(sigma)
     return _weight_fn
 
 
 # ********************
-# Molecular Training Model
+# Training Model
 # ********************
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class MolecularDenoisingModel:
-    """
-    Molecular denoising model for training.
-    """
     
     # Molecular structure parameters
     atom_nf: int = 10
@@ -313,14 +303,14 @@ class MolecularDenoisingModel:
     edge_embedding_dim: Optional[int] = 8
     update_pocket_coords: bool = True
     
+    # Loss weighting parameters
+    coord_loss_weight: float = 1.0
+    categorical_loss_weight: float = 1.0
+    
     # Diffusion scheme
     scheme: MolecularDiffusion = None
     noise_sampling: MolecularNoiseLevelSampling = None
     noise_weighting: MolecularNoiseLossWeighting = None
-    
-    # Evaluation parameters
-    num_eval_noise_levels: int = 5
-    num_eval_cases_per_lvl: int = 1
     
     def __post_init__(self):
         """Initialize the denoiser and diffusion components"""
@@ -332,7 +322,9 @@ class MolecularDenoisingModel:
                 sigma=sigma_schedule,
                 coord_norm=1.0,
                 feature_norm=1.0,
-                feature_bias=0.0
+                feature_bias=0.0,
+                categorical_temperature=1.0,
+                categorical_loss_type='cross_entropy'  # or 'gaussian_cdf'
             )
             object.__setattr__(self, 'scheme', scheme)
         
@@ -366,9 +358,7 @@ class MolecularDenoisingModel:
         print(f"✅ Initialized MolecularDenoisingModel with {sum(p.numel() for p in self.denoiser.parameters())} parameters")
 
     def loss_fn(self, batch: dict):
-        """
-        Compute molecular denoising loss.
-        
+        """        
         Args:
             batch: Molecular batch with ligand/pocket coords, features, masks
             
@@ -379,12 +369,16 @@ class MolecularDenoisingModel:
         
         # Extract molecular data (all on CUDA)
         lig_coords = batch['ligand_coords'].cuda()
-        lig_features = batch['ligand_features'].cuda()
+        lig_features = batch['ligand_features'].cuda()  # One-hot features
         pocket_coords = batch['pocket_coords'].cuda()
-        pocket_features = batch['pocket_features'].cuda()
+        pocket_features = batch['pocket_features'].cuda()  # One-hot features
         lig_mask = batch['ligand_mask'].cuda()
         pocket_mask = batch['pocket_mask'].cuda()
         batch_size = batch['batch_size']
+        
+        # Store clean one-hot features for categorical loss
+        lig_features_clean = lig_features.clone()
+        pocket_features_clean = pocket_features.clone()
         
         # Normalize molecular data
         lig_coords_norm, lig_features_norm, pocket_coords_norm, pocket_features_norm = \
@@ -402,10 +396,10 @@ class MolecularDenoisingModel:
         xh_lig_clean = torch.cat([lig_coords_centered, lig_features_norm], dim=1)
         xh_pocket_clean = torch.cat([pocket_coords_centered, pocket_features_norm], dim=1)
         
-        # Sample noise levels.
+        # Sample noise levels
         sigma = self.noise_sampling(shape=(batch_size,))  # [batch_size]
         
-        # Apply diffusion scheme.
+        # Apply diffusion scheme
         scale = self.scheme.scale(sigma)
         
         # Broadcast to all atoms/residues
@@ -441,22 +435,52 @@ class MolecularDenoisingModel:
             xh_lig_noisy, xh_pocket_noisy, t_normalized, lig_mask, pocket_mask
         )
         
+        # Split predictions into coordinates and features
+        pred_coords_lig = pred_noise_lig[:, :self.n_dims]
+        pred_features_lig = pred_noise_lig[:, self.n_dims:]
+        pred_coords_pocket = pred_noise_pocket[:, :self.n_dims]
+        pred_features_pocket = pred_noise_pocket[:, self.n_dims:]
+        
+        # Split true noise into coordinates and features
+        true_coords_lig = noise_lig[:, :self.n_dims]
+        true_features_lig = noise_lig[:, self.n_dims:]
+        true_coords_pocket = noise_pocket[:, :self.n_dims]
+        true_features_pocket = noise_pocket[:, self.n_dims:]
+        
         # Compute loss weights
         weights = self.noise_weighting(sigma)  # [batch_size]
         weights_lig = weights[lig_mask]
         weights_pocket = weights[pocket_mask]
         
-        # Compute weighted L2 loss
-        loss_lig = torch.mean(weights_lig.unsqueeze(1) * (pred_noise_lig - noise_lig) ** 2)
-        loss_pocket = torch.mean(weights_pocket.unsqueeze(1) * (pred_noise_pocket - noise_pocket) ** 2)
+        # Coordinate loss: L2 loss (appropriate for continuous coordinates)
+        coord_loss_lig = torch.mean(weights_lig.unsqueeze(1) * (pred_coords_lig - true_coords_lig) ** 2)
+        coord_loss_pocket = torch.mean(weights_pocket.unsqueeze(1) * (pred_coords_pocket - true_coords_pocket) ** 2)
+        coord_loss = coord_loss_lig + coord_loss_pocket
         
-        total_loss = loss_lig + loss_pocket
+        # Categorical loss: Cross-entropy or Gaussian CDF (appropriate for categorical features)
+        categorical_loss_lig = self.scheme.compute_categorical_loss(
+            pred_features_lig, lig_features_clean, sigma, lig_mask
+        )
+        categorical_loss_pocket = self.scheme.compute_categorical_loss(
+            pred_features_pocket, pocket_features_clean, sigma, pocket_mask
+        )
+        categorical_loss = categorical_loss_lig + categorical_loss_pocket
+        
+        # Combine losses
+        total_loss = (
+            self.coord_loss_weight * coord_loss + 
+            self.categorical_loss_weight * categorical_loss
+        )
         
         # Metrics
         metrics = {
             "loss": total_loss.item(),
-            "loss_ligand": loss_lig.item(),
-            "loss_pocket": loss_pocket.item(),
+            "coord_loss": coord_loss.item(),
+            "categorical_loss": categorical_loss.item(),
+            "coord_loss_ligand": coord_loss_lig.item(),
+            "coord_loss_pocket": coord_loss_pocket.item(),
+            "categorical_loss_ligand": categorical_loss_lig.item(),
+            "categorical_loss_pocket": categorical_loss_pocket.item(),
             "avg_sigma": sigma.mean().item(),
             "avg_scale": scale.mean().item() if isinstance(scale, Tensor) else scale
         }
@@ -464,7 +488,7 @@ class MolecularDenoisingModel:
         return total_loss, metrics
 
     def eval_fn(self, batch: dict) -> dict:
-        """Evaluate denoising at multiple noise levels"""
+        """Evaluate denoising at multiple noise levels with proper loss breakdown"""
         
         # Extract and normalize data
         lig_coords = batch['ligand_coords'].cuda()
@@ -475,16 +499,20 @@ class MolecularDenoisingModel:
         pocket_mask = batch['pocket_mask'].cuda()
         batch_size = batch['batch_size']
         
-        # Test at multiple fixed noise levels.
+        # Store clean features
+        lig_features_clean = lig_features.clone()
+        pocket_features_clean = pocket_features.clone()
+        
+        # Test at multiple fixed noise levels
         sigma_levels = torch.logspace(
             np.log10(1e-3), np.log10(self.scheme.sigma_max), 
-            self.num_eval_noise_levels, device='cuda'
+            5, device='cuda'
         )
         
         eval_losses = {}
         
         for i, sigma_val in enumerate(sigma_levels):
-            # Prepare clean data (same as training)
+            # Same forward process as training
             lig_coords_norm, lig_features_norm, pocket_coords_norm, pocket_features_norm = \
                 self.scheme.normalize_molecular_data(lig_coords, lig_features, pocket_coords, pocket_features)
             
@@ -520,18 +548,28 @@ class MolecularDenoisingModel:
                     xh_lig_noisy, xh_pocket_noisy, t_normalized, lig_mask, pocket_mask
                 )
             
-            # Compute evaluation loss
-            loss_lig = torch.mean((pred_noise_lig - noise_lig) ** 2)
-            loss_pocket = torch.mean((pred_noise_pocket - noise_pocket) ** 2)
-            total_loss = loss_lig + loss_pocket
+            # Compute evaluation losses
+            pred_coords_lig = pred_noise_lig[:, :self.n_dims]
+            pred_features_lig = pred_noise_lig[:, self.n_dims:]
+            true_coords_lig = noise_lig[:, :self.n_dims]
             
-            eval_losses[f"denoise_lvl{i}"] = total_loss.item()
+            coord_loss = torch.mean((pred_coords_lig - true_coords_lig) ** 2)
+            
+            # For evaluation, we can use the categorical loss as well
+            sigma_batch = torch.full((batch_size,), sigma_val.item(), device='cuda')
+            categorical_loss = self.scheme.compute_categorical_loss(
+                pred_features_lig, lig_features_clean, sigma_batch, lig_mask
+            )
+            
+            eval_losses[f"coord_loss_lvl{i}"] = coord_loss.item()
+            eval_losses[f"categorical_loss_lvl{i}"] = categorical_loss.item()
+            eval_losses[f"total_loss_lvl{i}"] = coord_loss.item() + categorical_loss.item()
         
         return eval_losses
 
 
 def test_molecular_diffusion():
-    """Test the molecular diffusion implementation"""
+    """Test the  molecular diffusion implementation"""
     
     print("Testing Molecular Diffusion (CUDA)...")
     
@@ -555,27 +593,43 @@ def test_molecular_diffusion():
         'batch_size': 2
     }
     
-    # Create model
-    model = MolecularDenoisingModel(
-        atom_nf=atom_nf,
-        residue_nf=residue_nf,
-        joint_nf=8,
-        hidden_nf=32,
-        n_layers=2
-    )
+    # Test both categorical loss types
+    for loss_type in ['cross_entropy', 'gaussian_cdf']:
+        print(f"\n--- Testing with {loss_type} categorical loss ---")
+        
+        # Create model
+        sigma_schedule = molecular_exponential_noise_schedule(clip_max=80.0)
+        scheme = MolecularDiffusion.create_variance_exploding(
+            sigma=sigma_schedule,
+            categorical_loss_type=loss_type,
+            categorical_temperature=1.0
+        )
+        
+        model = MolecularDenoisingModel(
+            atom_nf=atom_nf,
+            residue_nf=residue_nf,
+            joint_nf=8,
+            hidden_nf=32,
+            n_layers=2,
+            scheme=scheme,
+            coord_loss_weight=1.0,
+            categorical_loss_weight=0.5
+        )
+        
+        model.initialize()
+        
+        # Test loss computation
+        loss, metrics = model.loss_fn(batch)
+        print(f"Total Loss: {loss.item():.4f}")
+        print(f"Coord Loss: {metrics['coord_loss']:.4f}")
+        print(f"Categorical Loss: {metrics['categorical_loss']:.4f}")
+        print(f"Metrics: {metrics}")
+        
+        # Test evaluation
+        eval_metrics = model.eval_fn(batch)
+        print(f"Eval metrics: {eval_metrics}")
     
-    model.initialize()
-    
-    # Test loss computation
-    loss, metrics = model.loss_fn(batch)
-    print(f"Loss: {loss.item():.4f}")
-    print(f"Metrics: {metrics}")
-    
-    # Test evaluation
-    eval_metrics = model.eval_fn(batch)
-    print(f"Eval metrics: {eval_metrics}")
-    
-    print("✅ Molecular diffusion test passed!")
+    print("\n✅  Molecular diffusion test passed!")
     
     return model
 
