@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import os
+import wandb
 from typing import List, Dict
 from Dataset import PDBbind_Dataset
 from torch_geometric.loader import DataLoader
@@ -29,13 +30,12 @@ import torch.nn.functional as F
 
 # Configuration following framework patterns
 CONFIG = {
-
-    'train_dataset_path': 'dataset_casf2016.pt',
+    'train_dataset_path': 'dataset_cleansplit.pt',
     'eval_dataset_path': 'dataset_casf2016.pt',
 
     # Model parameters
-    'atom_nf': 10,            # Number of atom types
-    'residue_nf': 22,           # Number of residue types  
+    'atom_nf': 10,           # Number of atom types
+    'residue_nf': 22,        # Number of residue types  
     'n_dims': 3,             # 3D coordinates
     'joint_nf': 32,          # Joint embedding dimension
     'hidden_nf': 64,         # Hidden layer size
@@ -66,7 +66,18 @@ CONFIG = {
     
     # I/O
     'checkpoint_path': 'molecular_diffusion_checkpoint.pt',
-    'device': 'cuda'
+    'device': 'cuda',
+    
+    # Weights & Biases configuration
+    'wandb': {
+        'project': 'molecular-diffusion',
+        'entity': 'dagraber',
+        'name': 'molecular-diffusion-run',
+        'tags': ['molecular-diffusion', 'training'],
+        'notes': 'Training run for molecular diffusion model',
+        'log_model': False,
+        'log_gradients': False,  # Set to True to log gradient distributions
+    }
 }
 
 
@@ -256,15 +267,39 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
     print("TRAINING MOLECULAR DIFFUSION MODEL")
     print(f"{'='*60}")
     
+    # Initialize wandb
+    wandb.init(
+        project=config['wandb']['project'],
+        entity=config['wandb']['entity'],
+        name=config['wandb']['name'],
+        tags=config['wandb']['tags'],
+        notes=config['wandb']['notes'],
+        config=config
+    )
+    
     # Setup optimizer
     optimizer = optim.Adam(model.denoiser.parameters(), lr=config['learning_rate'])
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.8)
+    
+    # Watch model gradients if configured
+    if config['wandb']['log_gradients']:
+        wandb.watch(model.denoiser, log='all', log_freq=config['log_interval'])
     
     # Training loop
     model.denoiser.train()
     
     for epoch in range(config['num_epochs']):
         epoch_losses = []
+        epoch_metrics = {
+            'coord_loss': [],
+            'categorical_loss': [],
+            'coord_loss_ligand': [],
+            'coord_loss_pocket': [],
+            'categorical_loss_ligand': [],
+            'categorical_loss_pocket': [],
+            'avg_sigma': [],
+            'avg_scale': []
+        }
         
         for batch_idx, batch in enumerate(train_data):
             optimizer.zero_grad()
@@ -281,6 +316,10 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             optimizer.step()
             epoch_losses.append(loss.item())
             
+            # Collect metrics
+            for key in epoch_metrics.keys():
+                epoch_metrics[key].append(metrics[key])
+            
             # Logging 
             if (batch_idx + 1) % config['log_interval'] == 0:
                 print(f"Epoch {epoch+1:3d}/{config['num_epochs']}, "
@@ -292,8 +331,45 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                       f"(L:{metrics['categorical_loss_ligand']:.4f}, P:{metrics['categorical_loss_pocket']:.4f}), "
                       f"σ: {metrics['avg_sigma']:.3f}, "
                       f"s: {metrics['avg_scale']:.3f}")
+                
+                # Log batch metrics to wandb
+                wandb.log({
+                    'batch/loss': loss.item(),
+                    'batch/coord_loss': metrics['coord_loss'],
+                    'batch/categorical_loss': metrics['categorical_loss'],
+                    'batch/coord_loss_ligand': metrics['coord_loss_ligand'],
+                    'batch/coord_loss_pocket': metrics['coord_loss_pocket'],
+                    'batch/categorical_loss_ligand': metrics['categorical_loss_ligand'],
+                    'batch/categorical_loss_pocket': metrics['categorical_loss_pocket'],
+                    'batch/avg_sigma': metrics['avg_sigma'],
+                    'batch/avg_scale': metrics['avg_scale'],
+                    'batch/learning_rate': optimizer.param_groups[0]['lr'],
+                    'epoch': epoch + 1,
+                    'batch': batch_idx + 1
+                })
         
         scheduler.step()
+        
+        # Calculate epoch metrics
+        avg_epoch_loss = np.mean(epoch_losses)
+        avg_epoch_metrics = {
+            key: np.mean(values) for key, values in epoch_metrics.items()
+        }
+        
+        # Log epoch metrics
+        wandb.log({
+            'epoch/loss': avg_epoch_loss,
+            'epoch/coord_loss': avg_epoch_metrics['coord_loss'],
+            'epoch/categorical_loss': avg_epoch_metrics['categorical_loss'],
+            'epoch/coord_loss_ligand': avg_epoch_metrics['coord_loss_ligand'],
+            'epoch/coord_loss_pocket': avg_epoch_metrics['coord_loss_pocket'],
+            'epoch/categorical_loss_ligand': avg_epoch_metrics['categorical_loss_ligand'],
+            'epoch/categorical_loss_pocket': avg_epoch_metrics['categorical_loss_pocket'],
+            'epoch/avg_sigma': avg_epoch_metrics['avg_sigma'],
+            'epoch/avg_scale': avg_epoch_metrics['avg_scale'],
+            'epoch/learning_rate': optimizer.param_groups[0]['lr'],
+            'epoch': epoch + 1
+        })
         
         # Evaluation 
         if (epoch + 1) % config['eval_interval'] == 0 or epoch == 0:
@@ -301,8 +377,26 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             eval_losses = evaluate_model(model, eval_data)
             print(f"Eval losses: {eval_losses}")
             
-        avg_epoch_loss = np.mean(epoch_losses)
+            # Log evaluation metrics
+            wandb.log({
+                f'eval/{key}': value 
+                for key, value in eval_losses.items()
+            })
+            
         print(f"Epoch {epoch+1:3d} - Average Loss: {avg_epoch_loss:.4f}")
+    
+    # Save model to wandb if configured
+    if config['wandb']['log_model']:
+        model_artifact = wandb.Artifact(
+            'molecular_diffusion_model', 
+            type='model',
+            description='Trained molecular diffusion model'
+        )
+        model_artifact.add_file(config['checkpoint_path'])
+        wandb.log_artifact(model_artifact)
+    
+    # Close wandb run
+    wandb.finish()
     
     print(f"\n✅ Training completed!")
 
@@ -528,53 +622,56 @@ def main():
     print(f"Device: {CONFIG['device']}")
     print(f"Configuration: {CONFIG}")
     
-    # 1. Generate training and evaluation data
-    print(f"\n{'='*60}")
-    print("GENERATING TRAINING DATA")
-    print(f"{'='*60}")
-    
-    # train_data = create_random_training_data(CONFIG)
-    # eval_data = create_random_eval_data(CONFIG)
-
-    train_data = create_batches_from_dataset(CONFIG['train_dataset_path'], CONFIG)
-    eval_data = create_batches_from_dataset(CONFIG['eval_dataset_path'], CONFIG)
-    
-    # Show example batch 
-    example_batch = train_data[0]
-    print(f"\nExample batch:")
-    print(f"  Ligand atoms: {example_batch['ligand_coords'].shape[0]}")
-    print(f"  Pocket residues: {example_batch['pocket_coords'].shape[0]}")
-    #print(f"  Molecule sizes: ligands={example_batch['ligand_sizes']}, pockets={example_batch['pocket_sizes']}")
-    
-    # 2. Create and initialize model
-    print(f"\n{'='*60}")
-    print("CREATING MODEL")
-    print(f"{'='*60}")
-    
-    model = create_molecular_model(CONFIG)
-    
-    # 3. Train the model
-    train_model(model, train_data, eval_data, CONFIG)
-    
-    # 4. Save checkpoint
-    save_checkpoint(model, CONFIG)
-    
-    # 5. Load checkpoint to demonstrate persistence
-    print(f"\n{'='*60}")
-    print("LOADING MODEL FROM CHECKPOINT")
-    print(f"{'='*60}")
-    
-    loaded_model = load_checkpoint(CONFIG['checkpoint_path'])
-    
-    # 6. Sample new molecules
-    samples = sample_molecules(loaded_model, CONFIG)
-    
-    # 7. Analyze samples
-    analyze_samples(samples, CONFIG)
-    
-    print(f"\n🎉 PIPELINE COMPLETED SUCCESSFULLY!")
-    print(f"Checkpoint saved at: {CONFIG['checkpoint_path']}")
-    print(f"Used {torch.cuda.get_device_name()} for computation")
+    try:
+        # 1. Generate training and evaluation data
+        print(f"\n{'='*60}")
+        print("GENERATING TRAINING DATA")
+        print(f"{'='*60}")
+        
+        train_data = create_batches_from_dataset(CONFIG['train_dataset_path'], CONFIG)
+        eval_data = create_batches_from_dataset(CONFIG['eval_dataset_path'], CONFIG)
+        
+        # Show example batch 
+        example_batch = train_data[0]
+        print(f"\nExample batch:")
+        print(f"  Ligand atoms: {example_batch['ligand_coords'].shape[0]}")
+        print(f"  Pocket residues: {example_batch['pocket_coords'].shape[0]}")
+        
+        # 2. Create and initialize model
+        print(f"\n{'='*60}")
+        print("CREATING MODEL")
+        print(f"{'='*60}")
+        
+        model = create_molecular_model(CONFIG)
+        
+        # 3. Train the model
+        train_model(model, train_data, eval_data, CONFIG)
+        
+        # 4. Save checkpoint
+        save_checkpoint(model, CONFIG)
+        
+        # 5. Load checkpoint to demonstrate persistence
+        print(f"\n{'='*60}")
+        print("LOADING MODEL FROM CHECKPOINT")
+        print(f"{'='*60}")
+        
+        loaded_model = load_checkpoint(CONFIG['checkpoint_path'])
+        
+        # 6. Sample new molecules
+        samples = sample_molecules(loaded_model, CONFIG)
+        
+        # 7. Analyze samples
+        analyze_samples(samples, CONFIG)
+        
+        print(f"\n🎉 PIPELINE COMPLETED SUCCESSFULLY!")
+        print(f"Checkpoint saved at: {CONFIG['checkpoint_path']}")
+        print(f"Used {torch.cuda.get_device_name()} for computation")
+        
+    except Exception as e:
+        # Log error to wandb if it's initialized
+        if wandb.run is not None:
+            wandb.run.finish(exit_code=1)
+        raise e
 
 
 if __name__ == "__main__":
