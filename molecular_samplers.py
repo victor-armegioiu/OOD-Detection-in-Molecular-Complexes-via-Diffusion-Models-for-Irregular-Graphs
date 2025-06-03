@@ -6,12 +6,15 @@ Follows exact reverse SDE dynamics with automatic differentiation, all CUDA-opti
 """
 
 import torch
+import argparse
 import numpy as np
 from typing import Tuple, Optional, Callable, Mapping, Any, NamedTuple, Protocol
 from torch.autograd import grad
 from torch_scatter import scatter_mean
+from torch_geometric.data import Data
 
 from molecular_diffusion import MolecularDiffusion, remove_mean_batch
+from molecular_diffusion import MolecularDenoisingModel
 
 Tensor = torch.Tensor
 TensorMapping = Mapping[str, Tensor]
@@ -689,29 +692,91 @@ def create_molecular_sampler_from_model(
     return sampler
 
 
-def test_molecular_samplers():
+def load_checkpoint(checkpoint_path: str) -> MolecularDenoisingModel:
+    """Load model from checkpoint"""
+    
+    print(f"Loading checkpoint from {checkpoint_path}...")
+    checkpoint = torch.load(checkpoint_path, map_location='cuda')
+    
+    # Recreate model 
+    model_params = checkpoint['model_params']
+    
+    # Recreate the diffusion scheme from parameters
+    from molecular_diffusion import molecular_exponential_noise_schedule, MolecularDiffusion
+    
+    scheme_params = model_params['scheme_params']
+    sigma_schedule = molecular_exponential_noise_schedule(
+        clip_max=scheme_params['sigma_max'],
+        base=np.e**0.5,
+        start=0.0,
+        end=5.0
+    )
+    
+    scheme = MolecularDiffusion.create_variance_exploding(
+        sigma=sigma_schedule,
+        coord_norm=scheme_params['coord_norm'],
+        feature_norm=scheme_params['feature_norm'],
+        feature_bias=scheme_params['feature_bias']
+    )
+    
+    # Create noise sampling and weighting
+    from molecular_diffusion import molecular_log_uniform_sampling, molecular_edm_weighting
+    
+    noise_sampling = molecular_log_uniform_sampling(
+        scheme=scheme,
+        clip_min=scheme_params['sigma_min'],
+        uniform_grid=False
+    )
+    
+    noise_weighting = molecular_edm_weighting(data_std=1.0)
+    
+    model = MolecularDenoisingModel(
+        atom_nf=model_params['atom_nf'],
+        residue_nf=model_params['residue_nf'],
+        n_dims=model_params['n_dims'],
+        joint_nf=model_params['joint_nf'],
+        hidden_nf=model_params['hidden_nf'],
+        n_layers=model_params['n_layers'],
+        edge_embedding_dim=model_params['edge_embedding_dim'],
+        update_pocket_coords=model_params['update_pocket_coords'],
+        scheme=scheme,
+        noise_sampling=noise_sampling,
+        noise_weighting=noise_weighting
+    )
+    
+    model.initialize()
+    model.denoiser.load_state_dict(checkpoint['model_state_dict'])
+    
+    print(f"✅ Model loaded successfully!")
+    return model
+
+
+
+def test_molecular_samplers(model, num_samples: int = 3):
     """Test the molecular SDE sampler"""
     
     print("Testing Molecular SDE Sampler (CUDA)...")
     
     # Create dummy model for testing
-    from molecular_diffusion import MolecularDenoisingModel
+
+    # atom_nf = 4
+    # residue_nf = 5
     
-    atom_nf = 4
-    residue_nf = 5
-    
-    model = MolecularDenoisingModel(
-        atom_nf=atom_nf,
-        residue_nf=residue_nf,
-        joint_nf=8,
-        hidden_nf=16,
-        n_layers=1
-    )
-    model.initialize()
-    
+    # model = MolecularDenoisingModel(
+    #     atom_nf=atom_nf,
+    #     residue_nf=residue_nf,
+    #     joint_nf=8,
+    #     hidden_nf=16,
+    #     n_layers=1
+    # )
+    # model.initialize()
+
+    lig_size_range = (8, 24)
+    pocket_size_range = (8, 20)
+
     # Create sampler
-    ligand_sizes = [3, 4]
-    pocket_sizes = [8, 6]
+    ligand_sizes = np.random.randint(lig_size_range[0], lig_size_range[1], num_samples)
+    pocket_sizes = np.random.randint(pocket_size_range[0], pocket_size_range[1], num_samples)
     
     sampler = create_molecular_sampler_from_model(
         model=model,
@@ -723,6 +788,8 @@ def test_molecular_samplers():
     # Generate samples
     print("Generating samples...")
     samples = sampler.generate()
+
+    print(samples)
     
     print(f"Generated samples:")
     print(f"  Ligand coords: {samples['ligand_coords'].shape}")
@@ -750,4 +817,21 @@ def test_molecular_samplers():
 
 
 if __name__ == "__main__":
-    test_molecular_samplers()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--n_samples", type=int, default=3)
+    args = parser.parse_args()
+
+    model = load_checkpoint(args.model_path)
+
+    _, samples = test_molecular_samplers(model, args.n_samples)
+
+    for i in range(args.n_samples):
+        graph = Data(
+            ligand_coords=samples['ligand_coords'][samples['ligand_mask']==i].cpu(),
+            ligand_features=samples['ligand_features'][samples['ligand_mask']==i].cpu(),
+            pocket_coords=samples['pocket_coords'][samples['pocket_mask']==i].cpu(),
+            pocket_features=samples['pocket_features'][samples['pocket_mask']==i].cpu()
+        )
+        torch.save(graph, args.model_path.replace(".pt", f"_sample_{i}.pt"))
+    
