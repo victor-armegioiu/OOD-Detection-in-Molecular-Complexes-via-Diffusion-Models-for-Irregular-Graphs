@@ -11,6 +11,8 @@ import torch.optim as optim
 import numpy as np
 import os
 from typing import List, Dict
+from Dataset import PDBbind_Dataset
+from torch_geometric.loader import DataLoader
 
 # Import our molecular modules
 from molecular_diffusion import (
@@ -27,19 +29,23 @@ import torch.nn.functional as F
 
 # Configuration following framework patterns
 CONFIG = {
+
+    'train_dataset_path': 'dataset_casf2016.pt',
+    'eval_dataset_path': 'dataset_casf2016.pt',
+
     # Model parameters
-    'atom_nf': 6,           # Number of atom types (C, N, O, S, P, F)
-    'residue_nf': 8,        # Number of residue types  
-    'n_dims': 3,            # 3D coordinates
-    'joint_nf': 16,         # Joint embedding dimension
-    'hidden_nf': 64,        # Hidden layer size
-    'n_layers': 3,          # Number of EGNN layers
+    'atom_nf': 10,            # Number of atom types
+    'residue_nf': 22,           # Number of residue types  
+    'n_dims': 3,             # 3D coordinates
+    'joint_nf': 32,          # Joint embedding dimension
+    'hidden_nf': 64,         # Hidden layer size
+    'n_layers': 4,           # Number of EGNN layers
     'edge_embedding_dim': 8, # Edge feature dimension
     
     # Training parameters
-    'num_epochs': 2,
+    'num_epochs': 1000,
     'learning_rate': 1e-3,
-    'batch_size': 4,
+    'batch_size': 64,
     'log_interval': 20,
     'eval_interval': 50,
     
@@ -52,7 +58,7 @@ CONFIG = {
     'num_sampling_steps': 50,
     'schedule_type': "exponential",
     
-    # Data parameters
+    # Random data generation parameters
     'num_train_batches': 100,
     'num_eval_batches': 20,
     'ligand_size_range': (4, 12),     # Min/max ligand atoms
@@ -128,7 +134,7 @@ def create_fake_molecular_batch(batch_size: int, ligand_size_range: tuple,
     }
 
 
-def create_training_data(config: Dict) -> List[Dict]:
+def create_random_training_data(config: Dict) -> List[Dict]:
     """Generate training dataset"""
     
     print(f"Generating {config['num_train_batches']} training batches...")
@@ -148,7 +154,7 @@ def create_training_data(config: Dict) -> List[Dict]:
     return train_data
 
 
-def create_eval_data(config: Dict) -> List[Dict]:
+def create_random_eval_data(config: Dict) -> List[Dict]:
     """Generate evaluation dataset"""
     
     print(f"Generating {config['num_eval_batches']} evaluation batches...")
@@ -167,6 +173,31 @@ def create_eval_data(config: Dict) -> List[Dict]:
     print(f"✅ Generated {len(eval_data)} evaluation batches")
     return eval_data
 
+
+def create_batches_from_dataset(dataset_path: str, config: Dict) -> List[Dict]:
+    """Create dataset from PDBbind dataset"""
+    data = []
+
+    dataset = torch.load(dataset_path)
+    dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, follow_batch=['lig_coords', 'prot_coords'])
+
+    for batch in dataloader:
+        batch = {
+            'ligand_coords': batch.lig_coords,
+            'ligand_features': batch.lig_features,
+            'ligand_mask': batch.lig_coords_batch,
+
+            'pocket_coords': batch.prot_coords,
+            'pocket_features': batch.prot_features,
+            'pocket_mask': batch.prot_coords_batch,
+            'batch_size': config['batch_size'],
+        }
+        data.append(batch)
+
+    print(f"✅ Created {len(data)} batches from PDBbind dataset")
+    return data
+    
+    
 
 def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
     """Create molecular model following the GenCFD setup"""
@@ -397,8 +428,8 @@ def sample_molecules(model: MolecularDenoisingModel, config: Dict):
     print(f"{'='*60}")
     
     # Create sampler 
-    ligand_sizes = [6, 8, 5]  # Three different ligand sizes
-    pocket_sizes = [20, 25, 18]  # Three different pocket sizes
+    ligand_sizes = [12, 18, 24]  # Three different ligand sizes
+    pocket_sizes = [20, 25, 32]  # Three different pocket sizes
     
     sampler = create_molecular_sampler_from_model(
         model=model,
@@ -474,12 +505,18 @@ def analyze_samples(samples: Dict, config: Dict):
         if len(lig_coords) > 1:
             lig_distances = torch.cdist(lig_coords, lig_coords)
             lig_distances = lig_distances[lig_distances > 0]  # Remove self-distances
-            print(f"  Molecule {i} ligand bond lengths - Mean: {lig_distances.mean():.3f}, Min: {lig_distances.min():.3f}")
+            if len(lig_distances) > 0:  # Only calculate stats if we have distances
+                print(f"  Molecule {i} ligand bond lengths - Mean: {lig_distances.mean():.3f}, Min: {lig_distances.min():.3f}")
+            else:
+                print(f"  Molecule {i} ligand bond lengths - No valid distances found")
         
         if len(pocket_coords) > 1:
             pocket_distances = torch.cdist(pocket_coords, pocket_coords)
             pocket_distances = pocket_distances[pocket_distances > 0]
-            print(f"  Molecule {i} pocket distances - Mean: {pocket_distances.mean():.3f}, Min: {pocket_distances.min():.3f}")
+            if len(pocket_distances) > 0:  # Only calculate stats if we have distances
+                print(f"  Molecule {i} pocket distances - Mean: {pocket_distances.mean():.3f}, Min: {pocket_distances.min():.3f}")
+            else:
+                print(f"  Molecule {i} pocket distances - No valid distances found")
     
     print(f"\n✅ Sample analysis completed!")
 
@@ -496,15 +533,18 @@ def main():
     print("GENERATING TRAINING DATA")
     print(f"{'='*60}")
     
-    train_data = create_training_data(CONFIG)
-    eval_data = create_eval_data(CONFIG)
+    # train_data = create_random_training_data(CONFIG)
+    # eval_data = create_random_eval_data(CONFIG)
+
+    train_data = create_batches_from_dataset(CONFIG['train_dataset_path'], CONFIG)
+    eval_data = create_batches_from_dataset(CONFIG['eval_dataset_path'], CONFIG)
     
     # Show example batch 
     example_batch = train_data[0]
     print(f"\nExample batch:")
     print(f"  Ligand atoms: {example_batch['ligand_coords'].shape[0]}")
     print(f"  Pocket residues: {example_batch['pocket_coords'].shape[0]}")
-    print(f"  Molecule sizes: ligands={example_batch['ligand_sizes']}, pockets={example_batch['pocket_sizes']}")
+    #print(f"  Molecule sizes: ligands={example_batch['ligand_sizes']}, pockets={example_batch['pocket_sizes']}")
     
     # 2. Create and initialize model
     print(f"\n{'='*60}")
