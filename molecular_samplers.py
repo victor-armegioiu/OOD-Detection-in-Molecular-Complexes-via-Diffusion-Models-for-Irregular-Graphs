@@ -612,7 +612,7 @@ class MolecularSdeSampler(MolecularSampler):
 # Molecular Denoiser Wrapper
 # ********************
 
-def create_molecular_denoiser_wrapper(egnn_model) -> MolecularDenoiseFn:
+def create_molecular_denoiser_wrapper(egnn_model, scheme) -> MolecularDenoiseFn:
     """    
     Wraps the EGNN to handle MolecularState inputs/outputs while maintaining
     the same mathematical interface as the GenCFD framework.
@@ -628,8 +628,12 @@ def create_molecular_denoiser_wrapper(egnn_model) -> MolecularDenoiseFn:
         if isinstance(sigma, Tensor) and sigma.numel() == 1:
             sigma = sigma.item()
         
-        # Create time input for EGNN (normalized to [0, 1])
-        t_normalized = torch.full((molecular_state.batch_size, 1), sigma / 80.0, device='cuda')  # Assuming max_sigma=80
+        # Create time input for EGNN (normalized by scheme's sigma_max)
+        t_normalized = torch.full(
+            (molecular_state.batch_size, 1), 
+            sigma / scheme.sigma_max, 
+            device=molecular_state.ligand.device
+        )
         
         # Forward pass through EGNN
         with torch.no_grad():
@@ -652,10 +656,6 @@ def create_molecular_denoiser_wrapper(egnn_model) -> MolecularDenoiseFn:
     return molecular_denoiser
 
 
-# ********************
-# Convenience Functions
-# ********************
-
 def create_molecular_sampler_from_model(
     model,
     ligand_sizes: list[int],
@@ -669,8 +669,8 @@ def create_molecular_sampler_from_model(
     # Create time span 
     tspan = torch.linspace(1.0, 0.0, num_steps + 1, device='cuda')
     
-    # Create denoiser wrapper
-    molecular_denoise_fn = create_molecular_denoiser_wrapper(model.denoiser)
+    # Create denoiser wrapper - now passing the scheme for proper normalization
+    molecular_denoise_fn = create_molecular_denoiser_wrapper(model.denoiser, model.scheme)
     
     # Create sampler
     sampler = MolecularSdeSampler(
