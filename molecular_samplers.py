@@ -6,15 +6,12 @@ Follows exact reverse SDE dynamics with automatic differentiation, all CUDA-opti
 """
 
 import torch
-import argparse
 import numpy as np
 from typing import Tuple, Optional, Callable, Mapping, Any, NamedTuple, Protocol
 from torch.autograd import grad
 from torch_scatter import scatter_mean
-from torch_geometric.data import Data
 
 from molecular_diffusion import MolecularDiffusion, remove_mean_batch
-from molecular_diffusion import MolecularDenoisingModel
 
 Tensor = torch.Tensor
 TensorMapping = Mapping[str, Tensor]
@@ -612,13 +609,15 @@ class MolecularSdeSampler(MolecularSampler):
 
 
 # ********************
-# Molecular Denoiser Wrapper
+# Molecular Denoiser Wrapper - FIXED VERSION
 # ********************
 
 def create_molecular_denoiser_wrapper(egnn_model, scheme) -> MolecularDenoiseFn:
     """    
     Wraps the EGNN to handle MolecularState inputs/outputs while maintaining
     the same mathematical interface as the GenCFD framework.
+    
+    IMPORTANT: Model predicts CLEAN signal (GenCFD-style), not noise!
     """
     
     def molecular_denoiser(
@@ -638,9 +637,9 @@ def create_molecular_denoiser_wrapper(egnn_model, scheme) -> MolecularDenoiseFn:
             device=molecular_state.ligand.device
         )
         
-        # Forward pass through EGNN
+        # Forward pass through EGNN - predicts CLEAN signal (GenCFD-style)
         with torch.no_grad():
-            pred_noise_lig, pred_noise_pocket = egnn_model(
+            pred_clean_lig, pred_clean_pocket = egnn_model(
                 molecular_state.ligand,
                 molecular_state.pocket,
                 t_normalized,
@@ -648,9 +647,13 @@ def create_molecular_denoiser_wrapper(egnn_model, scheme) -> MolecularDenoiseFn:
                 molecular_state.pocket_mask
             )
         
+        # Add gradient clipping to prevent numerical explosion during sampling
+        #pred_clean_lig = torch.clamp(pred_clean_lig, -100.0, 100.0)
+        #pred_clean_pocket = torch.clamp(pred_clean_pocket, -100.0, 100.0)
+        
         return MolecularState(
-            ligand=pred_noise_lig,
-            pocket=pred_noise_pocket,
+            ligand=pred_clean_lig,
+            pocket=pred_clean_pocket,
             ligand_mask=molecular_state.ligand_mask,
             pocket_mask=molecular_state.pocket_mask,
             batch_size=molecular_state.batch_size
@@ -692,91 +695,29 @@ def create_molecular_sampler_from_model(
     return sampler
 
 
-def load_checkpoint(checkpoint_path: str) -> MolecularDenoisingModel:
-    """Load model from checkpoint"""
-    
-    print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location='cuda')
-    
-    # Recreate model 
-    model_params = checkpoint['model_params']
-    
-    # Recreate the diffusion scheme from parameters
-    from molecular_diffusion import molecular_exponential_noise_schedule, MolecularDiffusion
-    
-    scheme_params = model_params['scheme_params']
-    sigma_schedule = molecular_exponential_noise_schedule(
-        clip_max=scheme_params['sigma_max'],
-        base=np.e**0.5,
-        start=0.0,
-        end=5.0
-    )
-    
-    scheme = MolecularDiffusion.create_variance_exploding(
-        sigma=sigma_schedule,
-        coord_norm=scheme_params['coord_norm'],
-        feature_norm=scheme_params['feature_norm'],
-        feature_bias=scheme_params['feature_bias']
-    )
-    
-    # Create noise sampling and weighting
-    from molecular_diffusion import molecular_log_uniform_sampling, molecular_edm_weighting
-    
-    noise_sampling = molecular_log_uniform_sampling(
-        scheme=scheme,
-        clip_min=scheme_params['sigma_min'],
-        uniform_grid=False
-    )
-    
-    noise_weighting = molecular_edm_weighting(data_std=1.0)
-    
-    model = MolecularDenoisingModel(
-        atom_nf=model_params['atom_nf'],
-        residue_nf=model_params['residue_nf'],
-        n_dims=model_params['n_dims'],
-        joint_nf=model_params['joint_nf'],
-        hidden_nf=model_params['hidden_nf'],
-        n_layers=model_params['n_layers'],
-        edge_embedding_dim=model_params['edge_embedding_dim'],
-        update_pocket_coords=model_params['update_pocket_coords'],
-        scheme=scheme,
-        noise_sampling=noise_sampling,
-        noise_weighting=noise_weighting
-    )
-    
-    model.initialize()
-    model.denoiser.load_state_dict(checkpoint['model_state_dict'])
-    
-    print(f"✅ Model loaded successfully!")
-    return model
-
-
-
-def test_molecular_samplers(model, num_samples: int = 3):
+def test_molecular_samplers():
     """Test the molecular SDE sampler"""
     
     print("Testing Molecular SDE Sampler (CUDA)...")
     
     # Create dummy model for testing
-
-    # atom_nf = 4
-    # residue_nf = 5
+    from molecular_diffusion import MolecularDenoisingModel
     
-    # model = MolecularDenoisingModel(
-    #     atom_nf=atom_nf,
-    #     residue_nf=residue_nf,
-    #     joint_nf=8,
-    #     hidden_nf=16,
-    #     n_layers=1
-    # )
-    # model.initialize()
-
-    lig_size_range = (8, 24)
-    pocket_size_range = (8, 20)
-
+    atom_nf = 4
+    residue_nf = 5
+    
+    model = MolecularDenoisingModel(
+        atom_nf=atom_nf,
+        residue_nf=residue_nf,
+        joint_nf=8,
+        hidden_nf=16,
+        n_layers=1
+    )
+    model.initialize()
+    
     # Create sampler
-    ligand_sizes = np.random.randint(lig_size_range[0], lig_size_range[1], num_samples)
-    pocket_sizes = np.random.randint(pocket_size_range[0], pocket_size_range[1], num_samples)
+    ligand_sizes = [3, 4]
+    pocket_sizes = [8, 6]
     
     sampler = create_molecular_sampler_from_model(
         model=model,
@@ -788,8 +729,6 @@ def test_molecular_samplers(model, num_samples: int = 3):
     # Generate samples
     print("Generating samples...")
     samples = sampler.generate()
-
-    print(samples)
     
     print(f"Generated samples:")
     print(f"  Ligand coords: {samples['ligand_coords'].shape}")
@@ -801,37 +740,8 @@ def test_molecular_samplers(model, num_samples: int = 3):
     lig_sums = samples['ligand_features'].sum(dim=1)
     pocket_sums = samples['pocket_features'].sum(dim=1)
     
-    print(f"  Ligand features properly one-hot: {torch.allclose(lig_sums, torch.ones_like(lig_sums))}")
-    print(f"  Pocket features properly one-hot: {torch.allclose(pocket_sums, torch.ones_like(pocket_sums))}")
-    
-    # Show some statistics
-    ligand_types = torch.argmax(samples['ligand_features'], dim=1)
-    pocket_types = torch.argmax(samples['pocket_features'], dim=1)
-    
-    print(f"  Ligand atom type distribution: {torch.bincount(ligand_types)}")
-    print(f"  Pocket residue type distribution: {torch.bincount(pocket_types)}")
-    
-    print("✅ Molecular SDE sampler test passed!")
-    
-    return sampler, samples
+    print()
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--n_samples", type=int, default=3)
-    args = parser.parse_args()
-
-    model = load_checkpoint(args.model_path)
-
-    _, samples = test_molecular_samplers(model, args.n_samples)
-
-    for i in range(args.n_samples):
-        graph = Data(
-            ligand_coords=samples['ligand_coords'][samples['ligand_mask']==i].cpu(),
-            ligand_features=samples['ligand_features'][samples['ligand_mask']==i].cpu(),
-            pocket_coords=samples['pocket_coords'][samples['pocket_mask']==i].cpu(),
-            pocket_features=samples['pocket_features'][samples['pocket_mask']==i].cpu()
-        )
-        torch.save(graph, args.model_path.replace(".pt", f"_sample_{i}.pt"))
-    
+if __name__ == '__main__':
+    test_molecular_samplers()
