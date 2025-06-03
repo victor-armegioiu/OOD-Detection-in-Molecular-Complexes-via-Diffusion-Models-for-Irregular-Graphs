@@ -14,6 +14,8 @@ import wandb
 from typing import List, Dict
 from Dataset import PDBbind_Dataset
 from torch_geometric.loader import DataLoader
+from torch_geometric.data import Data
+from datetime import datetime
 
 # Import our molecular modules
 from molecular_diffusion import (
@@ -65,20 +67,27 @@ CONFIG = {
     'pocket_size_range': (15, 30),   # Min/max pocket residues
     
     # I/O
-    'checkpoint_path': 'molecular_diffusion_checkpoint.pt',
     'device': 'cuda',
     
     # Weights & Biases configuration
     'wandb': {
         'project': 'molecular-diffusion',
         'entity': 'dagraber',
-        'name': 'molecular-diffusion-run',
         'tags': ['molecular-diffusion', 'training'],
         'notes': 'Training run for molecular diffusion model',
         'log_model': False,
         'log_gradients': False,  # Set to True to log gradient distributions
     }
 }
+
+# Create a run id with a timestamp
+run_id = f"{datetime.now().strftime('%m%d_%H%M')}_{CONFIG['train_dataset_path'].split('.')[0]}"
+CONFIG['wandb']['name'] = run_id
+CONFIG['run_dir'] = f'training_runs/{run_id}'
+if not os.path.exists(CONFIG['run_dir']):
+    os.makedirs(CONFIG['run_dir'])
+CONFIG['checkpoint_path'] = f'{CONFIG["run_dir"]}/checkpoint.pt'
+
 
 
 def create_fake_molecular_batch(batch_size: int, ligand_size_range: tuple, 
@@ -514,16 +523,18 @@ def load_checkpoint(checkpoint_path: str) -> MolecularDenoisingModel:
     return model
 
 
-def sample_molecules(model: MolecularDenoisingModel, config: Dict):
+def sample_molecules(model: MolecularDenoisingModel, config: Dict, num_samples: int = 3):
     """Generate new molecules using the trained model"""
     
     print(f"\n{'='*60}")
     print("SAMPLING NEW MOLECULES")
     print(f"{'='*60}")
-    
-    # Create sampler 
-    ligand_sizes = [12, 18, 24]  # Three different ligand sizes
-    pocket_sizes = [20, 25, 32]  # Three different pocket sizes
+
+    # Create sampler
+    lig_size_range = (8, 24)
+    pocket_size_range = (8, 20)
+    ligand_sizes = np.random.randint(lig_size_range[0], lig_size_range[1], num_samples)
+    pocket_sizes = np.random.randint(pocket_size_range[0], pocket_size_range[1], num_samples)
     
     sampler = create_molecular_sampler_from_model(
         model=model,
@@ -658,7 +669,18 @@ def main():
         loaded_model = load_checkpoint(CONFIG['checkpoint_path'])
         
         # 6. Sample new molecules
-        samples = sample_molecules(loaded_model, CONFIG)
+        num_samples = 5
+        samples = sample_molecules(loaded_model, CONFIG, num_samples=num_samples)
+
+        for i in range(num_samples):
+            graph = Data(
+                ligand_coords=samples['ligand_coords'][samples['ligand_mask']==i].cpu(),
+                ligand_features=samples['ligand_features'][samples['ligand_mask']==i].cpu(),
+                pocket_coords=samples['pocket_coords'][samples['pocket_mask']==i].cpu(),
+                pocket_features=samples['pocket_features'][samples['pocket_mask']==i].cpu()
+            )
+            torch.save(graph, CONFIG['run_dir'] + f"/sample_{i}.pt")
+    
         
         # 7. Analyze samples
         analyze_samples(samples, CONFIG)
