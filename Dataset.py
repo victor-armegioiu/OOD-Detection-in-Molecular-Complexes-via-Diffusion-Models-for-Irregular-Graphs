@@ -99,22 +99,27 @@ class PDBbind_Dataset(Dataset):
         """
 
         processed_data = {}
+        lig_nf = 10
+        prot_nf = 22
+
         for idx, file in enumerate(self.filepaths):
             self.logger.info(f"Processing graph {file.split('/')[-1]}: {idx} of {len(self.filepaths)}")
-
 
             graph = torch.load(file, weights_only=False)
             complex_id = os.path.basename(file).replace('.pt', '')
 
             # Combine position and feature information
-            x = torch.cat([graph.pos, graph.x], dim=1)
+            lig_coords = graph.pos[graph.lig_mask]
+            prot_coords = graph.pos[graph.prot_mask]
+            lig_features = graph.x[graph.lig_mask][:, :lig_nf]
+            prot_features = graph.x[graph.prot_mask][:, -prot_nf:]
 
             processed_data[idx] = Data(
-                                        x=x.float(),
-                                        edge_index=graph.edge_index.long(),
-                                        edge_attr=graph.edge_attr.float(),
-                                        id=complex_id
-        )
+                                        lig_coords=lig_coords.float(),
+                                        lig_features=lig_features.float(),
+                                        prot_coords=prot_coords.float(),
+                                        prot_features=prot_features.float(),
+                                        id=complex_id)
         return processed_data
 
 
