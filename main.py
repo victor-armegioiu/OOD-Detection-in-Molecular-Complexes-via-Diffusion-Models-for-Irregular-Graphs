@@ -32,14 +32,14 @@ import torch.nn.functional as F
 
 # Configuration following framework patterns
 CONFIG = {
-    'train_dataset_path': 'dataset_cleansplit.pt',
+    'train_dataset_path': 'dataset_pdbbind.pt',
     'eval_dataset_path': 'dataset_casf2016.pt',
 
     # Model parameters
     'atom_nf': 10,           # Number of atom types
-    'residue_nf': 22,        # Number of residue types  
+    'residue_nf': 21,        # Number of residue types  
     'n_dims': 3,             # 3D coordinates
-    'joint_nf': 32,          # Joint embedding dimension
+    'joint_nf': 31,          # Joint embedding dimension
     'hidden_nf': 64,         # Hidden layer size
     'n_layers': 4,           # Number of EGNN layers
     'edge_embedding_dim': 8, # Edge feature dimension

@@ -100,7 +100,7 @@ class PDBbind_Dataset(Dataset):
 
         processed_data = {}
         lig_nf = 10
-        prot_nf = 22
+        prot_nf = 21
 
         for idx, file in enumerate(self.filepaths):
             self.logger.info(f"Processing graph {file.split('/')[-1]}: {idx} of {len(self.filepaths)}")
