@@ -25,7 +25,11 @@ from molecular_diffusion import (
     molecular_edm_weighting,
     MolecularDiffusion
 )
-from molecular_samplers import create_molecular_sampler_from_model
+from molecular_samplers import (
+    load_checkpoint,
+    sample_molecules, 
+    evaluate_samples
+)
 from egnn_dynamics import EGNNDynamics
 import torch.nn.functional as F
 
@@ -49,7 +53,8 @@ CONFIG = {
     'learning_rate': 1e-3,
     'batch_size': 64,
     'log_interval': 20,
-    'eval_interval': 50,
+    'eval_interval': 20,
+    'num_eval_samples': 10,
     
     # Diffusion parameters
     'sigma_max': 80.0,      # Maximum noise level
@@ -306,8 +311,8 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             'coord_loss_pocket': [],
             'categorical_loss_ligand': [],
             'categorical_loss_pocket': [],
-            'avg_sigma': [],
-            'avg_scale': []
+            'avg_sigma': []
+            #,'avg_scale': []
         }
         
         for batch_idx, batch in enumerate(train_data):
@@ -339,7 +344,8 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                       f"Cat: {metrics['categorical_loss']:.4f} "
                       f"(L:{metrics['categorical_loss_ligand']:.4f}, P:{metrics['categorical_loss_pocket']:.4f}), "
                       f"σ: {metrics['avg_sigma']:.3f}, "
-                      f"s: {metrics['avg_scale']:.3f}")
+                      # f"s: {metrics['avg_scale']:.3f}"
+                      )
                 
                 # Log batch metrics to wandb
                 wandb.log({
@@ -351,7 +357,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                     'batch/categorical_loss_ligand': metrics['categorical_loss_ligand'],
                     'batch/categorical_loss_pocket': metrics['categorical_loss_pocket'],
                     'batch/avg_sigma': metrics['avg_sigma'],
-                    'batch/avg_scale': metrics['avg_scale'],
+                    #'batch/avg_scale': metrics['avg_scale'],
                     'batch/learning_rate': optimizer.param_groups[0]['lr'],
                     'epoch': epoch + 1,
                     'batch': batch_idx + 1
@@ -375,7 +381,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             'epoch/categorical_loss_ligand': avg_epoch_metrics['categorical_loss_ligand'],
             'epoch/categorical_loss_pocket': avg_epoch_metrics['categorical_loss_pocket'],
             'epoch/avg_sigma': avg_epoch_metrics['avg_sigma'],
-            'epoch/avg_scale': avg_epoch_metrics['avg_scale'],
+            #'epoch/avg_scale': avg_epoch_metrics['avg_scale'],
             'epoch/learning_rate': optimizer.param_groups[0]['lr'],
             'epoch': epoch + 1
         })
@@ -384,7 +390,19 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
         if (epoch + 1) % config['eval_interval'] == 0 or epoch == 0:
             print(f"\n--- Evaluation at epoch {epoch+1} ---")
             eval_losses = evaluate_model(model, eval_data)
-            print(f"Eval losses: {eval_losses}")
+
+            # Sampling-based losses
+            save_path = CONFIG['checkpoint_path'].replace(".pt", f"_epoch_{epoch}.pt")
+            save_checkpoint(model, CONFIG, save_path)
+            loaded_model = load_checkpoint(save_path)
+            samples = sample_molecules(loaded_model,
+                                    num_steps=CONFIG['num_sampling_steps'],
+                                    schedule_type=CONFIG['schedule_type'],
+                                    num_samples=CONFIG['num_eval_samples']
+                                    )
+            sampling_losses = evaluate_samples(samples)
+            eval_losses.update(sampling_losses)
+            print(f"Eval losses: {eval_losses}", flush=True)
             
             # Log evaluation metrics
             wandb.log({
@@ -434,7 +452,7 @@ def evaluate_model(model: MolecularDenoisingModel, eval_data: List[Dict]) -> Dic
     return averaged_metrics
 
 
-def save_checkpoint(model: MolecularDenoisingModel, config: Dict):
+def save_checkpoint(model: MolecularDenoisingModel, config: Dict, save_path: None):
     """Save model checkpoint"""
     
     checkpoint = {
@@ -459,121 +477,13 @@ def save_checkpoint(model: MolecularDenoisingModel, config: Dict):
             }
         }
     }
-    
-    torch.save(checkpoint, config['checkpoint_path'])
-    print(f"✅ Checkpoint saved to {config['checkpoint_path']}")
+    if save_path is None:
+        torch.save(checkpoint, config['checkpoint_path'])
+        print(f"✅ Checkpoint saved to {config['checkpoint_path']}")
+    else:
+        torch.save(checkpoint, save_path)
+        print(f"✅ Checkpoint saved to {save_path}")
 
-
-def load_checkpoint(checkpoint_path: str) -> MolecularDenoisingModel:
-    """Load model from checkpoint"""
-    
-    print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location='cuda')
-    
-    # Recreate model 
-    model_params = checkpoint['model_params']
-    
-    # Recreate the diffusion scheme from parameters
-    from molecular_diffusion import molecular_exponential_noise_schedule, MolecularDiffusion
-    
-    scheme_params = model_params['scheme_params']
-    sigma_schedule = molecular_exponential_noise_schedule(
-        clip_max=scheme_params['sigma_max'],
-        base=np.e**0.5,
-        start=0.0,
-        end=5.0
-    )
-    
-    scheme = MolecularDiffusion.create_variance_exploding(
-        sigma=sigma_schedule,
-        coord_norm=scheme_params['coord_norm'],
-        feature_norm=scheme_params['feature_norm'],
-        feature_bias=scheme_params['feature_bias']
-    )
-    
-    # Create noise sampling and weighting
-    from molecular_diffusion import molecular_log_uniform_sampling, molecular_edm_weighting
-    
-    noise_sampling = molecular_log_uniform_sampling(
-        scheme=scheme,
-        clip_min=scheme_params['sigma_min'],
-        uniform_grid=False
-    )
-    
-    noise_weighting = molecular_edm_weighting(data_std=1.0)
-    
-    model = MolecularDenoisingModel(
-        atom_nf=model_params['atom_nf'],
-        residue_nf=model_params['residue_nf'],
-        n_dims=model_params['n_dims'],
-        joint_nf=model_params['joint_nf'],
-        hidden_nf=model_params['hidden_nf'],
-        n_layers=model_params['n_layers'],
-        edge_embedding_dim=model_params['edge_embedding_dim'],
-        update_pocket_coords=model_params['update_pocket_coords'],
-        scheme=scheme,
-        noise_sampling=noise_sampling,
-        noise_weighting=noise_weighting
-    )
-    
-    model.initialize()
-    model.denoiser.load_state_dict(checkpoint['model_state_dict'])
-    
-    print(f"✅ Model loaded successfully!")
-    return model
-
-
-def sample_molecules(model: MolecularDenoisingModel, config: Dict, num_samples: int = 3):
-    """Generate new molecules using the trained model"""
-    
-    print(f"\n{'='*60}")
-    print("SAMPLING NEW MOLECULES")
-    print(f"{'='*60}")
-
-    # Create sampler
-    lig_size_range = (8, 24)
-    pocket_size_range = (8, 20)
-    ligand_sizes = np.random.randint(lig_size_range[0], lig_size_range[1], num_samples)
-    pocket_sizes = np.random.randint(pocket_size_range[0], pocket_size_range[1], num_samples)
-    
-    sampler = create_molecular_sampler_from_model(
-        model=model,
-        ligand_sizes=ligand_sizes,
-        pocket_sizes=pocket_sizes,
-        num_steps=config['num_sampling_steps'],
-        schedule_type=config['schedule_type'],
-        return_full_paths=False
-    )
-    
-    print("Sampling unconditional molecules...")
-    print(f"Using {config['num_sampling_steps']} sampling steps...")
-    
-    # Generate samples
-    samples = sampler.generate()
-    
-    print(f"\nGenerated molecules:")
-    print(f"  Total ligand atoms: {samples['ligand_coords'].shape[0]}")
-    print(f"  Total pocket residues: {samples['pocket_coords'].shape[0]}")
-    print(f"  Ligand coordinate range: [{samples['ligand_coords'].min():.2f}, {samples['ligand_coords'].max():.2f}]")
-    print(f"  Pocket coordinate range: [{samples['pocket_coords'].min():.2f}, {samples['pocket_coords'].max():.2f}]")
-    
-    # Check that categorical features are properly discretized 
-    lig_feature_sums = samples['ligand_features'].sum(dim=1)
-    pocket_feature_sums = samples['pocket_features'].sum(dim=1)
-    
-    print(f"  Ligand features properly one-hot: {torch.allclose(lig_feature_sums, torch.ones_like(lig_feature_sums))}")
-    print(f"  Pocket features properly one-hot: {torch.allclose(pocket_feature_sums, torch.ones_like(pocket_feature_sums))}")
-    
-    # Show some statistics
-    ligand_types = torch.argmax(samples['ligand_features'], dim=1)
-    pocket_types = torch.argmax(samples['pocket_features'], dim=1)
-    
-    print(f"  Ligand atom type distribution: {torch.bincount(ligand_types)}")
-    print(f"  Pocket residue type distribution: {torch.bincount(pocket_types)}")
-    
-    print(f"\n✅ Sampling completed successfully!")
-    
-    return samples
 
 
 def analyze_samples(samples: Dict, config: Dict):
@@ -659,7 +569,7 @@ def main():
         train_model(model, train_data, eval_data, CONFIG)
         
         # 4. Save checkpoint
-        save_checkpoint(model, CONFIG)
+        save_checkpoint(model, CONFIG, save_path=CONFIG['checkpoint_path'].replace(".pt", "_final.pt"))
         
         # 5. Load checkpoint to demonstrate persistence
         print(f"\n{'='*60}")
@@ -669,17 +579,20 @@ def main():
         loaded_model = load_checkpoint(CONFIG['checkpoint_path'])
         
         # 6. Sample new molecules
-        num_samples = 5
-        samples = sample_molecules(loaded_model, CONFIG, num_samples=num_samples)
+        samples = sample_molecules(loaded_model,
+                                    num_steps=CONFIG['num_sampling_steps'],
+                                    schedule_type=CONFIG['schedule_type'],
+                                    num_samples=CONFIG['num_eval_samples']
+                                    )
 
-        for i in range(num_samples):
+        for s in range(CONFIG['num_eval_samples']):
             graph = Data(
-                ligand_coords=samples['ligand_coords'][samples['ligand_mask']==i].cpu(),
-                ligand_features=samples['ligand_features'][samples['ligand_mask']==i].cpu(),
-                pocket_coords=samples['pocket_coords'][samples['pocket_mask']==i].cpu(),
-                pocket_features=samples['pocket_features'][samples['pocket_mask']==i].cpu()
+                ligand_coords=samples['ligand_coords'][samples['ligand_mask']==s].cpu(),
+                ligand_features=samples['ligand_features'][samples['ligand_mask']==s].cpu(),
+                pocket_coords=samples['pocket_coords'][samples['pocket_mask']==s].cpu(),
+                pocket_features=samples['pocket_features'][samples['pocket_mask']==s].cpu()
             )
-            torch.save(graph, CONFIG['run_dir'] + f"/sample_{i}.pt")
+            torch.save(graph, CONFIG['run_dir'] + f"/sample_{s}.pt")
     
         
         # 7. Analyze samples
