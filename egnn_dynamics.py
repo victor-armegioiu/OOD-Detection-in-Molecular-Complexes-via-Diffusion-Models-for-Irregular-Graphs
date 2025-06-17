@@ -273,6 +273,7 @@ class EGNN(nn.Module):
         self.normalization_factor = normalization_factor
         self.aggregation_method = aggregation_method
         self.reflection_equiv = reflection_equiv
+        self.norm_constant = norm_constant
 
         if sin_embedding:
             self.sin_embedding = SinusoidsEmbeddingNew()
@@ -390,8 +391,8 @@ class EGNNDynamics(nn.Module):
         Forward pass of EGNN Dynamics
         
         Args:
-            xh_atoms: [total_lig_atoms, n_dims + atom_nf] - ligand coords + features
-            xh_residues: [total_pocket_atoms, n_dims + residue_nf] - pocket coords + features  
+            xh_atoms: [total_lig_atoms, n_dims + joint_nf] - ligand coords + embedding_size
+            xh_residues: [total_pocket_atoms, n_dims + residue_nf] - pocket coords + embedding_size  
             t: [batch_size, 1] - normalized timestep values
             mask_atoms: [total_lig_atoms] - molecule indices for ligand atoms
             mask_residues: [total_pocket_atoms] - molecule indices for pocket residues
@@ -407,8 +408,8 @@ class EGNNDynamics(nn.Module):
         h_residues = xh_residues[:, self.n_dims:].clone()
 
         # embed atom features and residue features in a shared space
-        h_atoms = self.atom_encoder(h_atoms)
-        h_residues = self.residue_encoder(h_residues)
+        # h_atoms = self.atom_encoder(h_atoms)
+        # h_residues = self.residue_encoder(h_residues)
 
         # combine the two node types
         x = torch.cat((x_atoms, x_residues), dim=0)
@@ -465,7 +466,7 @@ class EGNNDynamics(nn.Module):
         if self.update_pocket_coords:
             vel = remove_mean_batch(vel, mask)
 
-        # print(f"DEBUG: vel max: {vel.abs().max():.6f}, h_final max: {h_final_atoms.abs().max():.6f}")
+        #print(f"DEBUG: vel max: {vel.abs().max():.6f}, h_final max: {h_final_atoms.abs().max():.6f}")
         return torch.cat([vel[:len(mask_atoms)], h_final_atoms], dim=-1), \
                torch.cat([vel[len(mask_atoms):], h_final_residues], dim=-1)
 
@@ -491,6 +492,113 @@ class EGNNDynamics(nn.Module):
         return edges
 
 
+class PreconditionedEGNNDynamics(nn.Module):
+    """Preconditioned wrapper for EGNNDynamics following Karras et al. (2022)."""
+    
+    def __init__(self, egnn_dynamics: nn.Module, sigma_data: float = 1.0):
+        """
+        Args:
+            egnn_dynamics: The base EGNNDynamics model
+            sigma_data: Expected standard deviation of the data (default: 1.0)
+        """
+        super().__init__()
+        self.egnn_dynamics = egnn_dynamics
+        self.sigma_data = sigma_data
+
+    def atom_encoder(self, atom_features):
+        return self.egnn_dynamics.atom_encoder(atom_features)
+
+    def residue_encoder(self, residue_features):
+        return self.egnn_dynamics.residue_encoder(residue_features)
+        
+    def forward(self, xh_atoms, xh_residues, sigma, mask_atoms, mask_residues):
+        """
+        Preconditioned forward pass with separate handling for coordinates and categorical features.
+        
+        Args:
+            xh_atoms: [total_lig_atoms, n_dims + joint_nf] - ligand coords + embeddings
+            xh_residues: [total_pocket_atoms, n_dims + joint_nf] - pocket coords + embeddings  
+            sigma: [batch_size] or scalar - noise level (not normalized time!)
+            mask_atoms: [total_lig_atoms] - molecule indices for ligand atoms
+            mask_residues: [total_pocket_atoms] - molecule indices for pocket residues
+            
+        Returns:
+            Tuple of (ligand_output, pocket_output) with preconditioned coordinates + logits
+        """
+        # Ensure sigma is 1D tensor with batch dimension
+        batch_size = len(torch.unique(torch.cat([mask_atoms, mask_residues])))
+        if sigma.dim() < 1:
+            sigma = sigma.expand(batch_size)
+    
+        if sigma.dim() != 1 or batch_size != sigma.shape[0]:
+            print(sigma.shape, batch_size)
+
+            raise ValueError(
+                "sigma must be 1D and have the same leading (batch) dim as x"
+                f" ({batch_size})"
+            )
+            
+        # Compute preconditioning coefficients
+        total_var = self.sigma_data**2 + sigma**2
+        c_skip = self.sigma_data**2 / total_var
+        c_out = sigma * self.sigma_data / torch.sqrt(total_var)
+        c_in = 1 / torch.sqrt(total_var)
+        c_noise = 0.25 * torch.log(sigma)
+        
+        # Split input into coordinates and embeddings
+        coords_lig = xh_atoms[:, :self.egnn_dynamics.n_dims]  # [N_lig, 3]
+        embeddings_lig = xh_atoms[:, self.egnn_dynamics.n_dims:]  # [N_lig, joint_nf]
+        coords_pocket = xh_residues[:, :self.egnn_dynamics.n_dims]  # [N_pocket, 3]
+        embeddings_pocket = xh_residues[:, self.egnn_dynamics.n_dims:]  # [N_pocket, joint_nf]
+        
+        # Apply c_in scaling to coordinates only (per molecule)
+        coords_lig_scaled = coords_lig.clone()
+        coords_pocket_scaled = coords_pocket.clone()
+        
+        for i, batch_idx in enumerate(torch.unique(mask_atoms)):
+            atom_mask = mask_atoms == batch_idx
+            coords_lig_scaled[atom_mask] = c_in[i] * coords_lig[atom_mask]
+            
+        for i, batch_idx in enumerate(torch.unique(mask_residues)):
+            residue_mask = mask_residues == batch_idx  
+            coords_pocket_scaled[residue_mask] = c_in[i] * coords_pocket[residue_mask]
+        
+        # Recombine scaled coordinates with original embeddings
+        xh_atoms_scaled = torch.cat([coords_lig_scaled, embeddings_lig], dim=1)
+        xh_residues_scaled = torch.cat([coords_pocket_scaled, embeddings_pocket], dim=1)
+        
+        # Convert sigma to normalized time for the base model
+        t = c_noise.unsqueeze(1)  # [batch_size, 1]
+        
+        # Forward through base EGNN
+        f_ligand, f_pocket = self.egnn_dynamics(
+            xh_atoms_scaled, xh_residues_scaled, t, mask_atoms, mask_residues
+        )
+        
+        # Split EGNN output into coordinates and logits
+        coords_pred_lig = f_ligand[:, :self.egnn_dynamics.n_dims]  # [N_lig, 3]
+        logits_pred_lig = f_ligand[:, self.egnn_dynamics.n_dims:]  # [N_lig, atom_nf]
+        coords_pred_pocket = f_pocket[:, :self.egnn_dynamics.n_dims]  # [N_pocket, 3]
+        logits_pred_pocket = f_pocket[:, self.egnn_dynamics.n_dims:]  # [N_pocket, residue_nf]
+        
+        # Apply preconditioning to coordinates only (skip connection + output scaling)
+        coords_out_lig = coords_lig.clone()
+        coords_out_pocket = coords_pocket.clone()
+        
+        for i, batch_idx in enumerate(torch.unique(mask_atoms)):
+            atom_mask = mask_atoms == batch_idx
+            coords_out_lig[atom_mask] = c_skip[i] * coords_lig[atom_mask] + c_out[i] * coords_pred_lig[atom_mask]
+            
+        for i, batch_idx in enumerate(torch.unique(mask_residues)):
+            residue_mask = mask_residues == batch_idx
+            coords_out_pocket[residue_mask] = c_skip[i] * coords_pocket[residue_mask] + c_out[i] * coords_pred_pocket[residue_mask]
+        
+        # Combine preconditioned coordinates with raw logits (no preconditioning for classification)
+        ligand_out = torch.cat([coords_out_lig, logits_pred_lig], dim=1)
+        pocket_out = torch.cat([coords_out_pocket, logits_pred_pocket], dim=1)
+        
+        return ligand_out, pocket_out
+
 def test_egnn_dynamics():
     """Test the EGNNDynamics implementation"""
     
@@ -502,25 +610,27 @@ def test_egnn_dynamics():
     residue_nf = 7
     n_dims = 3
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    joint_nf = 8
     
     # Create test data
     total_lig_atoms = 8
     total_pocket_atoms = 20
     
-    xh_atoms = torch.randn(total_lig_atoms, n_dims + atom_nf, device=device)
-    xh_residues = torch.randn(total_pocket_atoms, n_dims + residue_nf, device=device)
+    xh_atoms = torch.randn(total_lig_atoms, n_dims + joint_nf, device=device)
+    xh_residues = torch.randn(total_pocket_atoms, n_dims + joint_nf, device=device)
     
     mask_atoms = torch.cat([torch.zeros(4), torch.ones(4)]).long().to(device)
     mask_residues = torch.cat([torch.zeros(12), torch.ones(8)]).long().to(device)
     
-    t = torch.tensor([[0.3], [0.7]], dtype=torch.float32, device=device)
+    t = torch.tensor([0.3, 0.7], dtype=torch.float32, device=device)
+    print(t.shape)
     
     # Create model
     model = EGNNDynamics(
         atom_nf=atom_nf,
         residue_nf=residue_nf,
         n_dims=n_dims,
-        joint_nf=8,
+        joint_nf=joint_nf,
         hidden_nf=32,
         device=device,
         n_layers=2,
@@ -532,6 +642,8 @@ def test_egnn_dynamics():
         tanh=True,
         attention=True
     )
+
+    model = PreconditionedEGNNDynamics(model)
     
     # Forward pass
     ligand_out, pocket_out = model(xh_atoms, xh_residues, t, mask_atoms, mask_residues)
