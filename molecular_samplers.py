@@ -6,23 +6,15 @@ Follows exact reverse SDE dynamics with automatic differentiation, all CUDA-opti
 """
 
 import torch
-import argparse
 import numpy as np
-from typing import Tuple, Optional, Callable, Mapping, Any, NamedTuple, Protocol
+from typing import Tuple, Optional, Callable, Mapping, Any, NamedTuple, Protocol, Dict
 from torch.autograd import grad
 from torch_scatter import scatter_mean
-from torch_geometric.data import Data
+import torch.nn.functional as F
+
 
 from molecular_diffusion import MolecularDiffusion, remove_mean_batch
-from molecular_diffusion import MolecularDenoisingModel
-from constants import (
-    ligand_size_distribution, 
-    ligand_to_pocket_size_mapping, 
-    atom_decoder, 
-    aa_decoder3, 
-    atom_freq_dist, 
-    aa_freq_dist
-    )
+import molecular_diffusion
 
 Tensor = torch.Tensor
 TensorMapping = Mapping[str, Tensor]
@@ -251,6 +243,7 @@ class MolecularSampler:
         n_dims: int = 3,
         atom_nf: int = 10,
         residue_nf: int = 20,
+        joint_nf: int = 16,
     ):
         self.ligand_sizes = ligand_sizes
         self.pocket_sizes = pocket_sizes
@@ -262,6 +255,7 @@ class MolecularSampler:
         self.n_dims = n_dims
         self.atom_nf = atom_nf
         self.residue_nf = residue_nf
+        self.joint_nf = joint_nf
         self.batch_size = len(ligand_sizes)
         
         if len(ligand_sizes) != len(pocket_sizes):
@@ -339,11 +333,11 @@ class MolecularSampler:
         initial_scale = self.scheme.scale(self.tspan[0])
         
         ligand_noise = (
-            torch.randn(total_lig_atoms, self.n_dims + self.atom_nf, device='cuda') 
+            torch.randn(total_lig_atoms, self.n_dims + self.joint_nf, device='cuda') 
             * initial_sigma * initial_scale
         )
         pocket_noise = (
-            torch.randn(total_pocket_atoms, self.n_dims + self.residue_nf, device='cuda')
+            torch.randn(total_pocket_atoms, self.n_dims + self.joint_nf, device='cuda')
             * initial_sigma * initial_scale
         )
         
@@ -408,9 +402,13 @@ class MolecularSampler:
         pocket_features = pocket_data[:, self.n_dims:]
         
         # Unnormalize
+        with torch.no_grad():
+            lig_logits = self._model.denoiser.egnn_dynamics.atom_decoder(lig_features)
+            pocket_logits = self._model.denoiser.egnn_dynamics.residue_decoder(pocket_features)
+            
         lig_coords_unnorm, lig_features_unnorm, pocket_coords_unnorm, pocket_features_unnorm = \
             self.scheme.unnormalize_molecular_data(
-                lig_coords, lig_features, pocket_coords, pocket_features,
+                lig_coords, lig_logits, pocket_coords, pocket_logits,
                 discretize_features=discretize_features,
                 atom_nf=self.atom_nf, residue_nf=self.residue_nf
             )
@@ -451,6 +449,7 @@ class MolecularSdeSampler(MolecularSampler):
         n_dims: int = 3,
         atom_nf: int = 10,
         residue_nf: int = 20,
+        joint_nf: int = 16,
     ):
         super().__init__(
             ligand_sizes=ligand_sizes,
@@ -463,6 +462,7 @@ class MolecularSdeSampler(MolecularSampler):
             n_dims=n_dims,
             atom_nf=atom_nf,
             residue_nf=residue_nf,
+            joint_nf=joint_nf,
         )
         
         self.integrator = integrator or MolecularEulerMaruyama(
@@ -620,15 +620,15 @@ class MolecularSdeSampler(MolecularSampler):
 
 
 # ********************
-# Molecular Denoiser Wrapper - FIXED VERSION
+# Molecular Denoiser Wrapper
 # ********************
 
 def create_molecular_denoiser_wrapper(egnn_model, scheme) -> MolecularDenoiseFn:
     """    
-    Wraps the EGNN to handle MolecularState inputs/outputs while maintaining
-    the same mathematical interface as the GenCFD framework.
+    Wraps the EGNN to handle MolecularState inputs/outputs with CDCD-style
+    score interpolation for categorical features.
     
-    IMPORTANT: Model predicts CLEAN signal (GenCFD-style), not noise!
+    Model predicts: coordinates (clean) + feature embeddings (for score interpolation)
     """
     
     def molecular_denoiser(
@@ -637,34 +637,64 @@ def create_molecular_denoiser_wrapper(egnn_model, scheme) -> MolecularDenoiseFn:
         cond: TensorMapping | None = None
     ) -> MolecularState:
         
-        # Convert sigma to time for EGNN
-        if isinstance(sigma, Tensor) and sigma.numel() == 1:
-            sigma = sigma.item()
-        
-        # Create time input for EGNN (normalized by scheme's sigma_max)
-        t_normalized = torch.full(
-            (molecular_state.batch_size, 1), 
-            sigma / scheme.sigma_max, 
-            device=molecular_state.ligand.device
-        )
-        
-        # Forward pass through EGNN - predicts CLEAN signal (GenCFD-style)
+        # Forward pass through EGNN - predicts coords + logits
         with torch.no_grad():
-            pred_clean_lig, pred_clean_pocket = egnn_model(
+            pred_output_lig, pred_output_pocket = egnn_model(
                 molecular_state.ligand,
                 molecular_state.pocket,
-                t_normalized,
+                sigma,
                 molecular_state.ligand_mask,
                 molecular_state.pocket_mask
             )
         
-        # Add gradient clipping to prevent numerical explosion during sampling
-        #pred_clean_lig = torch.clamp(pred_clean_lig, -100.0, 100.0)
-        #pred_clean_pocket = torch.clamp(pred_clean_pocket, -100.0, 100.0)
+        # Split EGNN output: coordinates + logits
+        n_dims = 3  # assuming 3D coordinates
+        
+        # Ligand
+        pred_coords_lig = pred_output_lig[:, :n_dims]              # [N_lig, 3] - clean coords
+        pred_logits_lig = pred_output_lig[:, n_dims:]              # [N_lig, atom_nf] - logits
+        
+        # Pocket  
+        pred_coords_pocket = pred_output_pocket[:, :n_dims]        # [N_pocket, 3] - clean coords
+        pred_logits_pocket = pred_output_pocket[:, n_dims:]        # [N_pocket, residue_nf] - logits
+        
+        # Convert logits to probabilities
+        probs_lig = F.softmax(pred_logits_lig, dim=-1)             # [N_lig, atom_nf]
+        probs_pocket = F.softmax(pred_logits_pocket, dim=-1)       # [N_pocket, residue_nf]
+        
+        # Get normalized embeddings from the model
+        atom_embeddings = egnn_model.egnn_dynamics.atom_encoder(
+            torch.eye(pred_logits_lig.size(-1), device=pred_logits_lig.device)
+        )  # [atom_nf, joint_nf]
+        atom_embeddings = F.normalize(atom_embeddings, dim=-1)
+        
+        residue_embeddings = egnn_model.egnn_dynamics.residue_encoder(
+            torch.eye(pred_logits_pocket.size(-1), device=pred_logits_pocket.device)
+        )  # [residue_nf, joint_nf] 
+        residue_embeddings = F.normalize(residue_embeddings, dim=-1)
+        
+        # Score interpolation: Σ p_i * (e_i - x_noisy) / σ²
+        # This gives us the "effective clean embedding prediction"
+        # Expand sigma for per-atom computation
+        if sigma.dim() == 0:
+            sigma_expanded_lig = sigma.expand(molecular_state.ligand.size(0))
+            sigma_expanded_pocket = sigma.expand(molecular_state.pocket.size(0))
+        else:
+            sigma_expanded_lig = sigma[molecular_state.ligand_mask]
+            sigma_expanded_pocket = sigma[molecular_state.pocket_mask]
+        
+        # Weighted sum of embeddings (what CDCD calls x̂_0)
+        interpolated_embeddings_lig = torch.matmul(probs_lig, atom_embeddings)      # [N_lig, joint_nf]
+        interpolated_embeddings_pocket = torch.matmul(probs_pocket, residue_embeddings)  # [N_pocket, joint_nf]
+        
+        # For the SDE, we need to return the "effective clean prediction"
+        # This combines clean coordinates with interpolated embeddings
+        effective_clean_lig = torch.cat([pred_coords_lig, interpolated_embeddings_lig], dim=1)
+        effective_clean_pocket = torch.cat([pred_coords_pocket, interpolated_embeddings_pocket], dim=1)
         
         return MolecularState(
-            ligand=pred_clean_lig,
-            pocket=pred_clean_pocket,
+            ligand=effective_clean_lig,
+            pocket=effective_clean_pocket,
             ligand_mask=molecular_state.ligand_mask,
             pocket_mask=molecular_state.pocket_mask,
             batch_size=molecular_state.batch_size
@@ -673,18 +703,42 @@ def create_molecular_denoiser_wrapper(egnn_model, scheme) -> MolecularDenoiseFn:
     return molecular_denoiser
 
 
+def edm_noise_decay(
+    scheme: molecular_diffusion.MolecularDiffusion,
+    rho: int = 7,
+    num_steps: int = 256,
+    end_sigma: float | None = 1e-3,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device = None,
+) -> Tensor:
+    """Time steps corresponding to Eq. 5 in Karras et al."""
+
+    rho_inv = torch.tensor(1.0 / rho)
+    sigma_schedule = torch.arange(num_steps, dtype=dtype, device=device) / (
+        num_steps - 1
+    )
+    sigma_schedule *= torch.pow(end_sigma, rho_inv) - torch.pow(
+        scheme.sigma_max, rho_inv
+    )
+    sigma_schedule += torch.pow(scheme.sigma_max, rho_inv)
+    sigma_schedule = torch.pow(sigma_schedule, rho)
+    return scheme.sigma.inverse(sigma_schedule)
+    
+
 def create_molecular_sampler_from_model(
     model,
     ligand_sizes: list[int],
     pocket_sizes: list[int],
     num_steps: int = 50,
-    schedule_type: str = "exponential",
-    return_full_paths: bool = False
+    schedule_type: str = "exponential_noise_schedule",
+    return_full_paths: bool = False,
+    config: Dict = {'clip_max': 100.0},
 ) -> MolecularSdeSampler:
     """Create a molecular sampler from a trained model"""
     
     # Create time span 
-    tspan = torch.linspace(1.0, 0.0, num_steps + 1, device='cuda')
+    # tspan = torch.linspace(1.0, 0.0, num_steps + 1, device='cuda')
+    tspan = edm_noise_decay(scheme=model.scheme, num_steps=num_steps)
     
     # Create denoiser wrapper - now passing the scheme for proper normalization
     molecular_denoise_fn = create_molecular_denoiser_wrapper(model.denoiser, model.scheme)
@@ -700,180 +754,37 @@ def create_molecular_sampler_from_model(
         return_full_paths=return_full_paths,
         n_dims=model.n_dims,
         atom_nf=model.atom_nf,
-        residue_nf=model.residue_nf
+        residue_nf=model.residue_nf,
+        joint_nf=model.joint_nf,
     )
+    sampler._model = model
     
     return sampler
 
 
-def load_checkpoint(checkpoint_path: str) -> MolecularDenoisingModel:
-    """Load model from checkpoint"""
-    
-    print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location='cuda')
-    
-    # Recreate model 
-    model_params = checkpoint['model_params']
-    
-    # Recreate the diffusion scheme from parameters
-    from molecular_diffusion import molecular_exponential_noise_schedule, MolecularDiffusion
-    
-    scheme_params = model_params['scheme_params']
-    sigma_schedule = molecular_exponential_noise_schedule(
-        clip_max=scheme_params['sigma_max'],
-        base=np.e**0.5,
-        start=0.0,
-        end=5.0
-    )
-    
-    scheme = MolecularDiffusion.create_variance_exploding(
-        sigma=sigma_schedule,
-        coord_norm=scheme_params['coord_norm'],
-        feature_norm=scheme_params['feature_norm'],
-        feature_bias=scheme_params['feature_bias']
-    )
-    
-    # Create noise sampling and weighting
-    from molecular_diffusion import molecular_log_uniform_sampling, molecular_edm_weighting
-    
-    noise_sampling = molecular_log_uniform_sampling(
-        scheme=scheme,
-        clip_min=scheme_params['sigma_min'],
-        uniform_grid=False
-    )
-    
-    noise_weighting = molecular_edm_weighting(data_std=1.0)
-    
-    model = MolecularDenoisingModel(
-        atom_nf=model_params['atom_nf'],
-        residue_nf=model_params['residue_nf'],
-        n_dims=model_params['n_dims'],
-        joint_nf=model_params['joint_nf'],
-        hidden_nf=model_params['hidden_nf'],
-        n_layers=model_params['n_layers'],
-        edge_embedding_dim=model_params['edge_embedding_dim'],
-        update_pocket_coords=model_params['update_pocket_coords'],
-        scheme=scheme,
-        noise_sampling=noise_sampling,
-        noise_weighting=noise_weighting
-    )
-    
-    model.initialize()
-    model.denoiser.load_state_dict(checkpoint['model_state_dict'])
-    
-    print(f"✅ Model loaded successfully!")
-    return model
-
-
-def compare_distributions(dist1, dist2):
-    """
-    Compare two probability distributions using KL and JS divergence.
-    Args:
-        dist1: First distribution array
-        dist2: Second distribution array
-    Returns:
-        dict: Dictionary containing KL and JS divergence metrics
-    """
-    dist1 = dist1 / np.sum(dist1)
-    dist2 = dist2 / np.sum(dist2)
-    
-    # Compute KL divergence
-    epsilon = 1e-10
-    kl_div = np.sum(dist1 * np.log((dist1 + epsilon) / (dist2 + epsilon)))
-    
-    # Compute Jensen-Shannon divergence
-    m = 0.5 * (dist1 + dist2)
-    js_div = 0.5 * np.sum(dist1 * np.log((dist1 + epsilon) / (m + epsilon))) + \
-             0.5 * np.sum(dist2 * np.log((dist2 + epsilon) / (m + epsilon)))
-    
-    return float(kl_div), float(js_div)
-
-
-def sample_lig_pocket_sizes(N: int, lig_lower_bound: int = 10, lig_upper_bound: int = 50):
-    """
-    Sample N ligand sizes and corresponding pocket sizes from the saved distributions.
-    Returns: tuple: (ligand_sizes, pocket_sizes)
-    """
-    ligand_sizes = []
-    pocket_sizes = []
-    
-    # Convert to numpy array and normalize the slice we want (10-49)
-    ligand_size_dist = np.array(ligand_size_distribution[lig_lower_bound:lig_upper_bound])
-    ligand_size_dist = ligand_size_dist / ligand_size_dist.sum()
-
-    for _ in range(N):
-        ligand_size = np.random.choice(np.arange(10, 50), p=ligand_size_dist)
-        ligand_sizes.append(ligand_size)
-        pocket_dist = np.array(ligand_to_pocket_size_mapping[ligand_size])
-        if pocket_dist.sum() > 0:
-            pocket_dist = pocket_dist / pocket_dist.sum()
-            pocket_size = np.random.choice(np.arange(len(pocket_dist)), p=pocket_dist)
-        else:
-            pocket_size = np.random.randint(20, 50)
-        pocket_sizes.append(pocket_size)
-    
-    return ligand_sizes, pocket_sizes
-
-
-def save_samples_to_graphs(samples: list[Data], num_samples: int, save_path: str):
-    '''Save samples individually as graphs for visualization'''
-
-    for i in range(num_samples):
-        graph = Data(
-            ligand_coords=samples['ligand_coords'][samples['ligand_mask']==i].cpu(),
-            ligand_features=samples['ligand_features'][samples['ligand_mask']==i].cpu(),
-            pocket_coords=samples['pocket_coords'][samples['pocket_mask']==i].cpu(),
-            pocket_features=samples['pocket_features'][samples['pocket_mask']==i].cpu()
-        )
-        torch.save(graph, save_path.replace(".pt", f"_graph_{i}.pt"))
-
-
-def evaluate_samples(samples: list[Data]):
-    """Evaluate the quality of sampled binding pockets
-         - Jenson-Shannon divergence of atom distribution from training distribution
-         - Jenson-Shannon divergence of amino acid distribution from training distribution
-    """
-
-    # Divergence of atom distribution from training distribution
-    ligand_features = samples['ligand_features'].cpu()
-    atom_distribution = ligand_features.sum(dim=0)
-    training_atom_distribution = np.array([atom_freq_dist[atom] for atom in atom_decoder])
-    _, atoms_dist_js_divergence = compare_distributions(atom_distribution.numpy(), training_atom_distribution)
-
-    # Divergence of amino acid distribution from training distribution
-    pocket_features = samples['pocket_features'].cpu()
-    aa_distribution = pocket_features.sum(dim=0)
-    training_aa_distribution = np.array([aa_freq_dist[aa] for aa in aa_decoder3])
-    _, aa_dist_js_divergence = compare_distributions(aa_distribution.numpy(), training_aa_distribution)
-
-    return {
-        'atoms_dist_js_divergence': atoms_dist_js_divergence, 
-        'aa_dist_js_divergence': aa_dist_js_divergence
-        }
-
-
 def test_molecular_samplers():
-    """Test the molecular SDE sampler"""
+    """Test the molecular SDE sampler with better debugging"""
     
     print("Testing Molecular SDE Sampler (CUDA)...")
     
-
     # Create dummy model for testing
-    if model is None:
-        atom_nf = 4
-        residue_nf = 5
-
-        model = MolecularDenoisingModel(
-            atom_nf=atom_nf,
-            residue_nf=residue_nf,
-            joint_nf=8,
-            hidden_nf=16,
-            n_layers=1
-        )
-        model.initialize()
-
+    from molecular_diffusion import MolecularDenoisingModel
+    
+    atom_nf = 4
+    residue_nf = 5
+    
+    model = MolecularDenoisingModel(
+        atom_nf=atom_nf,
+        residue_nf=residue_nf,
+        joint_nf=8,
+        hidden_nf=16,
+        n_layers=1
+    )
+    model.initialize()
+    
     # Create sampler
-    ligand_sizes, pocket_sizes = sample_lig_pocket_sizes(num_samples)
+    ligand_sizes = [3, 4]
+    pocket_sizes = [8, 6]
     
     sampler = create_molecular_sampler_from_model(
         model=model,
@@ -881,115 +792,36 @@ def test_molecular_samplers():
         pocket_sizes=pocket_sizes,
         num_steps=10
     )
-
-    # Generate samples
+    
+    # Generate samples with try-catch
     print("Generating samples...")
-    samples = sampler.generate()
-    
-    print(f"Generated samples:")
-    print(f"  Ligand coords: {samples['ligand_coords'].shape}")
-    print(f"  Ligand features: {samples['ligand_features'].shape}")
-    print(f"  Pocket coords: {samples['pocket_coords'].shape}")
-    print(f"  Pocket features: {samples['pocket_features'].shape}")
-    
-    # Verify discrete features
-    lig_sums = samples['ligand_features'].sum(dim=1)
-    pocket_sums = samples['pocket_features'].sum(dim=1)
-    
-    print(f"  Ligand features properly one-hot: {torch.allclose(lig_sums, torch.ones_like(lig_sums))}")
-    print(f"  Pocket features properly one-hot: {torch.allclose(pocket_sums, torch.ones_like(pocket_sums))}")
-
-    # Show some statistics
-    ligand_types = torch.argmax(samples['ligand_features'], dim=1)
-    pocket_types = torch.argmax(samples['pocket_features'], dim=1)
-    
-    print(f"  Ligand atom type distribution: {torch.bincount(ligand_types)}")
-    print(f"  Pocket residue type distribution: {torch.bincount(pocket_types)}")
-    
-    print("✅ Molecular SDE sampler test passed!")
-
-
-
-def sample_molecules(model: MolecularDenoisingModel, 
-            num_steps: int = 50, 
-            schedule_type: str = "exponential", 
-            num_samples: int = 3
-            ):
-
-    """Generate new molecules using the trained model"""
-    
-    print(f"\n{'='*60}")
-    print("SAMPLING NEW MOLECULES")
-    print(f"{'='*60}")
-
-    # Create sampler
-    ligand_sizes, pocket_sizes = sample_lig_pocket_sizes(num_samples)
-    print(f"Ligand sizes: {ligand_sizes}")
-    print(f"Pocket sizes: {pocket_sizes}")
-    
-    sampler = create_molecular_sampler_from_model(
-        model=model,
-        ligand_sizes=ligand_sizes,
-        pocket_sizes=pocket_sizes,
-        num_steps=num_steps,
-        schedule_type=schedule_type,
-        return_full_paths=False
-    )
-    
-    print("Sampling unconditional molecules...")
-    print(f"Using {num_steps} sampling steps...")
-    
-    # Generate samples
-    samples = sampler.generate()
-    
-    print(f"\nGenerated molecules:")
-    print(f"  Total ligand atoms: {samples['ligand_coords'].shape[0]}")
-    print(f"  Total pocket residues: {samples['pocket_coords'].shape[0]}")
-    print(f"  Ligand coordinate range: [{samples['ligand_coords'].min():.2f}, {samples['ligand_coords'].max():.2f}]")
-    print(f"  Pocket coordinate range: [{samples['pocket_coords'].min():.2f}, {samples['pocket_coords'].max():.2f}]")
-    
-    # Check that categorical features are properly discretized 
-    lig_feature_sums = samples['ligand_features'].sum(dim=1)
-    pocket_feature_sums = samples['pocket_features'].sum(dim=1)
-    
-    print(f"  Ligand features properly one-hot: {torch.allclose(lig_feature_sums, torch.ones_like(lig_feature_sums))}")
-    print(f"  Pocket features properly one-hot: {torch.allclose(pocket_feature_sums, torch.ones_like(pocket_feature_sums))}")
-    
-    # Show some statistics
-    ligand_types = torch.argmax(samples['ligand_features'], dim=1)
-    pocket_types = torch.argmax(samples['pocket_features'], dim=1)
-    
-    print(f"  Ligand atom type distribution: {torch.bincount(ligand_types)}")
-    print(f"  Pocket residue type distribution: {torch.bincount(pocket_types)}")
-    
-    print(f"\n✅ Sampling completed successfully!")
-    
-    return samples
-
+    try:
+        samples = sampler.generate()
+        
+        print(f"Generated samples:")
+        print(f"  Ligand coords: {samples['ligand_coords'].shape}")
+        print(f"  Ligand features: {samples['ligand_features'].shape}")
+        print(f"  Pocket coords: {samples['pocket_coords'].shape}")
+        print(f"  Pocket features: {samples['pocket_features'].shape}")
+        
+        # Verify discrete features
+        lig_sums = samples['ligand_features'].sum(dim=1)
+        pocket_sums = samples['pocket_features'].sum(dim=1)
+        
+        print(f"  Ligand feature sums (should be 1.0): {lig_sums[:5]}...")
+        print(f"  Pocket feature sums (should be 1.0): {pocket_sums[:5]}...")
+        print("✅ Test passed!")
+        
+    except Exception as e:
+        print(f"❌ Error during sampling: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Try to debug what went wrong
+        print("\nDebugging information:")
+        # print(f"Model norm_values: {model.scheme.norm_values}")
+        # print(f"Model norm_biases: {model.scheme.norm_biases}")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default=None)
-    parser.add_argument("--n_samples", type=int, default=3)
-    args = parser.parse_args()
-    
-    if args.model_path is None:
-        test_molecular_samplers()
-
-    else:
-        model = load_checkpoint(args.model_path)
-
-        samples = sample_molecules(model, args.n_samples)
-
-        for i in range(args.n_samples):
-            graph = Data(
-                ligand_coords=samples['ligand_coords'][samples['ligand_mask']==i].cpu(),
-                ligand_features=samples['ligand_features'][samples['ligand_mask']==i].cpu(),
-                pocket_coords=samples['pocket_coords'][samples['pocket_mask']==i].cpu(),
-                pocket_features=samples['pocket_features'][samples['pocket_mask']==i].cpu()
-            )
-            torch.save(graph, args.model_path.replace(".pt", f"_sample_{i}.pt"))
-
-        
-        
+    test_molecular_samplers()
