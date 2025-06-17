@@ -9,7 +9,7 @@ import numpy as np
 from typing import Callable, Tuple, Optional, Protocol
 from torch_scatter import scatter_mean
 
-from egnn_dynamics import EGNNDynamics
+from egnn_dynamics import EGNNDynamics, PreconditionedEGNNDynamics
 
 Tensor = torch.Tensor
 Numeric = float | int | Tensor
@@ -31,7 +31,7 @@ def remove_mean_batch(x: Tensor, indices: Tensor) -> Tensor:
 # ********************
 
 @dataclasses.dataclass(frozen=True)
-class MolecularInvertibleSchedule:
+class InvertibleSchedule:
     """Molecular version of InvertibleSchedule"""
     
     forward: ScheduleFn
@@ -45,31 +45,31 @@ class MolecularInvertibleSchedule:
         return result.to(self.device)
 
 
-def _molecular_linear_rescale(in_min: float, in_max: float, out_min: float, out_max: float) -> MolecularInvertibleSchedule:
+def _linear_rescale(in_min: float, in_max: float, out_min: float, out_max: float) -> InvertibleSchedule:
     in_range = in_max - in_min
     out_range = out_max - out_min
     fwd = lambda x: out_min + (x - in_min) / in_range * out_range
     inv = lambda y: in_min + (y - out_min) / out_range * in_range
-    return MolecularInvertibleSchedule(fwd, inv, device='cuda')
+    return InvertibleSchedule(fwd, inv, device='cuda')
 
 
-def molecular_exponential_noise_schedule(
-    clip_max: float = 10.0,  # Reduced from 80.0
+def exponential_noise_schedule(
+    clip_max: float = 100.0,
     base: float = np.e**0.5,
     start: float = 0.0,
     end: float = 5.0,
-) -> MolecularInvertibleSchedule:
+) -> InvertibleSchedule:
     
     if not (start < end and base > 1.0):
         raise ValueError("Must have `base` > 1 and `start` < `end`.")
 
-    in_rescale = _molecular_linear_rescale(
+    in_rescale = _linear_rescale(
         in_min=MIN_DIFFUSION_TIME,
         in_max=MAX_DIFFUSION_TIME,
         out_min=start,
         out_max=end,
     )
-    out_rescale = _molecular_linear_rescale(
+    out_rescale = _linear_rescale(
         in_min=base**start, in_max=base**end, out_min=0.0, out_max=clip_max
     )
 
@@ -85,7 +85,7 @@ def molecular_exponential_noise_schedule(
             torch.log(out_rescale.inverse(y_tensor)) / torch.log(base_tensor)
         )
     
-    return MolecularInvertibleSchedule(sigma, inverse, device='cuda')
+    return InvertibleSchedule(sigma, inverse, device='cuda')
 
 
 # ********************
@@ -98,7 +98,7 @@ class MolecularDiffusion:
     Simplified GenCFD-style diffusion for molecular data.
     """
     
-    sigma: MolecularInvertibleSchedule
+    sigma: InvertibleSchedule
     
     # Molecular-specific parameters
     coord_norm: float = 1.0
@@ -131,33 +131,48 @@ class MolecularDiffusion:
         return ligand_coords_norm, ligand_features_norm, pocket_coords_norm, pocket_features_norm
 
     def unnormalize_molecular_data(self, ligand_coords: Tensor, ligand_features: Tensor,
-                                  pocket_coords: Tensor, pocket_features: Tensor,
-                                  discretize_features: bool = False, 
-                                  atom_nf: int = 10, residue_nf: int = 20) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Unnormalize molecular data (kept for compatibility)"""
+                              pocket_coords: Tensor, pocket_features: Tensor,
+                              discretize_features: bool = False, 
+                              atom_nf: int = 10, residue_nf: int = 20) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Unnormalize molecular data with proper dimension handling"""
         
         # Unnormalize coordinates
         ligand_coords_unnorm = ligand_coords * self.coord_norm
         pocket_coords_unnorm = pocket_coords * self.coord_norm
         
-        # Unnormalize and optionally discretize features
+        # Unnormalize features
         ligand_features_unnorm = ligand_features * self.feature_norm + self.feature_bias
         pocket_features_unnorm = pocket_features * self.feature_norm + self.feature_bias
         
         if discretize_features:
-            ligand_features_unnorm = torch.nn.functional.one_hot(
-                torch.argmax(ligand_features_unnorm, dim=1), atom_nf
-            ).float()
-            pocket_features_unnorm = torch.nn.functional.one_hot(
-                torch.argmax(pocket_features_unnorm, dim=1), residue_nf
-            ).float()
+            # Debug info
+            print(f"DEBUG unnormalize: ligand_features_unnorm.shape = {ligand_features_unnorm.shape}")
+            print(f"DEBUG unnormalize: pocket_features_unnorm.shape = {pocket_features_unnorm.shape}")
+            print(f"DEBUG unnormalize: ligand_features range [{ligand_features_unnorm.min():.3f}, {ligand_features_unnorm.max():.3f}]")
+            print(f"DEBUG unnormalize: pocket_features range [{pocket_features_unnorm.min():.3f}, {pocket_features_unnorm.max():.3f}]")
+            
+            # Use dim=-1 to get argmax over the last dimension (feature classes)
+            # Clamp to ensure indices are in valid range
+            lig_indices = torch.argmax(ligand_features_unnorm, dim=-1)  # [N_lig]
+            pocket_indices = torch.argmax(pocket_features_unnorm, dim=-1)  # [N_pocket]
+            
+            print(f"DEBUG: lig_indices.shape = {lig_indices.shape}, range [{lig_indices.min()}, {lig_indices.max()}]")
+            print(f"DEBUG: pocket_indices.shape = {pocket_indices.shape}, range [{pocket_indices.min()}, {pocket_indices.max()}]")
+            print(f"DEBUG: expected atom_nf = {atom_nf}, residue_nf = {residue_nf}")
+            
+            # Convert to one-hot
+            ligand_features_unnorm = torch.nn.functional.one_hot(lig_indices, atom_nf).float()
+            pocket_features_unnorm = torch.nn.functional.one_hot(pocket_indices, residue_nf).float()
+            
+            print(f"DEBUG: final ligand_features_unnorm.shape = {ligand_features_unnorm.shape}")
+            print(f"DEBUG: final pocket_features_unnorm.shape = {pocket_features_unnorm.shape}")
         
         return ligand_coords_unnorm, ligand_features_unnorm, pocket_coords_unnorm, pocket_features_unnorm
     
     @classmethod
     def create_variance_exploding(
         cls,
-        sigma: MolecularInvertibleSchedule,
+        sigma: InvertibleSchedule,
         coord_norm: float = 1.0,
         feature_norm: float = 1.0,
         feature_bias: float = 0.0,
@@ -179,15 +194,15 @@ class MolecularDiffusion:
 # Noise Sampling and Weighting 
 # ********************
 
-class MolecularNoiseLevelSampling(Protocol):
+class NoiseLevelSampling(Protocol):
     def __call__(self, shape: Tuple[int, ...]) -> Tensor: ...
 
 
-def molecular_log_uniform_sampling(
+def log_uniform_sampling(
     scheme: MolecularDiffusion,
     clip_min: float = 1e-3,  # Increased from 1e-4
     uniform_grid: bool = False,
-) -> MolecularNoiseLevelSampling:
+) -> NoiseLevelSampling:
 
     def _noise_sampling(shape: Tuple[int, ...]) -> Tensor:
         if uniform_grid:
@@ -207,12 +222,12 @@ def molecular_log_uniform_sampling(
     return _noise_sampling
 
 
-class MolecularNoiseLossWeighting(Protocol):
+class NoiseLossWeighting(Protocol):
     def __call__(self, sigma: Tensor) -> Tensor: ...
 
-def molecular_edm_weighting(
+def edm_weighting(
     data_std: float = 1.0, device=None
-) -> MolecularNoiseLossWeighting:
+) -> NoiseLossWeighting:
     """Weighting proposed in Karras et al. (https://arxiv.org/abs/2206.00364).
 
     This weighting ensures the effective weights are uniform across noise levels
@@ -258,15 +273,15 @@ class MolecularDenoisingModel:
     
     # Diffusion scheme
     scheme: MolecularDiffusion = None
-    noise_sampling: MolecularNoiseLevelSampling = None
-    noise_weighting: MolecularNoiseLossWeighting = None
+    noise_sampling: NoiseLevelSampling = None
+    noise_weighting: NoiseLossWeighting = None
     
     def __post_init__(self):
         """Initialize the denoiser and diffusion components"""
         
         # Create default scheme if not provided
         if self.scheme is None:
-            sigma_schedule = molecular_exponential_noise_schedule(clip_max=10.0)  # Much smaller
+            sigma_schedule = exponential_noise_schedule(clip_max=100.0) 
             scheme = MolecularDiffusion.create_variance_exploding(
                 sigma=sigma_schedule,
                 coord_norm=1.0,
@@ -278,13 +293,13 @@ class MolecularDenoisingModel:
         
         # Create default noise sampling if not provided
         if self.noise_sampling is None:
-            noise_sampling = molecular_log_uniform_sampling(self.scheme)
+            noise_sampling = log_uniform_sampling(self.scheme)
             object.__setattr__(self, 'noise_sampling', noise_sampling)
         
         # Create default noise weighting if not provided
         if self.noise_weighting is None:
-            noise_weighting = molecular_edm_weighting()
-            object.__setattr__(self, 'edm_noise_weighting', noise_weighting)
+            noise_weighting = edm_weighting()
+            object.__setattr__(self, 'noise_weighting', noise_weighting)
         
         # Create the EGNN denoiser
         denoiser = EGNNDynamics(
@@ -299,6 +314,8 @@ class MolecularDenoisingModel:
             update_pocket_coords=self.update_pocket_coords,
             edge_embedding_dim=self.edge_embedding_dim
         )
+
+        denoiser = PreconditionedEGNNDynamics(denoiser)
         object.__setattr__(self, 'denoiser', denoiser)
 
     def initialize(self):
@@ -307,17 +324,10 @@ class MolecularDenoisingModel:
 
     def loss_fn(self, batch: dict):
         """
-        GenCFD-style loss function with categorical features
-        
-        Args:
-            batch: Molecular batch with ligand/pocket coords, features, masks
-            
-        Returns:
-            loss: Training loss
-            metrics: Dictionary of training metrics
+        CDCD-style loss function: noise embeddings, predict logits, use cross-entropy
         """
         
-        # Extract molecular data (all on CUDA)
+        # Extract molecular data
         lig_coords = batch['ligand_coords'].cuda()
         lig_features = batch['ligand_features'].cuda()  # One-hot features
         pocket_coords = batch['pocket_coords'].cuda()
@@ -326,17 +336,21 @@ class MolecularDenoisingModel:
         pocket_mask = batch['pocket_mask'].cuda()
         batch_size = batch['batch_size']
         
-        # Store clean one-hot features for categorical loss
-        lig_features_clean = lig_features.clone()
-        pocket_features_clean = pocket_features.clone()
+        # Get true atom/residue type indices for cross-entropy loss
+        true_atom_types = torch.argmax(lig_features, dim=-1)      # [N_lig] - indices
+        true_residue_types = torch.argmax(pocket_features, dim=-1)  # [N_pocket] - indices
         
-        # Normalize molecular data (coordinates only, keep features as-is for now)
+        # Convert one-hot to embeddings using encoders (DIFFERENTIABLE!)
+        lig_embeddings_clean = self.denoiser.atom_encoder(lig_features.float())      # [N_lig, joint_nf]
+        pocket_embeddings_clean = self.denoiser.residue_encoder(pocket_features.float())  # [N_pocket, joint_nf]
+        
+        # Normalize embeddings (CDCD style)
+        lig_embeddings_clean = F.normalize(lig_embeddings_clean, dim=-1)
+        pocket_embeddings_clean = F.normalize(pocket_embeddings_clean, dim=-1)
+        
+        # Normalize coordinates
         lig_coords_norm = lig_coords / self.scheme.coord_norm
         pocket_coords_norm = pocket_coords / self.scheme.coord_norm
-        
-        # Convert one-hot features to normalized continuous (for noise addition)
-        lig_features_norm = (lig_features.float() - self.scheme.feature_bias) / self.scheme.feature_norm
-        pocket_features_norm = (pocket_features.float() - self.scheme.feature_bias) / self.scheme.feature_norm
         
         # Remove center of mass for translation invariance
         combined_coords = torch.cat([lig_coords_norm, pocket_coords_norm], dim=0)
@@ -346,18 +360,18 @@ class MolecularDenoisingModel:
         lig_coords_centered = combined_coords_centered[:len(lig_coords)]
         pocket_coords_centered = combined_coords_centered[len(lig_coords):]
         
-        # Concatenate coordinates and features (clean targets)
-        xh_lig_clean = torch.cat([lig_coords_centered, lig_features_norm], dim=1)
-        xh_pocket_clean = torch.cat([pocket_coords_centered, pocket_features_norm], dim=1)
+        # Concatenate coordinates and embeddings (NOT one-hot!)
+        xh_lig_clean = torch.cat([lig_coords_centered, lig_embeddings_clean], dim=1)  # [N_lig, 3 + joint_nf]
+        xh_pocket_clean = torch.cat([pocket_coords_centered, pocket_embeddings_clean], dim=1)  # [N_pocket, 3 + joint_nf]
         
-        # Sample noise levels - GenCFD style (much simpler)
+        # Sample noise levels
         sigma = self.noise_sampling(shape=(batch_size,))  # [batch_size]
         
         # Generate Gaussian noise for the entire state
         noise_lig = torch.randn_like(xh_lig_clean)
         noise_pocket = torch.randn_like(xh_pocket_clean)
         
-        # Make coordinate noise COM-free (but not feature noise)
+        # Make coordinate noise COM-free (but not embedding noise)
         noise_coords_combined = torch.cat([noise_lig[:, :self.n_dims], noise_pocket[:, :self.n_dims]], dim=0)
         noise_coords_centered = remove_mean_batch(noise_coords_combined, combined_mask)
         noise_lig[:, :self.n_dims] = noise_coords_centered[:len(lig_coords)]
@@ -370,23 +384,24 @@ class MolecularDenoisingModel:
         xh_lig_noisy = xh_lig_clean + sigma_expanded_lig * noise_lig
         xh_pocket_noisy = xh_pocket_clean + sigma_expanded_pocket * noise_pocket
         
-        # Normalize time for denoiser (sigma -> [0,1])
-        sigma_max = self.scheme.sigma_max
-        t_normalized = (sigma / sigma_max).unsqueeze(1)  # [batch_size, 1]
         
-        # Forward pass through denoiser - predict CLEAN signal (GenCFD style)
-        pred_clean_lig, pred_clean_pocket = self.denoiser(
-            xh_lig_noisy, xh_pocket_noisy, t_normalized, lig_mask, pocket_mask
+        # Forward pass through denoiser - outputs coordinates + logits
+        pred_output_lig, pred_output_pocket = self.denoiser(
+            xh_lig_noisy, xh_pocket_noisy, sigma, lig_mask, pocket_mask
         )
         
-        # Simple weighting - GenCFD style (much simpler than EDM)
+        # Split predictions: coordinates + logits
+        pred_coords_lig = pred_output_lig[:, :self.n_dims]              # [N_lig, 3]
+        pred_logits_lig = pred_output_lig[:, self.n_dims:]              # [N_lig, atom_nf] - LOGITS
+        pred_coords_pocket = pred_output_pocket[:, :self.n_dims]        # [N_pocket, 3]  
+        pred_logits_pocket = pred_output_pocket[:, self.n_dims:]        # [N_pocket, residue_nf] - LOGITS
+        
+        # Loss weighting
         weights = self.noise_weighting(sigma)  # [batch_size]
         weights_lig = weights[lig_mask].unsqueeze(1)  # [N_lig, 1]
         weights_pocket = weights[pocket_mask].unsqueeze(1)  # [N_pocket, 1]
         
         # Coordinate loss: L2 between predicted and clean coordinates
-        pred_coords_lig = pred_clean_lig[:, :self.n_dims]
-        pred_coords_pocket = pred_clean_pocket[:, :self.n_dims]
         clean_coords_lig = xh_lig_clean[:, :self.n_dims]
         clean_coords_pocket = xh_pocket_clean[:, :self.n_dims]
         
@@ -394,29 +409,11 @@ class MolecularDenoisingModel:
         coord_loss_pocket = torch.mean(weights_pocket * (pred_coords_pocket - clean_coords_pocket) ** 2)
         coord_loss = coord_loss_lig + coord_loss_pocket
         
-        # Categorical loss: Handle features specially
-        pred_features_lig = pred_clean_lig[:, self.n_dims:]
-        pred_features_pocket = pred_clean_pocket[:, self.n_dims:]
-        clean_features_lig = xh_lig_clean[:, self.n_dims:]
-        clean_features_pocket = xh_pocket_clean[:, self.n_dims:]
+        # Categorical loss: Cross-entropy between logits and true atom types
+        ce_loss_lig = F.cross_entropy(pred_logits_lig, true_atom_types, reduction='none')
+        ce_loss_pocket = F.cross_entropy(pred_logits_pocket, true_residue_types, reduction='none')
         
-        # For categorical features, convert predictions back to logits and use cross-entropy
-        # First unnormalize predictions
-        pred_features_lig_unnorm = pred_features_lig * self.scheme.feature_norm + self.scheme.feature_bias
-        pred_features_pocket_unnorm = pred_features_pocket * self.scheme.feature_norm + self.scheme.feature_bias
-        
-        # Convert to logits and apply cross-entropy with clean one-hot targets
-        pred_logits_lig = pred_features_lig_unnorm / self.scheme.categorical_temperature
-        pred_logits_pocket = pred_features_pocket_unnorm / self.scheme.categorical_temperature
-        
-        true_categories_lig = torch.argmax(lig_features_clean, dim=-1)
-        true_categories_pocket = torch.argmax(pocket_features_clean, dim=-1)
-        
-        # Cross-entropy loss (weighted by noise level)
-        ce_loss_lig = F.cross_entropy(pred_logits_lig, true_categories_lig, reduction='none')
-        ce_loss_pocket = F.cross_entropy(pred_logits_pocket, true_categories_pocket, reduction='none')
-        
-        # Weight categorical loss by sigma (like coordinates)
+        # Weight categorical loss by noise level (like coordinates)
         categorical_loss_lig = torch.mean(weights[lig_mask] * ce_loss_lig)
         categorical_loss_pocket = torch.mean(weights[pocket_mask] * ce_loss_pocket)
         categorical_loss = categorical_loss_lig + categorical_loss_pocket
@@ -439,8 +436,8 @@ class MolecularDenoisingModel:
             "avg_sigma": sigma.mean().item(),
             "max_sigma": sigma.max().item(),
             "coord_pred_scale": torch.cat([pred_coords_lig, pred_coords_pocket]).abs().mean().item(),
-            "feature_pred_scale_lig": pred_features_lig_unnorm.abs().mean().item(),
-            "feature_pred_scale_pocket": pred_features_pocket_unnorm.abs().mean().item()
+            "atom_accuracy": (torch.argmax(pred_logits_lig, dim=-1) == true_atom_types).float().mean().item(),
+            "residue_accuracy": (torch.argmax(pred_logits_pocket, dim=-1) == true_residue_types).float().mean().item()
         }
         
         return total_loss, metrics
@@ -448,17 +445,18 @@ class MolecularDenoisingModel:
     def eval_fn(self, batch: dict) -> dict:
         """Evaluate denoising at multiple noise levels with proper loss breakdown"""
         
-        # Extract and normalize data
+        # Extract data
         lig_coords = batch['ligand_coords'].cuda()
-        lig_features = batch['ligand_features'].cuda()
+        lig_features = batch['ligand_features'].cuda()  # One-hot features
         pocket_coords = batch['pocket_coords'].cuda()
-        pocket_features = batch['pocket_features'].cuda()
+        pocket_features = batch['pocket_features'].cuda()  # One-hot features
         lig_mask = batch['ligand_mask'].cuda()
         pocket_mask = batch['pocket_mask'].cuda()
         batch_size = batch['batch_size']
         
-        # Store clean features
-        lig_features_clean = lig_features.clone()
+        # Get true categories for evaluation
+        true_atom_types = torch.argmax(lig_features, dim=-1)
+        true_residue_types = torch.argmax(pocket_features, dim=-1)
         
         # Test at multiple fixed noise levels
         sigma_levels = torch.logspace(
@@ -469,12 +467,19 @@ class MolecularDenoisingModel:
         eval_losses = {}
         
         for i, sigma_val in enumerate(sigma_levels):
-            # Same forward process as training
+            # Convert one-hot to embeddings (same as training)
+            lig_embeddings_clean = self.denoiser.atom_encoder(lig_features.float())
+            pocket_embeddings_clean = self.denoiser.residue_encoder(pocket_features.float())
+            
+            # Normalize embeddings (CDCD style)
+            lig_embeddings_clean = F.normalize(lig_embeddings_clean, dim=-1)
+            pocket_embeddings_clean = F.normalize(pocket_embeddings_clean, dim=-1)
+            
+            # Normalize coordinates
             lig_coords_norm = lig_coords / self.scheme.coord_norm
             pocket_coords_norm = pocket_coords / self.scheme.coord_norm
-            lig_features_norm = (lig_features.float() - self.scheme.feature_bias) / self.scheme.feature_norm
-            pocket_features_norm = (pocket_features.float() - self.scheme.feature_bias) / self.scheme.feature_norm
             
+            # Remove center of mass
             combined_coords = torch.cat([lig_coords_norm, pocket_coords_norm], dim=0)
             combined_mask = torch.cat([lig_mask, pocket_mask], dim=0)
             combined_coords_centered = remove_mean_batch(combined_coords, combined_mask)
@@ -482,14 +487,15 @@ class MolecularDenoisingModel:
             lig_coords_centered = combined_coords_centered[:len(lig_coords)]
             pocket_coords_centered = combined_coords_centered[len(lig_coords):]
             
-            xh_lig_clean = torch.cat([lig_coords_centered, lig_features_norm], dim=1)
-            xh_pocket_clean = torch.cat([pocket_coords_centered, pocket_features_norm], dim=1)
+            # Concatenate coordinates and embeddings (NOT one-hot!)
+            xh_lig_clean = torch.cat([lig_coords_centered, lig_embeddings_clean], dim=1)
+            xh_pocket_clean = torch.cat([pocket_coords_centered, pocket_embeddings_clean], dim=1)
             
             # Add noise at this level
             noise_lig = torch.randn_like(xh_lig_clean)
             noise_pocket = torch.randn_like(xh_pocket_clean)
             
-            # COM-free noise
+            # COM-free noise for coordinates only
             noise_coords_combined = torch.cat([noise_lig[:, :self.n_dims], noise_pocket[:, :self.n_dims]], dim=0)
             noise_coords_centered = remove_mean_batch(noise_coords_combined, combined_mask)
             noise_lig[:, :self.n_dims] = noise_coords_centered[:len(lig_coords)]
@@ -498,30 +504,44 @@ class MolecularDenoisingModel:
             xh_lig_noisy = xh_lig_clean + sigma_val * noise_lig
             xh_pocket_noisy = xh_pocket_clean + sigma_val * noise_pocket
             
-            # Denoise
-            t_normalized = (sigma_val / self.scheme.sigma_max).unsqueeze(0).expand(batch_size, 1)
+            # Create sigma tensor for this evaluation (broadcast to batch_size)
+            sigma_batch = sigma_val.expand(batch_size)
             
+            # Denoise
             with torch.no_grad():
-                pred_clean_lig, pred_clean_pocket = self.denoiser(
-                    xh_lig_noisy, xh_pocket_noisy, t_normalized, lig_mask, pocket_mask
+                pred_output_lig, pred_output_pocket = self.denoiser(
+                    xh_lig_noisy, xh_pocket_noisy, sigma_batch, lig_mask, pocket_mask
                 )
             
-            # Compute evaluation losses
-            pred_coords_lig = pred_clean_lig[:, :self.n_dims]
-            pred_features_lig = pred_clean_lig[:, self.n_dims:]
+            # Split predictions: coordinates + logits
+            pred_coords_lig = pred_output_lig[:, :self.n_dims]              # [N_lig, 3]
+            pred_logits_lig = pred_output_lig[:, self.n_dims:]              # [N_lig, atom_nf] - LOGITS
+            pred_coords_pocket = pred_output_pocket[:, :self.n_dims]        # [N_pocket, 3]
+            pred_logits_pocket = pred_output_pocket[:, self.n_dims:]        # [N_pocket, residue_nf] - LOGITS
+            
+            # Compute losses
             clean_coords_lig = xh_lig_clean[:, :self.n_dims]
+            clean_coords_pocket = xh_pocket_clean[:, :self.n_dims]
             
-            coord_loss = torch.mean((pred_coords_lig - clean_coords_lig) ** 2)
+            # Coordinate loss: L2
+            coord_loss_lig = torch.mean((pred_coords_lig - clean_coords_lig) ** 2)
+            coord_loss_pocket = torch.mean((pred_coords_pocket - clean_coords_pocket) ** 2)
+            coord_loss = coord_loss_lig + coord_loss_pocket
             
-            # For categorical evaluation
-            pred_features_lig_unnorm = pred_features_lig * self.scheme.feature_norm + self.scheme.feature_bias
-            pred_logits_lig = pred_features_lig_unnorm / self.scheme.categorical_temperature
-            true_categories_lig = torch.argmax(lig_features_clean, dim=-1)
-            categorical_loss = F.cross_entropy(pred_logits_lig, true_categories_lig)
+            # Categorical loss: Cross-entropy on logits
+            categorical_loss_lig = F.cross_entropy(pred_logits_lig, true_atom_types)
+            categorical_loss_pocket = F.cross_entropy(pred_logits_pocket, true_residue_types)
+            categorical_loss = categorical_loss_lig + categorical_loss_pocket
+            
+            # Accuracy metrics
+            atom_accuracy = (torch.argmax(pred_logits_lig, dim=-1) == true_atom_types).float().mean()
+            residue_accuracy = (torch.argmax(pred_logits_pocket, dim=-1) == true_residue_types).float().mean()
             
             eval_losses[f"coord_loss_lvl{i}"] = coord_loss.item()
             eval_losses[f"categorical_loss_lvl{i}"] = categorical_loss.item()
             eval_losses[f"total_loss_lvl{i}"] = coord_loss.item() + categorical_loss.item()
+            eval_losses[f"atom_accuracy_lvl{i}"] = atom_accuracy.item()
+            eval_losses[f"residue_accuracy_lvl{i}"] = residue_accuracy.item()
         
         return eval_losses
 
@@ -554,7 +574,7 @@ def test_molecular_diffusion():
     print(f"--- Testing GenCFD-style loss ---")
     
     # Create model
-    sigma_schedule = molecular_exponential_noise_schedule(clip_max=10.0)  # Smaller max
+    sigma_schedule = exponential_noise_schedule(clip_max=100.0)  # Smaller max
     scheme = MolecularDiffusion.create_variance_exploding(
         sigma=sigma_schedule,
         categorical_temperature=1.0
@@ -580,8 +600,6 @@ def test_molecular_diffusion():
     print(f"Categorical Loss: {metrics['categorical_loss']:.4f}")
     print(f"Sigma range: [{metrics['avg_sigma']:.3f}, {metrics['max_sigma']:.3f}]")
     print(f"Coord prediction scale: {metrics['coord_pred_scale']:.3f}")
-    print(f"Feature prediction scale (lig): {metrics['feature_pred_scale_lig']:.3f}")
-    print(f"Feature prediction scale (pocket): {metrics['feature_pred_scale_pocket']:.3f}")
     
     # Test evaluation
     eval_metrics = model.eval_fn(batch)
