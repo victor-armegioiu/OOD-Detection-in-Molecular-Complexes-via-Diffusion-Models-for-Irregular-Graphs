@@ -20,12 +20,12 @@ from datetime import datetime
 # Import our molecular modules
 from molecular_diffusion import (
     MolecularDenoisingModel, 
-    molecular_exponential_noise_schedule,
-    molecular_log_uniform_sampling,
-    molecular_edm_weighting,
+    exponential_noise_schedule,
+    log_uniform_sampling,
+    edm_weighting,
     MolecularDiffusion
 )
-from molecular_samplers import (
+from metrics import (
     load_checkpoint,
     sample_molecules, 
     evaluate_samples
@@ -230,7 +230,7 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
     print("Creating molecular diffusion model...")
     
     # Create noise schedule
-    sigma_schedule = molecular_exponential_noise_schedule(
+    sigma_schedule = exponential_noise_schedule(
         clip_max=config['sigma_max'],
         base=np.e**0.5,
         start=0.0,
@@ -246,13 +246,13 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
     )
     
     # Create noise sampling and weighting
-    noise_sampling = molecular_log_uniform_sampling(
+    noise_sampling = log_uniform_sampling(
         scheme=scheme,
         clip_min=config['sigma_min'],
         uniform_grid=False
     )
     
-    noise_weighting = molecular_edm_weighting(data_std=1.0)
+    noise_weighting = edm_weighting(data_std=1.0)
     
     # Create model
     model = MolecularDenoisingModel(
