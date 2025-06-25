@@ -401,23 +401,47 @@ class MolecularSampler:
         pocket_coords = pocket_data[:, :self.n_dims]
         pocket_features = pocket_data[:, self.n_dims:]
         
-        # Unnormalize
-        with torch.no_grad():
-            lig_logits = self._model.denoiser.egnn_dynamics.atom_decoder(lig_features)
-            pocket_logits = self._model.denoiser.egnn_dynamics.residue_decoder(pocket_features)
-            
-        lig_coords_unnorm, lig_features_unnorm, pocket_coords_unnorm, pocket_features_unnorm = \
-            self.scheme.unnormalize_molecular_data(
-                lig_coords, lig_logits, pocket_coords, pocket_logits,
-                discretize_features=discretize_features,
-                atom_nf=self.atom_nf, residue_nf=self.residue_nf
-            )
+        if discretize_features:
+            # OPTION 1: Use the embeddings to get probabilities via similarity
+            with torch.no_grad():
+                # Get the vocabulary embeddings
+                atom_embeddings = self._model.denoiser.egnn_dynamics.atom_encoder(
+                    torch.eye(self.atom_nf, device=lig_features.device)
+                )
+                atom_embeddings = F.normalize(atom_embeddings, dim=-1)
+                
+                residue_embeddings = self._model.denoiser.egnn_dynamics.residue_encoder(
+                    torch.eye(self.residue_nf, device=pocket_features.device)
+                )
+                residue_embeddings = F.normalize(residue_embeddings, dim=-1)
+                
+                # Normalize current embeddings
+                lig_features_norm = F.normalize(lig_features, dim=-1)
+                pocket_features_norm = F.normalize(pocket_features, dim=-1)
+                
+                # Compute similarities (this preserves the diversity!)
+                lig_similarities = torch.matmul(lig_features_norm, atom_embeddings.T)
+                pocket_similarities = torch.matmul(pocket_features_norm, residue_embeddings.T)
+                
+                # Convert to one-hot
+                lig_types = torch.argmax(lig_similarities, dim=-1)
+                pocket_types = torch.argmax(pocket_similarities, dim=-1)
+                
+                ligand_features_final = F.one_hot(lig_types, self.atom_nf).float()
+                pocket_features_final = F.one_hot(pocket_types, self.residue_nf).float()
+        else:
+            ligand_features_final = lig_features
+            pocket_features_final = pocket_features
+        
+        # Unnormalize coordinates
+        lig_coords_unnorm = lig_coords * self.scheme.coord_norm
+        pocket_coords_unnorm = pocket_coords * self.scheme.coord_norm
         
         return {
             'ligand_coords': lig_coords_unnorm,
-            'ligand_features': lig_features_unnorm,
+            'ligand_features': ligand_features_final,
             'pocket_coords': pocket_coords_unnorm,
-            'pocket_features': pocket_features_unnorm,
+            'pocket_features': pocket_features_final,
             'ligand_mask': state.ligand_mask,
             'pocket_mask': state.pocket_mask,
             'batch_size': state.batch_size
