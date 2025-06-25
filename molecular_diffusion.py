@@ -316,6 +316,9 @@ class MolecularDenoisingModel:
         )
 
         denoiser = PreconditionedEGNNDynamics(denoiser)
+        from ema_pytorch import EMA
+        denoise = EMA(denoiser, update_after_step=100)
+
         object.__setattr__(self, 'denoiser', denoiser)
 
     def initialize(self):
@@ -334,7 +337,7 @@ class MolecularDenoisingModel:
         pocket_features = batch['pocket_features'].cuda()  # One-hot features
         lig_mask = batch['ligand_mask'].cuda()
         pocket_mask = batch['pocket_mask'].cuda()
-        batch_size = batch['batch_size']
+        batch_size = len(torch.unique(torch.cat([lig_mask, pocket_mask])))
         
         # Get true atom/residue type indices for cross-entropy loss
         true_atom_types = torch.argmax(lig_features, dim=-1)      # [N_lig] - indices
@@ -386,6 +389,14 @@ class MolecularDenoisingModel:
         
         
         # Forward pass through denoiser - outputs coordinates + logits
+        # print('In train:')
+        # print('Sigma shape:', sigma.shape)
+        # print('xh_lig_noisy shape:', xh_lig_noisy.shape)
+        # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
+        # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
+        # print('lig_mask', lig_mask.shape)
+        # print('pocket_mask', pocket_mask.shape)
+        
         pred_output_lig, pred_output_pocket = self.denoiser(
             xh_lig_noisy, xh_pocket_noisy, sigma, lig_mask, pocket_mask
         )
@@ -414,8 +425,12 @@ class MolecularDenoisingModel:
         ce_loss_pocket = F.cross_entropy(pred_logits_pocket, true_residue_types, reduction='none')
         
         # Weight categorical loss by noise level (like coordinates)
-        categorical_loss_lig = torch.mean(weights[lig_mask] * ce_loss_lig)
-        categorical_loss_pocket = torch.mean(weights[pocket_mask] * ce_loss_pocket)
+        # categorical_loss_lig = torch.mean(weights[lig_mask] * ce_loss_lig)
+        # categorical_loss_pocket = torch.mean(weights[pocket_mask] * ce_loss_pocket)
+        # categorical_loss = categorical_loss_lig + categorical_loss_pocket
+
+        categorical_loss_lig = ce_loss_lig.mean()
+        categorical_loss_pocket = ce_loss_pocket.mean()
         categorical_loss = categorical_loss_lig + categorical_loss_pocket
         
         # Combine losses
@@ -505,13 +520,24 @@ class MolecularDenoisingModel:
             xh_pocket_noisy = xh_pocket_clean + sigma_val * noise_pocket
             
             # Create sigma tensor for this evaluation (broadcast to batch_size)
-            sigma_batch = sigma_val.expand(batch_size)
+            sigma_batch = sigma_val
+
+            # print('In eval:')
+            # print('Noise level:', i, sigma_val)
+            # print('Sigma shape:', sigma_batch.shape)
+            # print('xh_lig_noisy shape:', xh_lig_noisy.shape)
+            # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
+            # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
+            # print('lig_mask', lig_mask.shape)
+            # print('pocket_mask', pocket_mask.shape)
+            
             
             # Denoise
             with torch.no_grad():
                 pred_output_lig, pred_output_pocket = self.denoiser(
                     xh_lig_noisy, xh_pocket_noisy, sigma_batch, lig_mask, pocket_mask
                 )
+            
             
             # Split predictions: coordinates + logits
             pred_coords_lig = pred_output_lig[:, :self.n_dims]              # [N_lig, 3]
