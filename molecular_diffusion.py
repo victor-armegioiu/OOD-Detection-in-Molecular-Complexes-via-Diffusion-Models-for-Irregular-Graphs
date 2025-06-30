@@ -200,7 +200,7 @@ class NoiseLevelSampling(Protocol):
 
 def log_uniform_sampling(
     scheme: MolecularDiffusion,
-    clip_min: float = 1e-3,  # Increased from 1e-4
+    clip_min: float = 1e-4,
     uniform_grid: bool = False,
 ) -> NoiseLevelSampling:
 
@@ -473,12 +473,15 @@ class MolecularDenoisingModel:
         true_atom_types = torch.argmax(lig_features, dim=-1)
         true_residue_types = torch.argmax(pocket_features, dim=-1)
         
-        # Test at multiple fixed noise levels
-        sigma_levels = torch.logspace(
-            np.log10(1e-3), np.log10(self.scheme.sigma_max), 
-            5, device='cuda'
-        )
-        
+        # Cache training quantiles.
+        if not hasattr(self, '_cached_sigma_levels'):
+            training_sigmas = self.noise_sampling(shape=(10000,))
+            sigma_levels = torch.quantile(training_sigmas, torch.tensor([0.1, 0.3, 0.5, 0.7, 0.9], device='cuda'))
+            object.__setattr__(self, '_cached_sigma_levels', sigma_levels)
+        else:
+            sigma_levels = self._cached_sigma_levels
+
+
         eval_losses = {}
         
         for i, sigma_val in enumerate(sigma_levels):
@@ -613,8 +616,8 @@ def test_molecular_diffusion():
         hidden_nf=32,
         n_layers=2,
         scheme=scheme,
-        coord_loss_weight=1.0,
-        categorical_loss_weight=0.5
+        coord_loss_weight=2.0,
+        categorical_loss_weight=1.0
     )
     
     model.initialize()
