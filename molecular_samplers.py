@@ -353,8 +353,8 @@ class MolecularSampler:
         pocket_noise[:, :self.n_dims] = noise_coords_centered[total_lig_atoms:]
         
         return MolecularState(
-            ligand=ligand_noise,
-            pocket=pocket_noise,
+            ligand=ligand_noise / self.scheme.coord_norm,
+            pocket=pocket_noise / self.scheme.coord_norm,
             ligand_mask=ligand_mask,
             pocket_mask=pocket_mask,
             batch_size=self.batch_size
@@ -564,8 +564,8 @@ class MolecularSdeSampler(MolecularSampler):
                 s_pocket = s
             
             normalized_state = MolecularState(
-                ligand=molecular_state.ligand / s_lig,
-                pocket=molecular_state.pocket / s_pocket,
+                ligand=molecular_state.ligand,
+                pocket=molecular_state.pocket,
                 ligand_mask=molecular_state.ligand_mask,
                 pocket_mask=molecular_state.pocket_mask,
                 batch_size=molecular_state.batch_size
