@@ -40,29 +40,29 @@ CONFIG = {
     'eval_dataset_path': 'dataset_casf2016.pt',
 
     # Model parameters
-    'atom_nf': 10,           # Number of atom types
-    'residue_nf': 21,        # Number of residue types  
-    'n_dims': 3,             # 3D coordinates
-    'joint_nf': 31,          # Joint embedding dimension
-    'hidden_nf': 64,         # Hidden layer size
-    'n_layers': 4,           # Number of EGNN layers
-    'edge_embedding_dim': 8, # Edge feature dimension
+    'atom_nf': 10,            # Number of atom types
+    'residue_nf': 21,         # Number of residue types  
+    'n_dims': 3,              # 3D coordinates
+    'n_layers': 4,            # Number of EGNN layers
+    'joint_nf': 256,          # Even richer shared space
+    'hidden_nf': 128,         # More EGNN capacity
+    'edge_embedding_dim': 32, # Edge embeddings
     
     # Training parameters
     'num_epochs': 1000,
-    'learning_rate': 1e-3,
-    'batch_size': 64,
+    'learning_rate': 1e-4,
+    'batch_size': 16,
     'log_interval': 20,
-    'eval_interval': 20,
-    'num_eval_samples': 10,
+    'eval_interval': 2,
+    'num_eval_samples': 100,
     
     # Diffusion parameters
-    'sigma_max': 80.0,      # Maximum noise level
-    'sigma_min': 1e-3,      # Minimum noise level
+    'sigma_max': 100.0,      # Maximum noise level
+    'sigma_min': 1e-4,      # Minimum noise level
     'update_pocket_coords': True,  # Joint modeling
     
     # Sampling parameters
-    'num_sampling_steps': 50,
+    'num_sampling_steps': 16,
     'schedule_type': "exponential",
     
     # Random data generation parameters
@@ -240,7 +240,7 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
     # Create diffusion scheme 
     scheme = MolecularDiffusion.create_variance_exploding(
         sigma=sigma_schedule,
-        coord_norm=1.0,
+        coord_norm=10.0, # TODO: check if okay.
         feature_norm=1.0,
         feature_bias=0.0
     )
@@ -249,7 +249,7 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
     noise_sampling = log_uniform_sampling(
         scheme=scheme,
         clip_min=config['sigma_min'],
-        uniform_grid=False
+        uniform_grid=True,
     )
     
     noise_weighting = edm_weighting(data_std=1.0)
@@ -280,6 +280,16 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
     print(f"\n{'='*60}")
     print("TRAINING MOLECULAR DIFFUSION MODEL")
     print(f"{'='*60}")
+
+    # samples = sample_molecules(model,
+    #                                 num_steps=CONFIG['num_sampling_steps'],
+    #                                 schedule_type=CONFIG['schedule_type'],
+    #                                 num_samples=CONFIG['num_eval_samples']
+    #                                 )
+    # sampling_losses = evaluate_samples(samples)
+    # print(sampling_losses)
+    # import sys
+    # sys.exit(0)
     
     # Initialize wandb
     wandb.init(
@@ -290,10 +300,12 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
         notes=config['wandb']['notes'],
         config=config
     )
-    
+
     # Setup optimizer
-    optimizer = optim.Adam(model.denoiser.parameters(), lr=config['learning_rate'])
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.8)
+    optimizer = optim.AdamW(
+        model.denoiser.parameters(),
+        lr=config['learning_rate'],
+    )
     
     # Watch model gradients if configured
     if config['wandb']['log_gradients']:
@@ -312,7 +324,6 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             'categorical_loss_ligand': [],
             'categorical_loss_pocket': [],
             'avg_sigma': []
-            #,'avg_scale': []
         }
         
         for batch_idx, batch in enumerate(train_data):
@@ -325,7 +336,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             loss.backward()
             
             # Clip gradients 
-            torch.nn.utils.clip_grad_norm_(model.denoiser.parameters(), max_norm=1.0)
+            #torch.nn.utils.clip_grad_norm_(model.denoiser.parameters(), max_norm=1.0)
             
             optimizer.step()
             epoch_losses.append(loss.item())
@@ -357,13 +368,10 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                     'batch/categorical_loss_ligand': metrics['categorical_loss_ligand'],
                     'batch/categorical_loss_pocket': metrics['categorical_loss_pocket'],
                     'batch/avg_sigma': metrics['avg_sigma'],
-                    #'batch/avg_scale': metrics['avg_scale'],
                     'batch/learning_rate': optimizer.param_groups[0]['lr'],
                     'epoch': epoch + 1,
                     'batch': batch_idx + 1
                 })
-        
-        scheduler.step()
         
         # Calculate epoch metrics
         avg_epoch_loss = np.mean(epoch_losses)
@@ -579,11 +587,12 @@ def main():
         loaded_model = load_checkpoint(CONFIG['checkpoint_path'])
         
         # 6. Sample new molecules
-        samples = sample_molecules(loaded_model,
-                                    num_steps=CONFIG['num_sampling_steps'],
-                                    schedule_type=CONFIG['schedule_type'],
-                                    num_samples=CONFIG['num_eval_samples']
-                                    )
+        samples = sample_molecules(
+            loaded_model,
+            num_steps=CONFIG['num_sampling_steps'],
+            schedule_type=CONFIG['schedule_type'],
+            num_samples=CONFIG['num_eval_samples'],
+        )
 
         for s in range(CONFIG['num_eval_samples']):
             graph = Data(
