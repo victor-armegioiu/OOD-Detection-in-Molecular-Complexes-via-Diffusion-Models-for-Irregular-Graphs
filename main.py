@@ -28,7 +28,7 @@ from molecular_diffusion import (
 from metrics import (
     load_checkpoint,
     sample_molecules, 
-    evaluate_samples
+    evaluate_atom_aa_distributions
 )
 from egnn_dynamics import EGNNDynamics
 import torch.nn.functional as F
@@ -286,7 +286,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
     #                                 schedule_type=CONFIG['schedule_type'],
     #                                 num_samples=CONFIG['num_eval_samples']
     #                                 )
-    # sampling_losses = evaluate_samples(samples)
+    # sampling_losses = evaluate_atom_aa_distributions(samples)
     # print(sampling_losses)
     # import sys
     # sys.exit(0)
@@ -408,8 +408,8 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                                     schedule_type=CONFIG['schedule_type'],
                                     num_samples=CONFIG['num_eval_samples']
                                     )
-            sampling_losses = evaluate_samples(samples)
-            eval_losses.update(sampling_losses)
+            distribution_losses = evaluate_atom_aa_distributions(samples)
+            eval_losses.update(distribution_losses)
             print(f"Eval losses: {eval_losses}", flush=True)
             
             # Log evaluation metrics
