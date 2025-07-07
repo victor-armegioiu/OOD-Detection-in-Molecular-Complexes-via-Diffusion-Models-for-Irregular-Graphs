@@ -1,0 +1,1069 @@
+"""
+Main Molecular Diffusion Pipeline
+
+Complete demonstration of training, saving, loading, and sampling with molecular diffusion models.
+All operations are CUDA-optimized.
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import os
+import wandb
+import argparse
+import itertools
+import json
+import csv
+import random
+from typing import List, Dict, Tuple, Optional
+from Dataset import PDBbind_Dataset
+from torch_geometric.loader import DataLoader
+from torch_geometric.data import Data
+from datetime import datetime
+
+# Import our molecular modules
+from molecular_diffusion import (
+    MolecularDenoisingModel, 
+    exponential_noise_schedule,
+    log_uniform_sampling,
+    edm_weighting,
+    MolecularDiffusion
+)
+from metrics import (
+    load_checkpoint,
+    sample_molecules, 
+    evaluate_atom_aa_distributions,
+    evaluate_mols,
+    build_mol_objects
+)
+from egnn_dynamics import EGNNDynamics
+import torch.nn.functional as F
+
+# Try to import optuna for Bayesian optimization
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
+    print("Warning: optuna not available. Bayesian optimization will be disabled.")
+
+
+# Configuration following framework patterns
+CONFIG = {
+    'train_dataset_path': 'dataset_pdbbind.pt',
+    'eval_dataset_path': 'dataset_casf2016.pt',
+
+    # Model parameters
+    'atom_nf': 10,            # Number of atom types
+    'residue_nf': 21,         # Number of residue types  
+    'n_dims': 3,              # 3D coordinates
+    'n_layers': 4,            # Number of EGNN layers
+    'joint_nf': 256,          # Even richer shared space
+    'hidden_nf': 128,         # More EGNN capacity
+    'edge_embedding_dim': 32, # Edge embeddings
+    
+    # Training parameters
+    'num_epochs': 1000,
+    'learning_rate': 1e-4,
+    'batch_size': 16,
+    'log_interval': 20,
+    'eval_interval': 10,
+    'num_eval_samples': 100,
+    
+    # Diffusion parameters
+    'sigma_max': 100.0,      # Maximum noise level
+    'sigma_min': 1e-4,      # Minimum noise level
+    'update_pocket_coords': True,  # Joint modeling
+    
+    # Sampling parameters
+    'num_sampling_steps': 16,
+    'schedule_type': "exponential",
+    
+    # Random data generation parameters
+    # 'num_train_batches': 100,
+    # 'num_eval_batches': 20,
+    # 'ligand_size_range': (4, 12),     # Min/max ligand atoms
+    # 'pocket_size_range': (15, 30),   # Min/max pocket residues
+    
+    # I/O
+    'device': 'cuda',
+    
+    # Weights & Biases configuration
+    'wandb': {
+        'project': 'molecular-diffusion',
+        'entity': 'dagraber',
+        'tags': ['molecular-diffusion', 'training'],
+        'notes': 'Training run for molecular diffusion model',
+        'log_model': False,
+        'log_gradients': False,  # Set to True to log gradient distributions
+    }
+}
+
+
+# Hyperparameter search spaces
+HYPERPARAM_SPACES = {
+    'num_sampling_steps': [25, 50, 100, 200, 300],
+    'joint_nf': [32, 64, 128, 256],
+    'hidden_nf': [64, 128, 256],
+    'n_layers': [2, 4, 6, 8],
+    'edge_embedding_dim': [4, 8, 16, 32],
+    'learning_rate': [1e-5, 5e-5, 1e-4, 5e-4, 1e-3],
+    'batch_size': [16, 32, 64, 128]
+}
+
+def parse_arguments():
+    """Parse command line arguments"""
+    
+    parser = argparse.ArgumentParser(description="Molecular Diffusion Pipeline with Hyperparameter Optimization")
+    
+    # Basic run options
+    parser.add_argument('--mode', choices=['single', 'grid', 'random', 'bayesian'], default='single',
+        help='Run mode: single training run or hyperparameter optimization')
+    
+    
+    # Dataset options
+    parser.add_argument('--train_dataset', default='dataset_pdbbind.pt', help='Path to training dataset')
+    parser.add_argument('--eval_dataset', default='dataset_casf2016.pt', help='Path to evaluation dataset')
+    
+    # Model parameters (for single mode or to override defaults)
+    parser.add_argument('--joint_nf', type=int, help='Joint embedding dimension')
+    parser.add_argument('--hidden_nf', type=int, help='Hidden layer size')
+    parser.add_argument('--n_layers', type=int, help='Number of EGNN layers')
+    parser.add_argument('--edge_embedding_dim', type=int, help='Edge feature dimension')
+    
+    # Training parameters
+    parser.add_argument('--learning_rate', type=float, help='Learning rate')
+    parser.add_argument('--batch_size', type=int, help='Batch size')
+    parser.add_argument('--num_epochs', type=int, help='Number of training epochs')
+    parser.add_argument('--eval_interval', type=int, help='Interval for evaluation')
+    
+    # Sampling parameters
+    parser.add_argument('--num_sampling_steps', type=int, help='Number of sampling steps')
+    
+    # Optimization parameters
+    parser.add_argument('--max_combinations', type=int, default=100, help='Maximum number of combinations for grid search')
+    parser.add_argument('--num_trials', type=int, default=20, help='Number of trials for random/bayesian search')
+    
+    # Output options
+    parser.add_argument('--output_dir', default='optimization_results',help='Directory to save optimization results')
+    parser.add_argument('--results_file', default='optimization_results.csv', help='Filename for optimization results (CSV format)')
+    
+    # Wandb options
+    parser.add_argument('--wandb_project', default='molecular-diffusion', help='Wandb project name')
+    parser.add_argument('--wandb_entity', default='dagraber', help='Wandb entity name')
+    parser.add_argument('--no_wandb', action='store_true', help='Disable wandb logging')
+    
+    return parser.parse_args()
+
+
+def update_config_from_args(config: Dict, args) -> Dict:
+    """Update configuration with command line arguments"""
+    
+    # Update dataset paths
+    if args.train_dataset is not None:
+        config['train_dataset_path'] = args.train_dataset
+    if args.eval_dataset is not None:
+        config['eval_dataset_path'] = args.eval_dataset
+    
+    # Update model parameters if provided
+    if args.joint_nf is not None:
+        config['joint_nf'] = args.joint_nf
+    if args.hidden_nf is not None:
+        config['hidden_nf'] = args.hidden_nf
+    if args.n_layers is not None:
+        config['n_layers'] = args.n_layers
+    if args.edge_embedding_dim is not None:
+        config['edge_embedding_dim'] = args.edge_embedding_dim
+    
+    # Update training parameters
+    if args.learning_rate is not None:
+        config['learning_rate'] = args.learning_rate
+    if args.batch_size is not None:
+        config['batch_size'] = args.batch_size
+    if args.num_epochs is not None:
+        config['num_epochs'] = args.num_epochs
+    if args.eval_interval is not None:
+        config['eval_interval'] = args.eval_interval
+    
+    # Update sampling parameters
+    if args.num_sampling_steps is not None:
+        config['num_sampling_steps'] = args.num_sampling_steps
+    
+    # Update wandb configuration
+    config['wandb']['project'] = args.wandb_project
+    config['wandb']['entity'] = args.wandb_entity
+    if args.no_wandb:
+        config['wandb']['enabled'] = False
+    
+    return config
+
+
+def create_batches_from_dataset(dataset_path: str, config: Dict) -> List[Dict]:
+    """Create dataset from PDBbind dataset"""
+    data = []
+
+    dataset = torch.load(dataset_path)
+    dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, follow_batch=['lig_coords', 'prot_coords'])
+
+    for batch in dataloader:
+        batch = {
+            'ligand_coords': batch.lig_coords,
+            'ligand_features': batch.lig_features,
+            'ligand_mask': batch.lig_coords_batch,
+
+            'pocket_coords': batch.prot_coords,
+            'pocket_features': batch.prot_features,
+            'pocket_mask': batch.prot_coords_batch,
+            'batch_size': config['batch_size'],
+        }
+        data.append(batch)
+
+    print(f"✅ Created {len(data)} batches from PDBbind dataset")
+    return data
+    
+
+def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
+    """Create molecular model following the GenCFD setup"""
+    
+    print("Creating molecular diffusion model...")
+    
+    # Create noise schedule
+    sigma_schedule = exponential_noise_schedule(
+        clip_max=config['sigma_max'],
+        base=np.e**0.5,
+        start=0.0,
+        end=5.0
+    )
+    # Create diffusion scheme 
+    scheme = MolecularDiffusion.create_variance_exploding(
+        sigma=sigma_schedule,
+        coord_norm=10.0, # TODO: check if okay.
+        feature_norm=1.0,
+        feature_bias=0.0
+    )
+    # Create noise sampling and weighting
+    noise_sampling = log_uniform_sampling(
+        scheme=scheme,
+        clip_min=config['sigma_min'],
+        uniform_grid=True
+    )
+    noise_weighting = edm_weighting(data_std=1.0)
+    
+    # Create model
+    model = MolecularDenoisingModel(
+        atom_nf=config['atom_nf'],
+        residue_nf=config['residue_nf'],
+        n_dims=config['n_dims'],
+        joint_nf=config['joint_nf'],
+        hidden_nf=config['hidden_nf'],
+        n_layers=config['n_layers'],
+        edge_embedding_dim=config['edge_embedding_dim'],
+        update_pocket_coords=config['update_pocket_coords'],
+        scheme=scheme,
+        noise_sampling=noise_sampling,
+        noise_weighting=noise_weighting
+    )
+    
+    model.initialize()
+    return model
+
+
+def train_model(model: MolecularDenoisingModel, train_data: List[Dict], 
+                eval_data: List[Dict], config: Dict):
+    """Train the molecular diffusion model"""
+    
+    print(f"\n{'='*60}")
+    print("TRAINING MOLECULAR DIFFUSION MODEL")
+    print(f"{'='*60}")
+    
+    # Initialize wandb
+    wandb.init(
+        project=config['wandb']['project'],
+        entity=config['wandb']['entity'],
+        name=config['wandb']['name'],
+        tags=config['wandb']['tags'],
+        notes=config['wandb']['notes'],
+        config=config
+    )
+    
+    # optimizer = optim.Adam(model.denoiser.parameters(), lr=config['learning_rate'])
+    optimizer = optim.AdamW(
+        model.denoiser.parameters(),
+        lr=config['learning_rate'],
+    )
+    #scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.8)
+    
+    # Watch model gradients if configured
+    if config['wandb']['log_gradients']:
+        wandb.watch(model.denoiser, log='all', log_freq=config['log_interval'])
+    
+    # Training loop
+    model.denoiser.train()
+    
+    for epoch in range(config['num_epochs']):
+        epoch_losses = []
+        epoch_metrics = {
+            'coord_loss': [],
+            'categorical_loss': [],
+            'coord_loss_ligand': [],
+            'coord_loss_pocket': [],
+            'categorical_loss_ligand': [],
+            'categorical_loss_pocket': [],
+            'avg_sigma': []
+        }
+        
+        for batch_idx, batch in enumerate(train_data):
+            optimizer.zero_grad()
+            
+            # Forward pass 
+            loss, metrics = model.loss_fn(batch)
+            
+            # Backward pass 
+            loss.backward()
+            
+            # Clip gradients 
+            #torch.nn.utils.clip_grad_norm_(model.denoiser.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            epoch_losses.append(loss.item())
+            
+            # Collect metrics
+            for key in epoch_metrics.keys():
+                epoch_metrics[key].append(metrics[key])
+            
+            # Logging 
+            if (batch_idx + 1) % config['log_interval'] == 0:
+                print(f"Epoch {epoch+1:3d}/{config['num_epochs']}, "
+                      f"Batch {batch_idx+1:3d}/{len(train_data)}, "
+                      f"Loss: {loss.item():.4f}, "
+                      f"Coord: {metrics['coord_loss']:.4f} "
+                      f"(L:{metrics['coord_loss_ligand']:.4f}, P:{metrics['coord_loss_pocket']:.4f}), "
+                      f"Cat: {metrics['categorical_loss']:.4f} "
+                      f"(L:{metrics['categorical_loss_ligand']:.4f}, P:{metrics['categorical_loss_pocket']:.4f}), "
+                      f"σ: {metrics['avg_sigma']:.3f}, "
+                      )
+                
+                # Log batch metrics to wandb
+                wandb.log({
+                    'batch/loss': loss.item(),
+                    'batch/coord_loss': metrics['coord_loss'],
+                    'batch/categorical_loss': metrics['categorical_loss'],
+                    'batch/coord_loss_ligand': metrics['coord_loss_ligand'],
+                    'batch/coord_loss_pocket': metrics['coord_loss_pocket'],
+                    'batch/categorical_loss_ligand': metrics['categorical_loss_ligand'],
+                    'batch/categorical_loss_pocket': metrics['categorical_loss_pocket'],
+                    'batch/avg_sigma': metrics['avg_sigma'],
+                    'batch/learning_rate': optimizer.param_groups[0]['lr'],
+                    'epoch': epoch + 1,
+                    'batch': batch_idx + 1
+                })
+        
+#        scheduler.step()
+        
+        # Calculate epoch metrics
+        avg_epoch_loss = np.mean(epoch_losses)
+        avg_epoch_metrics = {
+            key: np.mean(values) for key, values in epoch_metrics.items()
+        }
+        
+        # Log epoch metrics
+        epoch_metrics = {
+            'epoch/loss': avg_epoch_loss,
+            'epoch/coord_loss': avg_epoch_metrics['coord_loss'],
+            'epoch/categorical_loss': avg_epoch_metrics['categorical_loss'],
+            'epoch/coord_loss_ligand': avg_epoch_metrics['coord_loss_ligand'],
+            'epoch/coord_loss_pocket': avg_epoch_metrics['coord_loss_pocket'],
+            'epoch/categorical_loss_ligand': avg_epoch_metrics['categorical_loss_ligand'],
+            'epoch/categorical_loss_pocket': avg_epoch_metrics['categorical_loss_pocket'],
+            'epoch/avg_sigma': avg_epoch_metrics['avg_sigma'],
+            'epoch/learning_rate': optimizer.param_groups[0]['lr'],
+            'epoch': epoch + 1
+        }
+        wandb.log(epoch_metrics)
+        
+        # Evaluation 
+        if (epoch + 1) % config['eval_interval'] == 0 or epoch == 0:
+            print(f"\n--- Evaluation at epoch {epoch+1} ---")
+            eval_losses = evaluate_model(model, eval_data)
+
+            # Sampling-based losses
+            save_path = config['checkpoint_path'].replace(".pt", f"_epoch_{epoch}.pt")
+            save_checkpoint(model, config, save_path)
+            loaded_model = load_checkpoint(save_path)
+            samples = sample_molecules(loaded_model,
+                                    num_steps=config['num_sampling_steps'],
+                                    schedule_type=config['schedule_type'],
+                                    num_samples=config['num_eval_samples']
+                                    )
+            distribution_losses = evaluate_atom_aa_distributions(samples)
+            eval_losses.update(distribution_losses)
+
+            # Evaluate molecule integrity
+            molecules = build_mol_objects(samples)
+            integrity_data = evaluate_mols(molecules)
+
+            if integrity_data['sum_num_rings'] > 0:
+                mean_ring_size = sum(ring_size * count for ring_size, count in 
+                                    integrity_data['ring_size_counts'].items()) / integrity_data['sum_num_rings']
+            else:
+                mean_ring_size = 0
+
+            integrity_losses = {
+                'percent_valid': integrity_data['valid_molecules'] / integrity_data['num_molecules'],
+                'percent_fragmented': integrity_data['num_multifragment'] / integrity_data['num_molecules'],
+                'percent_disconnected': integrity_data['num_disconnected_atoms'] / integrity_data['num_molecules'],
+                'percent_valence_issues': integrity_data['sum_num_valence_issues'] / integrity_data['num_molecules'],
+                'n_rings_per_mol': integrity_data['sum_num_rings'] / integrity_data['num_molecules'],
+                'mean_num_rings': integrity_data['mean_num_rings'],
+                'mean_ring_size': mean_ring_size,
+                'mean_num_fragments': integrity_data['mean_num_fragments'],
+                'mean_num_valence_issues': integrity_data['mean_num_valence_issues'],
+                'ring_size_dist_kl_divergence': integrity_data['ring_size_dist_kl_divergence'],
+                'ring_size_dist_js_divergence': integrity_data['ring_size_dist_js_divergence'],
+            }
+
+            eval_losses.update(integrity_losses)
+            print("Eval losses:")
+            for key, value in eval_losses.items(): print(f'{key}: {value}')
+            
+            # Log evaluation metrics
+            wandb.log({
+                f'eval/{key}': value 
+                for key, value in eval_losses.items()
+            })
+            
+        print(f"Epoch {epoch+1:3d} - Average Loss: {avg_epoch_loss:.4f}", flush=True)
+    
+    # Save model to wandb if configured
+    if config['wandb']['log_model']:
+        model_artifact = wandb.Artifact(
+            'molecular_diffusion_model', 
+            type='model',
+            description='Trained molecular diffusion model'
+        )
+        model_artifact.add_file(config['checkpoint_path'])
+        wandb.log_artifact(model_artifact)
+    
+    # Close wandb run
+    wandb.finish()
+
+    # Return the metrics of the last epoch and the losses of the last evaluation    
+    return epoch_metrics, eval_losses
+
+
+def evaluate_model(model: MolecularDenoisingModel, eval_data: List[Dict]) -> Dict:
+    """Evaluate the model following """
+    
+    model.denoiser.eval()
+    all_eval_metrics = {}
+    
+    with torch.no_grad():
+        for batch in eval_data[:5]:  # Evaluate on subset
+            eval_metrics = model.eval_fn(batch)
+            
+            for key, value in eval_metrics.items():
+                if key not in all_eval_metrics:
+                    all_eval_metrics[key] = []
+                all_eval_metrics[key].append(value)
+    
+    # Average metrics
+    averaged_metrics = {
+        key: np.mean(values) for key, values in all_eval_metrics.items()
+    }
+    
+    model.denoiser.train()
+    return averaged_metrics
+
+
+def save_checkpoint(model: MolecularDenoisingModel, config: Dict, save_path: None):
+    """Save model checkpoint"""
+    
+    checkpoint = {
+        'model_state_dict': model.denoiser.state_dict(),
+        'config': config,
+        'model_params': {
+            'atom_nf': model.atom_nf,
+            'residue_nf': model.residue_nf,
+            'n_dims': model.n_dims,
+            'joint_nf': model.joint_nf,
+            'hidden_nf': model.hidden_nf,
+            'n_layers': model.n_layers,
+            'edge_embedding_dim': model.edge_embedding_dim,
+            'update_pocket_coords': model.update_pocket_coords,
+            # Save scheme parameters instead of the scheme itself
+            'scheme_params': {
+                'coord_norm': model.scheme.coord_norm,
+                'feature_norm': model.scheme.feature_norm,
+                'feature_bias': model.scheme.feature_bias,
+                'sigma_max': config['sigma_max'],
+                'sigma_min': config['sigma_min']
+            }
+        }
+    }
+    if save_path is None:
+        torch.save(checkpoint, config['checkpoint_path'])
+        print(f"✅ Checkpoint saved to {config['checkpoint_path']}")
+    else:
+        torch.save(checkpoint, save_path)
+        print(f"✅ Checkpoint saved to {save_path}")
+
+
+def analyze_samples(samples: Dict, config: Dict):
+    """Analyze the generated molecular samples"""
+    
+    print(f"\n{'='*60}")
+    print("SAMPLE ANALYSIS")
+    print(f"{'='*60}")
+    
+    # Basic statistics 
+    print("Coordinate Statistics:")
+    print(f"  Ligand coords - Mean: {samples['ligand_coords'].mean(dim=0)}")
+    print(f"  Ligand coords - Std:  {samples['ligand_coords'].std(dim=0)}")
+    print(f"  Pocket coords - Mean: {samples['pocket_coords'].mean(dim=0)}")
+    print(f"  Pocket coords - Std:  {samples['pocket_coords'].std(dim=0)}")
+    
+    # Check center of mass (should be near zero)
+    total_coords = torch.cat([samples['ligand_coords'], samples['pocket_coords']], dim=0)
+    total_mask = torch.cat([samples['ligand_mask'], samples['pocket_mask']], dim=0)
+    
+    # Calculate COM for each molecule
+    batch_size = samples['batch_size']
+    for i in range(batch_size):
+        mol_coords = total_coords[total_mask == i]
+        com = mol_coords.mean(dim=0)
+        print(f"  Molecule {i} center of mass: {com}")
+    
+    # Check molecular geometry reasonableness
+    print(f"\nMolecular Geometry Analysis:")
+    for i in range(batch_size):
+        lig_coords = samples['ligand_coords'][samples['ligand_mask'] == i]
+        pocket_coords = samples['pocket_coords'][samples['pocket_mask'] == i]
+        
+        if len(lig_coords) > 1:
+            lig_distances = torch.cdist(lig_coords, lig_coords)
+            lig_distances = lig_distances[lig_distances > 0]  # Remove self-distances
+            if len(lig_distances) > 0:  # Only calculate stats if we have distances
+                print(f"  Molecule {i} ligand bond lengths - Mean: {lig_distances.mean():.3f}, Min: {lig_distances.min():.3f}")
+            else:
+                print(f"  Molecule {i} ligand bond lengths - No valid distances found")
+        
+        if len(pocket_coords) > 1:
+            pocket_distances = torch.cdist(pocket_coords, pocket_coords)
+            pocket_distances = pocket_distances[pocket_distances > 0]
+            if len(pocket_distances) > 0:  # Only calculate stats if we have distances
+                print(f"  Molecule {i} pocket distances - Mean: {pocket_distances.mean():.3f}, Min: {pocket_distances.min():.3f}")
+            else:
+                print(f"  Molecule {i} pocket distances - No valid distances found")
+    
+    print(f"\n✅ Sample analysis completed!")
+
+
+def generate_grid_search_configs(param_spaces: Dict, max_combinations: int = 100) -> List[Dict]:
+    """Generate all combinations for grid search"""
+    
+    # Get all parameter combinations
+    param_names = list(param_spaces.keys())
+    param_values = list(param_spaces.values())
+    all_combinations = list(itertools.product(*param_values))
+    
+    # Limit number of combinations if too many
+    if len(all_combinations) > max_combinations:
+        print(f"Warning: {len(all_combinations)} combinations found, limiting to {max_combinations}")
+        all_combinations = random.sample(all_combinations, max_combinations)
+    
+    configs = []
+    for combination in all_combinations:
+        config = CONFIG.copy()
+        for param_name, param_value in zip(param_names, combination):
+            config[param_name] = param_value
+        configs.append(config)
+    
+    return configs
+
+
+def generate_random_search_configs(param_spaces: Dict, num_trials: int) -> List[Dict]:
+    """Generate random configurations for random search"""
+    
+    configs = []
+    for _ in range(num_trials):
+        config = CONFIG.copy()
+        for param_name, param_values in param_spaces.items():
+            config[param_name] = random.choice(param_values)
+        configs.append(config)
+    
+    return configs
+
+
+def objective_function(trial, param_spaces: Dict, train_data: List[Dict], 
+                      eval_data: List[Dict], base_config: Dict, csv_path: str = None, 
+                      optimization_id: str = None, trial_number: int = None) -> float:
+    """Objective function for Bayesian optimization"""
+    
+    # Suggest hyperparameters
+    config = base_config.copy()
+    for param_name, param_values in param_spaces.items():
+        if isinstance(param_values[0], int):
+            config[param_name] = trial.suggest_categorical(param_name, param_values)
+        elif isinstance(param_values[0], float):
+            config[param_name] = trial.suggest_categorical(param_name, param_values)
+    
+    try:
+        # Create and train model
+        model = create_molecular_model(config)
+        _ = train_model(model, train_data, eval_data, config)
+        
+        # Evaluate final performance
+        eval_losses = evaluate_model(model, eval_data)
+        final_loss = eval_losses.get('total_loss_lvl0', float('inf')) + \
+                     eval_losses.get('total_loss_lvl1', float('inf')) + \
+                     eval_losses.get('total_loss_lvl2', float('inf')) + \
+                     eval_losses.get('total_loss_lvl3', float('inf')) + \
+                     eval_losses.get('total_loss_lvl4', float('inf'))
+        
+        # Save result to CSV if path is provided
+        if csv_path is not None and optimization_id is not None and trial_number is not None:
+            run_id = f"{optimization_id}_trial_{trial_number}"
+            save_result_to_csv(csv_path, config, final_loss, run_id, 'completed')
+        
+        # Return validation loss as objective (minimize)
+        return final_loss
+        
+    except Exception as e:
+        print(f"Trial failed: {e}")
+        
+        # Save failed result to CSV if path is provided
+        if csv_path is not None and optimization_id is not None and trial_number is not None:
+            run_id = f"{optimization_id}_trial_{trial_number}"
+            save_result_to_csv(csv_path, config, float('inf'), run_id, 'failed')
+        
+        return float('inf')
+
+
+def run_bayesian_optimization(param_spaces: Dict, train_data: List[Dict], 
+                            eval_data: List[Dict], n_trials: int = 50, 
+                            csv_path: str = None, optimization_id: str = None) -> Tuple[Dict, float]:
+    """Run Bayesian optimization using Optuna"""
+    
+    if not OPTUNA_AVAILABLE:
+        raise ImportError("Optuna is required for Bayesian optimization")
+    
+    # Track trial number for CSV saving
+    trial_counter = 0
+    
+    def objective(trial):
+        nonlocal trial_counter
+        trial_counter += 1
+        return objective_function(trial, param_spaces, train_data, eval_data, CONFIG, 
+                                csv_path, optimization_id, trial_counter)
+    
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=n_trials)
+    
+    best_config = CONFIG.copy()
+    for param_name in param_spaces.keys():
+        best_config[param_name] = study.best_params[param_name]
+    
+    return best_config, study.best_value
+
+
+
+def run_optimization_configs(configs: List[Dict], train_data: List[Dict], eval_data: List[Dict], 
+                             csv_path: str, json_path: str, optimization_id: str, optimization_metrics: List[str]):
+
+    for i, config in enumerate(configs):
+        print(f"\n\n\n--- Configuration {i+1}/{len(configs)} ---")
+
+        # Create name for the individual training run
+        run_id = f"{optimization_id}_{i}"
+        config['wandb']['name'] = run_id
+        config['run_dir'] = f'{config["run_dir"]}/{run_id}'
+        if not os.path.exists(config['run_dir']):
+            os.makedirs(config['run_dir'])
+        config['checkpoint_path'] = f'{config["run_dir"]}/checkpoint.pt'
+        
+        try:
+            model = create_molecular_model(config)
+            train_losses, eval_losses = train_model(model, train_data, eval_data, config)
+        
+        except Exception as e:
+            print(f"Configuration failed: {e}")
+            for key in optimization_metrics:
+                config.update({key: float('inf')})
+            save_result_to_csv(csv_path, config, run_id, 'failed')
+            save_result_to_json(json_path, config, run_id, 'failed')
+            continue
+
+
+        # Save result of this configuration to CSV and JSON   
+        for key in optimization_metrics:
+            if key in train_losses:
+                config.update({key: train_losses.get(key, float('inf'))})
+            else:
+                config.update({key: eval_losses.get(key, float('inf'))})
+        save_result_to_csv(csv_path, config, run_id, 'completed')
+        save_result_to_json(json_path, config, run_id, 'completed')
+
+        print(f"Configuration {i+1}/{len(configs)} completed")
+            
+
+
+
+
+def run_hyperparameter_optimization(optimization_type: str, param_spaces: Dict, 
+                                  train_data: List[Dict], eval_data: List[Dict], 
+                                  **kwargs) -> List[Tuple[Dict, float]]:
+    
+    print(f"\n{'='*60}\n" + f"HYPERPARAMETER OPTIMIZATION: {optimization_type.upper()}" + f"{'='*60}\n")
+
+    optimization_metrics = [
+        # Training losses
+        'epoch/loss',
+        'epoch/coord_loss',
+        'epoch/categorical_loss',
+        'epoch/coord_loss_ligand',
+        'epoch/coord_loss_pocket',
+        'epoch/categorical_loss_ligand',
+        'epoch/categorical_loss_pocket',
+        'epoch/avg_sigma',
+
+        # Evaluation losses
+        'coord_loss_lvl0',
+        'coord_loss_lvl1',
+        'coord_loss_lvl2',
+        'coord_loss_lvl3',
+        'coord_loss_lvl4',
+        'categorical_loss_lvl0',
+        'categorical_loss_lvl1',
+        'categorical_loss_lvl2',
+        'categorical_loss_lvl3',
+        'categorical_loss_lvl4',
+        'atom_accuracy_lvl0',
+        'atom_accuracy_lvl1',
+        'atom_accuracy_lvl2',
+        'atom_accuracy_lvl3',
+        'atom_accuracy_lvl4',
+        'residue_accuracy_lvl0',
+        'residue_accuracy_lvl1',
+        'residue_accuracy_lvl2',
+        'residue_accuracy_lvl3',
+        'residue_accuracy_lvl4',
+
+        # Integrity metrics
+        'percent_valid',
+        'percent_fragmented',
+        'percent_disconnected',
+        'percent_valence_issues',
+        'n_rings_per_mol',
+        'mean_num_rings',
+        'mean_ring_size',
+        'ring_size_dist_kl_divergence',
+        'ring_size_dist_js_divergence',
+        'mean_num_fragments',
+        'mean_num_valence_issues',
+
+
+        # Distribution losses
+        'atoms_dist_kl_divergence',
+        'atoms_dist_js_divergence',
+        'aa_dist_kl_divergence',
+        'aa_dist_js_divergence'
+    ]
+
+    # Create name for the optimization
+    optimization_id = f"{datetime.now().strftime('%m%d_%H%M%S')}_{optimization_type}"
+    CONFIG['run_dir'] = f'optimization_runs/{optimization_id}'
+    if not os.path.exists(CONFIG['run_dir']):
+        os.makedirs(CONFIG['run_dir'])
+    
+    # Initialize CSV results file in the optimization run directory
+    csv_path = os.path.join(CONFIG['run_dir'], 'optimization_results.csv')
+    json_path = os.path.join(CONFIG['run_dir'], 'optimization_results.json')
+    initialize_csv_results(csv_path, CONFIG, ['run_id', 'status'], ['checkpoint_path'] + optimization_metrics)
+    
+    results = []
+    
+    if optimization_type == 'grid':
+        configs = generate_grid_search_configs(param_spaces, kwargs.get('max_combinations', 100))
+        print(f"Running grid search with {len(configs)} configurations...")
+        run_optimization_configs(configs, train_data, eval_data, csv_path, json_path, optimization_id, optimization_metrics)
+
+    elif optimization_type == 'random':
+        configs = generate_random_search_configs(param_spaces, kwargs.get('num_trials', 20))
+        print(f"Running random search with {len(configs)} trials...")
+        run_optimization_configs(configs, train_data, eval_data, csv_path, json_path, optimization_id, optimization_metrics)
+    
+    # elif optimization_type == 'bayesian':
+    #     n_trials = kwargs.get('n_trials', 20)
+    #     print(f"Running Bayesian optimization with {n_trials} trials...")
+        
+    #     best_config, best_loss = run_bayesian_optimization(
+    #         param_spaces, train_data, eval_data, n_trials, csv_path, optimization_id
+    #     )
+    #     results.append((best_config, best_loss))
+        
+    #     run_id = f"{optimization_id}_best"
+    #     save_result_to_csv(csv_path, best_config, best_loss, run_id, 'completed')
+    #     print(f"Best validation loss: {best_loss:.4f}")
+    
+    else: raise ValueError(f"Unknown optimization type: {optimization_type}")
+    
+    
+    # SUMMARY
+    results.sort(key=lambda x: x[1]) # Sort results by loss
+    print(f"\n{'='*60}")
+    print("OPTIMIZATION RESULTS SUMMARY")
+    print(f"{'='*60}")
+    for i, (config, loss) in enumerate(results[:5]):  # Top 5 results
+        print(f"Rank {i+1}: Loss = {loss:.4f}")
+        print(f"  Parameters: {', '.join([f'{k}={v}' for k, v in config.items() if k in param_spaces])}")
+    
+    return results
+
+
+
+def main():
+    """Main pipeline demonstrating the complete molecular diffusion workflow"""
+    
+    # Parse command line arguments
+    args = parse_arguments()
+    
+    # Update config with command line arguments
+    global CONFIG
+    CONFIG = update_config_from_args(CONFIG, args)
+
+    print(f"🧬 MOLECULAR DIFFUSION PIPELINE")
+    print(f"Mode: {args.mode}")
+    print(f"Device: {CONFIG['device']}")
+
+    # Create output directory for optimization results
+    if args.mode != 'single':
+        os.makedirs(args.output_dir, exist_ok=True)
+    
+    try:
+        # 1. Generate training and evaluation data
+        print(f"\n{'='*60}")
+        print("GENERATING TRAINING DATA")
+        print(f"{'='*60}")
+
+        train_data = create_batches_from_dataset(CONFIG['train_dataset_path'], CONFIG)
+        eval_data = create_batches_from_dataset(CONFIG['eval_dataset_path'], CONFIG)
+        
+        # Show example batch 
+        example_batch = train_data[0]
+        print(f"\nExample batch:")
+        print(f"  Ligand atoms: {example_batch['ligand_coords'].shape[0]}")
+        print(f"  Pocket residues: {example_batch['pocket_coords'].shape[0]}")
+    
+    except Exception as e:
+        print(f"Error generating training data: {e}")
+        return
+    
+
+    try:
+        if args.mode == 'single':
+
+            print(f"\n{'='*60}")
+            print("SINGLE TRAINING RUN")
+            print(f"{'='*60}")
+            
+            # Create run directory and update config
+            run_id = f"{datetime.now().strftime('%m%d_%H%M%S')}_{CONFIG['train_dataset_path'].split('.')[0]}"
+            CONFIG['wandb']['name'] = run_id
+            CONFIG['run_dir'] = f'training_runs/{run_id}'
+            if not os.path.exists(CONFIG['run_dir']):
+                os.makedirs(CONFIG['run_dir'])
+            CONFIG['checkpoint_path'] = f'{CONFIG["run_dir"]}/checkpoint.pt'
+
+            print(f"Configuration: {CONFIG}")
+            
+            # 2. Create and initialize model
+            print(f"\n{'='*60}")
+            print("CREATING MODEL")
+            print(f"{'='*60}")
+            
+            model = create_molecular_model(CONFIG)
+            
+            # 3. Train the model
+            train_model(model, train_data, eval_data, CONFIG)
+            
+            # 4. Save checkpoint
+            save_checkpoint(model, CONFIG, save_path=CONFIG['checkpoint_path'].replace(".pt", "_final.pt"))
+            
+            # 5. Load checkpoint to demonstrate persistence
+            print(f"\n{'='*60}")
+            print("LOADING MODEL FROM CHECKPOINT")
+            print(f"{'='*60}")
+            
+            loaded_model = load_checkpoint(CONFIG['checkpoint_path'])
+            
+            # 6. Sample new molecules
+            samples = sample_molecules(loaded_model,
+                                        num_steps=CONFIG['num_sampling_steps'],
+                                        schedule_type=CONFIG['schedule_type'],
+                                        num_samples=CONFIG['num_eval_samples']
+                                        )
+
+            for s in range(CONFIG['num_eval_samples']):
+                graph = Data(
+                    ligand_coords=samples['ligand_coords'][samples['ligand_mask']==s].cpu(),
+                    ligand_features=samples['ligand_features'][samples['ligand_mask']==s].cpu(),
+                    pocket_coords=samples['pocket_coords'][samples['pocket_mask']==s].cpu(),
+                    pocket_features=samples['pocket_features'][samples['pocket_mask']==s].cpu()
+                )
+                torch.save(graph, CONFIG['run_dir'] + f"/sample_{s}.pt")
+        
+            # 7. Analyze samples
+            analyze_samples(samples, CONFIG)
+            
+            print(f"\n🎉 PIPELINE COMPLETED SUCCESSFULLY!")
+            print(f"Checkpoint saved at: {CONFIG['checkpoint_path']}")
+            print(f"Used {torch.cuda.get_device_name()} for computation")
+            
+
+        else:
+
+            print(f"\n{'='*60}")
+            print("HYPERPARAMETER OPTIMIZATION")
+            print(f"\n{'='*60}")
+            
+            # Define parameter spaces for optimization
+            param_spaces = {}
+            for param_name in ['num_sampling_steps', 'joint_nf', 'hidden_nf', 'n_layers', 
+                             'edge_embedding_dim', 'learning_rate', 'batch_size']:
+                if hasattr(args, param_name) and getattr(args, param_name) is None:
+                    # Only include parameters that weren't explicitly set via command line
+                    param_spaces[param_name] = HYPERPARAM_SPACES[param_name]
+            if not param_spaces:
+                print("No parameters to optimize (all parameters specified via command line)")
+                return
+            print(f"Optimizing parameters: {list(param_spaces.keys())}")
+            
+
+            # Run optimization
+            # --------------------------------------------------------------------------------------
+            optimization_kwargs = {
+                'max_combinations': args.max_combinations,
+                'num_trials': args.num_trials,
+                'n_trials': args.num_trials
+            }
+            results = run_hyperparameter_optimization(args.mode, param_spaces, train_data, eval_data, 
+                                                    **optimization_kwargs)
+            # --------------------------------------------------------------------------------------
+            
+        
+    except Exception as e:
+        # Log error to wandb if it's initialized
+        if wandb.run is not None:
+            wandb.run.finish(exit_code=1)
+        raise e
+
+
+# ------------------------------------------------------------------------------------------------
+# Functions for saving optimization results
+# ------------------------------------------------------------------------------------------------
+
+def save_result_to_json(output_path: str, config: Dict, run_id: str, status: str = 'completed'):
+    """Save optimization results to JSON file"""
+    
+    # Convert results to serializable format
+
+    serializable_config = {}
+    for key, value in config.items():
+        if isinstance(value, (int, float, str, bool)):
+            serializable_config[key] = value
+        elif isinstance(value, tuple):
+            serializable_config[key] = list(value)
+        elif isinstance(value, dict):
+            serializable_config[key] = value
+
+        serializable_config['status'] = status
+
+    
+    if os.path.exists(output_path):
+        with open(output_path, 'r') as f:
+            existing_results = json.load(f)
+        existing_results.update({run_id: serializable_config})
+        with open(output_path, 'w') as f:
+            json.dump(existing_results, f, indent=2)
+    else:
+        with open(output_path, 'w') as f:
+            json.dump({run_id: serializable_config}, f, indent=2)
+    
+    print(f"Configuration results saved to {output_path}")
+
+
+
+def initialize_csv_results(csv_path: str, config_template: Dict, add_columns_start: List[str] = [], add_columns_end: List[str] = []):
+    """Initialize CSV file with headers for all CONFIG parameters"""
+    
+    # Get all possible parameter names from CONFIG
+    all_params = list(config_template.keys())
+    
+    # Add result columns
+    columns = add_columns_start + all_params + add_columns_end
+    
+    # Create CSV file with headers
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+    
+    print(f"CSV results file initialized: {csv_path}")
+
+
+
+
+def save_result_to_csv(csv_path: str, config: Dict, run_id: str, status: str = 'completed'):
+    """Save a single optimization result to CSV file"""
+    
+    # Get all possible parameter names from CONFIG
+    all_params = list(config.keys())
+    
+    # Prepare row data
+    row_data = [run_id, status]
+    for param in all_params:
+        value = config[param]
+        # Convert complex types to strings
+        if isinstance(value, (list, tuple, dict)):
+            value = str(value)
+        row_data.append(value)
+    
+    # Append to CSV file
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(row_data)
+    
+    print(f"Result saved to CSV: {run_id} - Status: {status}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# Train best model with full configuration
+# if results:
+#     best_config, best_loss = results[0]
+#     print(f"\n{'='*60}")
+#     print("TRAINING BEST MODEL")
+#     print(f"{'='*60}")
+    
+#     # Create run directory for best model
+#     run_id = best_config['wandb']['name'].split('_')[:-1] + '_best'
+#     best_config['wandb']['name'] = run_id
+#     best_config['run_dir'] = f'optimization_runs/{run_id}'
+#     if not os.path.exists(best_config['run_dir']):
+#         os.makedirs(best_config['run_dir'])
+#     best_config['checkpoint_path'] = f'{best_config["run_dir"]}/checkpoint.pt'
+    
+#     print(f"Best configuration: {best_config}")
+#     print(f"Expected validation loss: {best_loss:.4f}")
+    
+#     # Train best model
+#     model = create_molecular_model(best_config)
+#     best_config['num_epochs'] = 1000
+#     train_model(model, train_data, eval_data, best_config)
+#     save_checkpoint(model, best_config, save_path=best_config['checkpoint_path'].replace(".pt", "_best.pt"))
+    
+#     print(f"\n🎉 OPTIMIZATION COMPLETED SUCCESSFULLY!")
+#     print(f"Best model checkpoint: {best_config['checkpoint_path']}")
+#     print(f"Best validation loss: {best_loss:.4f}")
