@@ -1,15 +1,33 @@
 import torch
+import json
+import warnings
+import tempfile
+from openbabel import openbabel
+from rdkit import Chem
+from rdkit.Chem.rdForceFieldHelpers import UFFOptimizeMolecule, UFFHasAllMoleculeParams
+from rdkit.Chem import rdMolDescriptors
+from rdkit.Chem import inchi
+from collections import Counter
 import numpy as np
 from torch_geometric.data import Data
 from molecular_diffusion import MolecularDenoisingModel
 import argparse
 from molecular_samplers import create_molecular_sampler_from_model
+import utils
 from molecular_diffusion import (
     log_uniform_sampling,
     edm_weighting,
     MolecularDiffusion,
     exponential_noise_schedule
 )
+from constants import (
+    ligand_size_distribution, 
+    ligand_to_pocket_size_mapping, 
+    atom_decoder, 
+    aa_decoder3, 
+    atom_freq_dist, 
+    aa_freq_dist,
+    ring_size_dist)
 
 
 def load_checkpoint(checkpoint_path: str) -> MolecularDenoisingModel:
@@ -187,7 +205,7 @@ def sample_molecules(model: MolecularDenoisingModel,
     return samples
 
 
-def evaluate_samples(samples: list[Data]):
+def evaluate_atom_aa_distributions(samples: list[Data]):
     """Evaluate the quality of sampled binding pockets
          - Jenson-Shannon divergence of atom distribution from training distribution
          - Jenson-Shannon divergence of amino acid distribution from training distribution
@@ -197,28 +215,387 @@ def evaluate_samples(samples: list[Data]):
     ligand_features = samples['ligand_features'].cpu()
     atom_distribution = ligand_features.sum(dim=0)
     training_atom_distribution = np.array([atom_freq_dist[atom] for atom in atom_decoder])
-    _, atoms_dist_js_divergence = compare_distributions(atom_distribution.numpy(), training_atom_distribution)
+    atoms_dist_kl_divergence, atoms_dist_js_divergence = compare_distributions(atom_distribution.numpy(), training_atom_distribution)
 
     # Divergence of amino acid distribution from training distribution
     pocket_features = samples['pocket_features'].cpu()
     aa_distribution = pocket_features.sum(dim=0)
     training_aa_distribution = np.array([aa_freq_dist[aa] for aa in aa_decoder3])
-    _, aa_dist_js_divergence = compare_distributions(aa_distribution.numpy(), training_aa_distribution)
+    aa_dist_kl_divergence, aa_dist_js_divergence = compare_distributions(aa_distribution.numpy(), training_aa_distribution)
 
     return {
+        'atoms_dist_kl_divergence': atoms_dist_kl_divergence, 
         'atoms_dist_js_divergence': atoms_dist_js_divergence, 
+        'aa_dist_kl_divergence': aa_dist_kl_divergence,
         'aa_dist_js_divergence': aa_dist_js_divergence
         }
+
+
+def evaluate_ring_size_distributions(ring_size_counts: Counter, ring_size_dist: dict):
+    
+    # Convert ring_size_counts Counter to array format matching ring_size_dist
+    max_ring_size_from_dist = max(int(key) for key in ring_size_dist.keys())
+    max_ring_size_from_counts = max(ring_size_counts.keys()) if ring_size_counts else 0
+    max_ring_size = max(max_ring_size_from_dist, max_ring_size_from_counts)
+    ring_size_array = np.zeros(max_ring_size + 1)
+    
+    for ring_size, count in ring_size_counts.items():
+        ring_size_array[ring_size] = count
+    
+    # Convert ring_size_dist to array format
+    ring_size_dist_array = np.zeros(max_ring_size + 1)
+    for ring_size_str, count in ring_size_dist.items():
+        ring_size = int(ring_size_str)
+        if ring_size <= max_ring_size:
+            ring_size_dist_array[ring_size] = count
+
+    ring_size_dist_kl_divergence, ring_size_dist_js_divergence = compare_distributions(ring_size_array, ring_size_dist_array)
+
+    return {
+        'ring_size_dist_kl_divergence': ring_size_dist_kl_divergence,
+        'ring_size_dist_js_divergence': ring_size_dist_js_divergence
+    }
+
+
+def uff_relax(mol, max_iter=200):
+    """
+    Uses RDKit's universal force field (UFF) implementation to optimize a
+    molecule.
+    """
+    more_iterations_required = UFFOptimizeMolecule(mol, maxIters=max_iter)
+    if more_iterations_required:
+        warnings.warn(f'Maximum number of FF iterations reached. '
+                      f'Returning molecule after {max_iter} relaxation steps.')
+    return more_iterations_required
+
+
+def process_molecule(rdmol, add_hydrogens=False, sanitize=True, relax_iter=0,
+                     largest_frag=True):
+    """
+    Apply filters to an RDKit molecule. Makes a copy first.
+    Args:
+        rdmol: rdkit molecule
+        add_hydrogens
+        sanitize
+        relax_iter: maximum number of UFF optimization iterations
+        largest_frag: filter out the largest fragment in a set of disjoint
+            molecules
+    Returns:
+        RDKit molecule or None if it does not pass the filters
+    """
+
+    # Create a copy
+    mol = Chem.Mol(rdmol)
+
+    if sanitize:
+        try:
+            Chem.SanitizeMol(mol)
+        except ValueError:
+            warnings.warn('Sanitization failed. Returning None.')
+            return None
+
+    if add_hydrogens:
+        mol = Chem.AddHs(mol, addCoords=(len(mol.GetConformers()) > 0))
+
+    if largest_frag:
+        mol_frags = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=False)
+        mol = max(mol_frags, default=mol, key=lambda m: m.GetNumAtoms())
+        if sanitize:
+            # sanitize the updated molecule
+            try:
+                Chem.SanitizeMol(mol)
+            except ValueError:
+                return None
+
+    if relax_iter > 0:
+        if not UFFHasAllMoleculeParams(mol):
+            warnings.warn('UFF parameters not available for all atoms. '
+                          'Returning None.')
+            return None
+
+        try:
+            uff_relax(mol, relax_iter)
+            if sanitize:
+                # sanitize the updated molecule
+                Chem.SanitizeMol(mol)
+        except (RuntimeError, ValueError) as e:
+            return None
+
+    return mol
+
+
+
+def make_mol_openbabel(positions, atom_types, atom_decoder):
+    """
+    Build an RDKit molecule using openbabel for creating bonds
+    Args:
+        positions: N x 3
+        atom_types: N
+        atom_decoder: maps indices to atom types
+    Returns:
+        rdkit molecule
+    """
+    atom_types = [atom_decoder[x] for x in atom_types]
+
+    with tempfile.NamedTemporaryFile() as tmp:
+        tmp_file = tmp.name
+
+        # Write xyz file
+        utils.write_xyz_file(positions, atom_types, tmp_file)
+
+        # Convert to sdf file with openbabel
+        # openbabel will add bonds
+        obConversion = openbabel.OBConversion()
+        obConversion.SetInAndOutFormats("xyz", "sdf")
+        ob_mol = openbabel.OBMol()
+        obConversion.ReadFile(ob_mol, tmp_file)
+
+        obConversion.WriteFile(ob_mol, tmp_file)
+
+        # Read sdf file with RDKit
+        tmp_mol = Chem.SDMolSupplier(tmp_file, sanitize=False)[0]
+
+    # Build new molecule. This is a workaround to remove radicals.
+    mol = Chem.RWMol()
+    for atom in tmp_mol.GetAtoms():
+        mol.AddAtom(Chem.Atom(atom.GetSymbol()))
+    mol.AddConformer(tmp_mol.GetConformer(0))
+
+    for bond in tmp_mol.GetBonds():
+        mol.AddBond(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(),
+                    bond.GetBondType())
+
+    return mol
+
+
+
+def build_molecule(positions, atom_types, add_coords=False,
+                   use_openbabel=True):
+    """
+    Build RDKit molecule
+    Args:
+        positions: N x 3
+        atom_types: N
+        dataset_info: dict
+        add_coords: Add conformer to mol (always added if use_openbabel=True)
+        use_openbabel: use OpenBabel to create bonds
+    Returns:
+        RDKit molecule
+    """
+    if use_openbabel:
+        mol = make_mol_openbabel(positions, atom_types, atom_decoder)
+    else:
+        mol = make_mol_edm(positions, atom_types, dataset_info, add_coords)
+
+    return mol
+
+
+
+def build_mol_objects(samples, sanitize=False, relax_iter=0, largest_frag=False):
+    molecules = []
+    x = samples['ligand_coords'].detach().cpu()
+    atom_type = samples['ligand_features'].argmax(1).detach().cpu()
+    lig_mask = samples['ligand_mask'].cpu()
+    # x = xh_lig[:, :self.x_dims].detach().cpu()
+    # atom_type = xh_lig[:, self.x_dims:].argmax(1).detach().cpu()
+    #lig_mask = lig_mask.cpu()
+
+    molecules = []
+    for mol_pc in zip(utils.batch_to_list(x, lig_mask),
+                        utils.batch_to_list(atom_type, lig_mask)):
+
+        mol = build_molecule(*mol_pc, add_coords=True)
+        mol = process_molecule(mol,
+                                add_hydrogens=False,
+                                sanitize=sanitize,
+                                relax_iter=relax_iter,
+                                largest_frag=largest_frag)
+        if mol is not None:
+            molecules.append(mol)
+
+    return molecules
+
+
+
+def evaluate_mols(mols):
+    """
+    Takes a list of RDKit Mol objects.
+    Returns a dictionary with summary statistics about molecule integrity,
+    including ring size distributions.
+    """
+    summary = {
+        "num_molecules": len(mols),
+        "valid_molecules": 0,
+        "invalid_molecules": 0,
+        # "invalid_molecules_indices": [],
+        "num_multifragment": 0,
+        # "multifragment_indices": [],
+        "num_disconnected_atoms": 0,
+        # "molecules_with_disconnected_atoms": [],
+        "total_valence_issues": 0,
+        "molecules_with_valence_issues": [],
+        "max_num_fragments": 0,
+        "sum_num_fragments": 0,
+        "sum_num_valence_issues": 0,
+        "num_molecules_with_rings": 0,
+        "sum_num_rings": 0,
+        "max_num_rings": 0,
+        "ring_size_counts": Counter(),
+    }
+
+    pt = Chem.GetPeriodicTable()
+
+    for idx, mol in enumerate(mols):
+        # 1. Validity:Sanitization
+        sanitized = True
+        try:
+            Chem.SanitizeMol(mol)
+        except Exception:
+            sanitized = False
+        if sanitized:
+            summary["valid_molecules"] += 1
+        else:
+            summary["invalid_molecules"] += 1
+            # summary["invalid_molecules_indices"].append(idx)
+
+        # 2. Fragments
+        frags = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=False)
+        num_frags = len(frags)
+        summary["sum_num_fragments"] += num_frags
+        if num_frags > 1:
+            summary["num_multifragment"] += 1
+            # summary["multifragment_indices"].append(idx)
+        summary["max_num_fragments"] = max(summary["max_num_fragments"], num_frags)
+
+        # 3. Disconnected atoms
+        has_disconnected = any(len(atom.GetNeighbors()) == 0 for atom in mol.GetAtoms())
+        if has_disconnected:
+            summary["num_disconnected_atoms"] += 1
+            # summary["molecules_with_disconnected_atoms"].append(idx)
+
+        # 4. Valence issues
+        mol_valence_issues = 0
+        for atom in mol.GetAtoms():
+            try:
+                valence = atom.GetTotalValence()
+                default_valence = pt.GetDefaultValence(atom.GetSymbol())
+                if valence > default_valence + 1:
+                    mol_valence_issues += 1
+            except:
+                mol_valence_issues += 1
+        summary["total_valence_issues"] += mol_valence_issues
+        summary["sum_num_valence_issues"] += mol_valence_issues
+        if mol_valence_issues > 0:
+            summary["molecules_with_valence_issues"].append(idx)
+
+        # 5. Rings and ring sizes
+        ring_info = mol.GetRingInfo()
+        atom_rings = ring_info.AtomRings()
+        num_rings = len(atom_rings)
+        summary["sum_num_rings"] += num_rings
+        if num_rings > 0:
+            summary["num_molecules_with_rings"] += 1
+        summary["max_num_rings"] = max(summary["max_num_rings"], num_rings)
+
+        # Count ring sizes
+        for ring in atom_rings:
+            ring_size = len(ring)
+            summary["ring_size_counts"][ring_size] += 1
+
+    # 6. Means
+    n = len(mols)
+    summary["mean_num_fragments"] = summary["sum_num_fragments"] / n if n else 0
+    summary["mean_num_valence_issues"] = summary["sum_num_valence_issues"] / n if n else 0
+    summary["mean_num_rings"] = summary["sum_num_rings"] / n if n else 0
+
+    # 7. Ring size distributions
+    ring_size_dist_metrics = evaluate_ring_size_distributions(summary["ring_size_counts"], ring_size_dist)
+    summary.update(ring_size_dist_metrics)
+
+    # Convert ring_size_counts to regular dict for JSON compatibility
+    summary["ring_size_counts"] = dict(summary["ring_size_counts"])
+
+    return summary
+
+
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", required=True, type=str)
+    parser.add_argument("--num_steps", type=int, default=25)
     parser.add_argument("--n_samples", type=int, default=3)
     args = parser.parse_args()
     
     model = load_checkpoint(args.model_path)
+    samples = sample_molecules(model, num_steps=args.num_steps, num_samples=args.n_samples)
 
-    samples = sample_molecules(model, args.n_samples)
+    molecules = build_mol_objects(samples)
 
+    for key, value in evaluate_mols(molecules).items():
+        print(f'{key}: {value}')
+
+    utils.write_sdf_file(sdf_path='0704_134322_samples.sdf', molecules=molecules)
+    
     save_samples_to_graphs(samples, args.n_samples, args.model_path)
+
+
+# # Save the samples to a json file, making tensors serializable
+# samples_dict = {}
+# for key, value in samples.items():
+#     if isinstance(value, torch.Tensor):
+#         samples_dict[key] = value.cpu().detach().numpy().tolist()
+#     else:
+#         samples_dict[key] = value
+# with open('samples.json', 'w') as f:
+#     json.dump(samples_dict, f, indent=4)
+
+# for i in range(args.n_samples):
+#     ligand_coords=samples['ligand_coords'][samples['ligand_mask']==i].cpu(),
+#     ligand_features=samples['ligand_features'][samples['ligand_mask']==i].cpu(),
+#     pocket_coords=samples['pocket_coords'][samples['pocket_mask']==i].cpu(),
+#     pocket_features=samples['pocket_features'][samples['pocket_mask']==i].cpu()
+
+#     print(f'Ligand coords: {ligand_coords.shape}')
+#     print(f'Ligand features: {ligand_features.shape}')
+#     print()
+#     print(ligand_coords)
+#     print(ligand_features)
+
+# def analyze_sample(self, molecules, atom_types, aa_types, receptors=None):
+#     # Distribution of node types
+#     kl_div_atom = self.ligand_type_distribution.kl_divergence(atom_types) \
+#         if self.ligand_type_distribution is not None else -1
+#     kl_div_aa = self.pocket_type_distribution.kl_divergence(aa_types) \
+#         if self.pocket_type_distribution is not None else -1
+
+#     # Convert into rdmols
+#     rdmols = [build_molecule(*graph, self.dataset_info) for graph in molecules]
+
+#     # Other basic metrics
+#     (validity, connectivity, uniqueness, novelty), (_, connected_mols) = \
+#         self.ligand_metrics.evaluate_rdmols(rdmols)
+
+#     qed, sa, logp, lipinski, diversity = \
+#         self.molecule_properties.evaluate_mean(connected_mols)
+
+#     out = {
+#         'kl_div_atom_types': kl_div_atom,
+#         'kl_div_residue_types': kl_div_aa,
+#         'Validity': validity,
+#         'Connectivity': connectivity,
+#         'Uniqueness': uniqueness,
+#         'Novelty': novelty,
+#         'QED': qed,
+#         'SA': sa,
+#         'LogP': logp,
+#         'Lipinski': lipinski,
+#         'Diversity': diversity
+#     }
+
+#     # Simple docking score
+#     if receptors is not None:
+#         # out['smina_score'] = np.mean(smina_score(rdmols, receptors))
+#         out['smina_score'] = np.mean(smina_score(connected_mols, receptors))
+
+#     return out

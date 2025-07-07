@@ -4,3 +4,8 @@ wandb/
 *.out
 *.err
 *.sh
+
+optimization_runs/
+optimization_results/
+diffsbdd_stuff/
+combine_csvs.py
