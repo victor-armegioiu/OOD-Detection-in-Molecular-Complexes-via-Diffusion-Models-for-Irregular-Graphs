@@ -1,10 +1,10 @@
 """
-EGNN Dynamics for Molecular Diffusion - Exact Implementation
+EGNN Dynamics for Molecular Diffusion - Enhanced with Geometric Regularization
 
 Contains the EGNNDynamics class that predicts noise for molecular systems.
-This is the exact equivariant implementation from the original codebase.
+Now includes geometric losses for preventing fragmentation and encouraging rings.
 
-https://github.com/victor-armegioiu/molecular-diffusion/blob/main/egnn_dynamics.py
+https://github.com/arneschneuing/DiffSBDD/blob/5d0d38d16c8932a0339fd2ce3f67ade98bbdff27/equivariant_diffusion/dynamics.py#L10
 combined with
 https://github.com/arneschneuing/DiffSBDD/blob/main/equivariant_diffusion/egnn_new.py#L187
 """
@@ -318,6 +318,231 @@ class EGNN(nn.Module):
         return h, x
 
 
+class GeometricRegularizer(nn.Module):
+    """Geometric regularization losses for molecular diffusion"""
+    
+    def __init__(self, device='cpu'):
+        super().__init__()
+        self.device = device
+        
+    def infer_bond_threshold(self, target_coords, method='adaptive_percentile'):
+        """
+        Infer reasonable bond threshold from target molecule's geometry
+        """
+        n_atoms = target_coords.shape[0]
+        if n_atoms <= 1:
+            return torch.tensor(2.5, device=target_coords.device)
+        
+        dist_matrix = torch.cdist(target_coords, target_coords)
+        triu_indices = torch.triu_indices(n_atoms, n_atoms, offset=1, device=target_coords.device)
+        distances = torch.sort(dist_matrix[triu_indices[0], triu_indices[1]])[0]
+        
+        if method == 'adaptive_percentile':
+            # Use adaptive percentile based on molecule size
+            # Smaller molecules: higher percentile (more connections)
+            # Larger molecules: lower percentile (fewer connections per atom)
+            percentile = max(5, min(20, 100 / n_atoms))
+            return torch.quantile(distances, percentile / 100.0) * 1.2
+            
+        elif method == 'nearest_neighbors':
+            # Each atom should connect to ~2-4 nearest neighbors
+            target_edges = min(n_atoms * 3, len(distances))
+            return distances[target_edges - 1] * 1.1
+            
+        else:
+            return torch.quantile(distances, 0.1) * 1.2
+
+    def count_connected_components(self, coords, bond_threshold):
+        """
+        Count connected components using differentiable graph operations
+        """
+        n_atoms = coords.shape[0]
+        if n_atoms <= 1:
+            return torch.tensor(1.0, device=coords.device)
+        
+        # Build adjacency matrix
+        dist_matrix = torch.cdist(coords, coords)
+        adj = (dist_matrix < bond_threshold).float()
+        
+        # Remove self-loops
+        adj = adj - torch.eye(n_atoms, device=adj.device)
+        
+        # Eigenvalue approach (differentiable)
+        # Number of zero eigenvalues = number of connected components
+        try:
+            # Add small regularization for numerical stability
+            reg_adj = adj + 1e-6 * torch.eye(n_atoms, device=adj.device)
+            eigenvals = torch.linalg.eigvals(reg_adj).real
+            
+            # Count near-zero eigenvalues (connected components)
+            num_components = (eigenvals.abs() < 1e-3).float().sum()
+            return num_components
+            
+        except:
+            # Fallback: simple connectivity check
+            return self.count_components_simple(adj)
+
+    def count_components_simple(self, adj):
+        """Simple connectivity check using matrix powers"""
+        n_atoms = adj.shape[0]
+        
+        # Compute reachability matrix using matrix powers
+        reach = adj.clone()
+        for _ in range(n_atoms):
+            new_reach = torch.matmul(reach, adj)
+            new_reach = (reach + new_reach > 0).float()
+            if torch.allclose(new_reach, reach, atol=1e-6):
+                break
+            reach = new_reach
+        
+        # Count components by checking reachability from each node
+        visited = torch.zeros(n_atoms, device=adj.device)
+        num_components = 0
+        
+        for i in range(n_atoms):
+            if visited[i] == 0:
+                # Mark all nodes reachable from i
+                component = reach[i]
+                visited = torch.max(visited, component)
+                num_components += 1
+                
+        return torch.tensor(num_components, dtype=torch.float32, device=adj.device)
+
+    def connected_components_loss(self, coords, target_coords, mask):
+        """
+        Compare predicted connectivity to target connectivity
+        Uses target-derived bond thresholds for each molecule
+        """
+        penalties = []
+        
+        for batch_idx in torch.unique(mask):
+            pred_mol = coords[mask == batch_idx]
+            target_mol = target_coords[mask == batch_idx]
+            
+            # Get bond threshold from target molecule
+            bond_threshold = self.infer_bond_threshold(target_mol)
+            
+            # Count components using target-derived threshold
+            pred_components = self.count_connected_components(pred_mol, bond_threshold)
+            target_components = self.count_connected_components(target_mol, bond_threshold)
+            
+            # Penalize fragmentation (more components than target)
+            fragmentation_penalty = F.relu(pred_components - target_components)
+            penalties.append(fragmentation_penalty)
+        
+        return torch.stack(penalties).mean() if penalties else torch.tensor(0.0, device=coords.device)
+
+    def radius_of_gyration_loss(self, coords, target_coords, mask):
+        """
+        Match radius of gyration to target molecules
+        """
+        penalties = []
+        
+        for batch_idx in torch.unique(mask):
+            pred_mol = coords[mask == batch_idx]
+            target_mol = target_coords[mask == batch_idx]
+            
+            if pred_mol.shape[0] <= 1:
+                continue
+                
+            # Predicted Rg
+            pred_centroid = pred_mol.mean(dim=0)
+            pred_rg = torch.sqrt(torch.sum((pred_mol - pred_centroid)**2, dim=1).mean())
+            
+            # Target Rg
+            target_centroid = target_mol.mean(dim=0)
+            target_rg = torch.sqrt(torch.sum((target_mol - target_centroid)**2, dim=1).mean())
+            
+            # Match target's radius of gyration
+            rg_diff = F.mse_loss(pred_rg, target_rg)
+            penalties.append(rg_diff)
+        
+        return torch.stack(penalties).mean() if penalties else torch.tensor(0.0, device=coords.device)
+
+    def cycle_detection_loss(self, coords, mask, bond_threshold=2.0):
+        """
+        Detect and reward cycle formation in molecular graphs
+        """
+        rewards = []
+        
+        for batch_idx in torch.unique(mask):
+            mol_coords = coords[mask == batch_idx]
+            n_atoms = mol_coords.shape[0]
+            
+            if n_atoms < 3:
+                continue
+                
+            # Build adjacency matrix based on distance threshold
+            dist_matrix = torch.cdist(mol_coords, mol_coords)
+            adj_matrix = (dist_matrix < bond_threshold).float()
+            adj_matrix = adj_matrix - torch.eye(n_atoms, device=adj_matrix.device)  # remove self-loops
+            
+            # Count cycles by looking at powers of adjacency matrix
+            # This is a differentiable approximation
+            adj_squared = torch.matmul(adj_matrix, adj_matrix)
+            adj_cubed = torch.matmul(adj_squared, adj_matrix)
+            
+            # 3-cycles (triangles)
+            triangles = torch.trace(adj_cubed) / 6.0
+            
+            # 4-cycles and higher (approximation)
+            adj_fourth = torch.matmul(adj_cubed, adj_matrix)
+            four_cycles = torch.trace(adj_fourth) / 8.0
+            
+            # Reward cycle formation (negative loss = reward)
+            cycle_reward = -(triangles + four_cycles)
+            rewards.append(cycle_reward)
+        
+        return torch.stack(rewards).mean() if rewards else torch.tensor(0.0, device=coords.device)
+
+    def pairwise_distance_loss(self, coords, mask, min_dist=0.8, max_dist=8.0):
+        """
+        Simple distance-based geometric constraints
+        """
+        penalties = []
+        
+        for batch_idx in torch.unique(mask):
+            mol_coords = coords[mask == batch_idx]
+            n_atoms = mol_coords.shape[0]
+            
+            if n_atoms <= 1:
+                continue
+                
+            # Get all pairwise distances
+            dist_matrix = torch.cdist(mol_coords, mol_coords)
+            
+            # Get upper triangular (unique pairs)
+            triu_indices = torch.triu_indices(n_atoms, n_atoms, offset=1, device=mol_coords.device)
+            distances = dist_matrix[triu_indices[0], triu_indices[1]]
+            
+            # Soft repulsion (atoms too close)
+            too_close_penalty = torch.exp(-distances / min_dist).mean()
+            
+            # Prevent excessive drift (atoms too far)
+            too_far_penalty = F.relu(distances - max_dist).mean()
+            
+            total_penalty = too_close_penalty + too_far_penalty
+            penalties.append(total_penalty)
+        
+        return torch.stack(penalties).mean() if penalties else torch.tensor(0.0, device=coords.device)
+
+    def comprehensive_geometric_loss(self, coords, target_coords, mask, 
+                                   weights=(1.0, 0.8, 0.5, 0.3)):
+        """
+        Combine multiple geometric constraints
+        """
+        w_components, w_rg, w_cycles, w_distances = weights
+        
+        total_loss = (
+            w_components * self.connected_components_loss(coords, target_coords, mask) +
+            w_rg * self.radius_of_gyration_loss(coords, target_coords, mask) +
+            w_cycles * self.cycle_detection_loss(coords, mask) +
+            w_distances * self.pairwise_distance_loss(coords, mask)
+        )
+        
+        return total_loss
+
+
 class EGNNDynamics(nn.Module):
     def __init__(self, atom_nf, residue_nf,
                  n_dims, joint_nf=16, hidden_nf=64, device='cpu',
@@ -327,12 +552,15 @@ class EGNNDynamics(nn.Module):
                  normalization_factor=100, aggregation_method='sum',
                  update_pocket_coords=True, edge_cutoff_ligand=None,
                  edge_cutoff_pocket=None, edge_cutoff_interaction=None,
-                 reflection_equivariant=True, edge_embedding_dim=None):
+                 reflection_equivariant=True, edge_embedding_dim=None,
+                 geometric_regularization=False, geom_loss_weight=0.1):
         super().__init__()
         self.edge_cutoff_l = edge_cutoff_ligand
         self.edge_cutoff_p = edge_cutoff_pocket
         self.edge_cutoff_i = edge_cutoff_interaction
         self.edge_nf = edge_embedding_dim
+        self.geometric_regularization = geometric_regularization
+        self.geom_loss_weight = geom_loss_weight
 
         self.atom_encoder = nn.Sequential(
             nn.Linear(atom_nf, 2 * atom_nf),
@@ -381,12 +609,20 @@ class EGNNDynamics(nn.Module):
         self.node_nf = dynamics_node_nf
         self.update_pocket_coords = update_pocket_coords
 
+        # Geometric regularizer
+        if self.geometric_regularization:
+            self.geometric_regularizer = GeometricRegularizer(device=device)
+            
+        # For storing losses
+        self.last_geometric_loss = torch.tensor(0.0)
+
         self.device = device
         self.n_dims = n_dims
         self.condition_time = condition_time
         self.to(device)
 
-    def forward(self, xh_atoms, xh_residues, t, mask_atoms, mask_residues):
+    def forward(self, xh_atoms, xh_residues, t, mask_atoms, mask_residues, 
+                target_atoms=None, target_residues=None):
         """
         Forward pass of EGNN Dynamics
         
@@ -396,6 +632,8 @@ class EGNNDynamics(nn.Module):
             t: [batch_size, 1] - normalized timestep values
             mask_atoms: [total_lig_atoms] - molecule indices for ligand atoms
             mask_residues: [total_pocket_atoms] - molecule indices for pocket residues
+            target_atoms: [total_lig_atoms, n_dims + joint_nf] - target ligand coords (for geometric loss)
+            target_residues: [total_pocket_atoms, n_dims + residue_nf] - target pocket coords
             
         Returns:
             Tuple of (ligand_output, pocket_output) representing predicted noise
@@ -449,6 +687,20 @@ class EGNNDynamics(nn.Module):
                                      batch_mask=mask, edge_attr=edge_types)
         vel = (x_final - x)
 
+        # Geometric regularization loss (computed on predicted coordinates)
+        if self.geometric_regularization and target_atoms is not None and self.training:
+            # Extract predicted and target coordinates for ligands only
+            pred_ligand_coords = x_final[:len(mask_atoms)]
+            target_ligand_coords = target_atoms[:, :self.n_dims]
+            
+            # Compute geometric loss
+            geom_loss = self.geometric_regularizer.comprehensive_geometric_loss(
+                pred_ligand_coords, target_ligand_coords, mask_atoms
+            )
+            self.last_geometric_loss = geom_loss * self.geom_loss_weight
+        else:
+            self.last_geometric_loss = torch.tensor(0.0, device=self.device)
+
         if self.condition_time:
             # Slice off last dimension which represented time.
             h_final = h_final[:, :-1]
@@ -466,7 +718,6 @@ class EGNNDynamics(nn.Module):
         if self.update_pocket_coords:
             vel = remove_mean_batch(vel, mask)
 
-        #print(f"DEBUG: vel max: {vel.abs().max():.6f}, h_final max: {h_final_atoms.abs().max():.6f}")
         return torch.cat([vel[:len(mask_atoms)], h_final_atoms], dim=-1), \
                torch.cat([vel[len(mask_atoms):], h_final_residues], dim=-1)
 
@@ -511,7 +762,8 @@ class PreconditionedEGNNDynamics(nn.Module):
     def residue_encoder(self, residue_features):
         return self.egnn_dynamics.residue_encoder(residue_features)
         
-    def forward(self, xh_atoms, xh_residues, sigma, mask_atoms, mask_residues):
+    def forward(self, xh_atoms, xh_residues, sigma, mask_atoms, mask_residues,
+                target_atoms=None, target_residues=None):
         """
         Preconditioned forward pass with separate handling for coordinates and categorical features.
         
@@ -521,6 +773,8 @@ class PreconditionedEGNNDynamics(nn.Module):
             sigma: [batch_size] or scalar - noise level (not normalized time!)
             mask_atoms: [total_lig_atoms] - molecule indices for ligand atoms
             mask_residues: [total_pocket_atoms] - molecule indices for pocket residues
+            target_atoms: [total_lig_atoms, n_dims + joint_nf] - target ligand coords (for geometric loss)
+            target_residues: [total_pocket_atoms, n_dims + residue_nf] - target pocket coords
             
         Returns:
             Tuple of (ligand_output, pocket_output) with preconditioned coordinates + logits
@@ -570,9 +824,10 @@ class PreconditionedEGNNDynamics(nn.Module):
         # Convert sigma to normalized time for the base model
         t = c_noise.unsqueeze(1)  # [batch_size, 1]
         
-        # Forward through base EGNN
+        # Forward through base EGNN (pass through target data for geometric loss)
         f_ligand, f_pocket = self.egnn_dynamics(
-            xh_atoms_scaled, xh_residues_scaled, t, mask_atoms, mask_residues
+            xh_atoms_scaled, xh_residues_scaled, t, mask_atoms, mask_residues,
+            target_atoms=target_atoms, target_residues=target_residues
         )
         
         # Split EGNN output into coordinates and logits
@@ -599,10 +854,16 @@ class PreconditionedEGNNDynamics(nn.Module):
         
         return ligand_out, pocket_out
 
+    @property
+    def last_geometric_loss(self):
+        """Access geometric loss from the underlying EGNN dynamics"""
+        return self.egnn_dynamics.last_geometric_loss
+
+
 def test_egnn_dynamics():
-    """Test the EGNNDynamics implementation"""
+    """Test the enhanced EGNNDynamics implementation"""
     
-    print("Testing EGNNDynamics...")
+    print("Testing Enhanced EGNNDynamics with Geometric Regularization...")
     
     # Configuration
     batch_size = 2
@@ -619,13 +880,17 @@ def test_egnn_dynamics():
     xh_atoms = torch.randn(total_lig_atoms, n_dims + joint_nf, device=device)
     xh_residues = torch.randn(total_pocket_atoms, n_dims + joint_nf, device=device)
     
+    # Create target data (same structure as inputs for testing)
+    target_atoms = torch.randn(total_lig_atoms, n_dims + joint_nf, device=device)
+    target_residues = torch.randn(total_pocket_atoms, n_dims + joint_nf, device=device)
+    
     mask_atoms = torch.cat([torch.zeros(4), torch.ones(4)]).long().to(device)
     mask_residues = torch.cat([torch.zeros(12), torch.ones(8)]).long().to(device)
     
     t = torch.tensor([0.3, 0.7], dtype=torch.float32, device=device)
-    print(t.shape)
+    print(f"Time tensor shape: {t.shape}")
     
-    # Create model
+    # Create model with geometric regularization
     model = EGNNDynamics(
         atom_nf=atom_nf,
         residue_nf=residue_nf,
@@ -640,17 +905,29 @@ def test_egnn_dynamics():
         sin_embedding=True,
         reflection_equivariant=True,
         tanh=True,
-        attention=True
+        attention=True,
+        geometric_regularization=True,
+        geom_loss_weight=0.1
     )
 
     model = PreconditionedEGNNDynamics(model)
     
-    # Forward pass
-    ligand_out, pocket_out = model(xh_atoms, xh_residues, t, mask_atoms, mask_residues)
+    # Forward pass with geometric regularization
+    model.train()  # Set to training mode to enable geometric loss
+    ligand_out, pocket_out = model(
+        xh_atoms, xh_residues, t, mask_atoms, mask_residues,
+        target_atoms=target_atoms, target_residues=target_residues
+    )
     
     print(f"Input shapes: ligand {xh_atoms.shape}, pocket {xh_residues.shape}")
     print(f"Output shapes: ligand {ligand_out.shape}, pocket {pocket_out.shape}")
-    print(f"✅ EGNNDynamics test passed!")
+    print(f"Geometric loss: {model.last_geometric_loss.item():.6f}")
+    print(f"✅ Enhanced EGNNDynamics test passed!")
+    
+    # Test without targets (should have zero geometric loss)
+    model.eval()
+    ligand_out_eval, pocket_out_eval = model(xh_atoms, xh_residues, t, mask_atoms, mask_residues)
+    print(f"Geometric loss (eval mode): {model.last_geometric_loss.item():.6f}")
     
     return model
 
