@@ -398,7 +398,8 @@ class MolecularDenoisingModel:
         # print('pocket_mask', pocket_mask.shape)
         
         pred_output_lig, pred_output_pocket = self.denoiser(
-            xh_lig_noisy, xh_pocket_noisy, sigma, lig_mask, pocket_mask
+            xh_lig_noisy, xh_pocket_noisy, sigma, lig_mask, pocket_mask,
+            target_atoms=lig_coords_centered, target_residues=pocket_coords_centered,
         )
         
         # Split predictions: coordinates + logits
@@ -432,12 +433,17 @@ class MolecularDenoisingModel:
         categorical_loss_lig = ce_loss_lig.mean()
         categorical_loss_pocket = ce_loss_pocket.mean()
         categorical_loss = categorical_loss_lig + categorical_loss_pocket
+        geometric_loss = self.denoiser.last_geometric_loss
         
         # Combine losses
         total_loss = (
             self.coord_loss_weight * coord_loss + 
             self.categorical_loss_weight * categorical_loss
         )
+
+         # Add geometric loss only if non-zero
+        if geometric_loss > 0:
+            total_loss += geometric_loss
         
         # Metrics
         metrics = {
@@ -448,12 +454,17 @@ class MolecularDenoisingModel:
             "coord_loss_pocket": coord_loss_pocket.item(),
             "categorical_loss_ligand": categorical_loss_lig.item(),
             "categorical_loss_pocket": categorical_loss_pocket.item(),
+            "geometric_loss_total": geometric_loss.item(),
             "avg_sigma": sigma.mean().item(),
             "max_sigma": sigma.max().item(),
             "coord_pred_scale": torch.cat([pred_coords_lig, pred_coords_pocket]).abs().mean().item(),
             "atom_accuracy": (torch.argmax(pred_logits_lig, dim=-1) == true_atom_types).float().mean().item(),
             "residue_accuracy": (torch.argmax(pred_logits_pocket, dim=-1) == true_residue_types).float().mean().item()
         }
+
+        # Add geometric loss to metrics only if non-zero
+        if geometric_loss > 0:
+            metrics["geometric_loss_total"] = geometric_loss.item()
         
         return total_loss, metrics
 
