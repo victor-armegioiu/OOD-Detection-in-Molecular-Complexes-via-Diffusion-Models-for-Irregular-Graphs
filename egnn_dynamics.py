@@ -324,113 +324,94 @@ class GeometricRegularizer(nn.Module):
     def __init__(self, device='cpu'):
         super().__init__()
         self.device = device
-        
-    def infer_bond_threshold(self, target_coords, method='adaptive_percentile'):
+
+    def infer_actual_bonds_threshold(self, target_coords):
         """
-        Infer reasonable bond threshold from target molecule's geometry
+        Infer bond threshold from target's likely bonding pattern
         """
         n_atoms = target_coords.shape[0]
         if n_atoms <= 1:
-            return torch.tensor(2.5, device=target_coords.device)
+            return torch.tensor(2.0, device=target_coords.device)
         
         dist_matrix = torch.cdist(target_coords, target_coords)
-        triu_indices = torch.triu_indices(n_atoms, n_atoms, offset=1, device=target_coords.device)
-        distances = torch.sort(dist_matrix[triu_indices[0], triu_indices[1]])[0]
         
-        if method == 'adaptive_percentile':
-            # Use adaptive percentile based on molecule size
-            # Smaller molecules: higher percentile (more connections)
-            # Larger molecules: lower percentile (fewer connections per atom)
-            percentile = max(5, min(20, 100 / n_atoms))
-            return torch.quantile(distances, percentile / 100.0) * 1.2
-            
-        elif method == 'nearest_neighbors':
-            # Each atom should connect to ~2-4 nearest neighbors
-            target_edges = min(n_atoms * 3, len(distances))
-            return distances[target_edges - 1] * 1.1
-            
-        else:
-            return torch.quantile(distances, 0.1) * 1.2
-
-    def count_connected_components(self, coords, bond_threshold):
-        """
-        Count connected components using differentiable graph operations
-        """
-        n_atoms = coords.shape[0]
-        if n_atoms <= 1:
-            return torch.tensor(1.0, device=coords.device)
+        # For each atom, find its 2-3 nearest neighbors (likely bonds)
+        # Most atoms have 2-4 bonds in organic molecules
+        k_nearest = min(4, n_atoms - 1)
         
-        # Build adjacency matrix
-        dist_matrix = torch.cdist(coords, coords)
-        adj = (dist_matrix < bond_threshold).float()
-        
-        # Remove self-loops
-        adj = adj - torch.eye(n_atoms, device=adj.device)
-        
-        # Eigenvalue approach (differentiable)
-        # Number of zero eigenvalues = number of connected components
-        try:
-            # Add small regularization for numerical stability
-            reg_adj = adj + 1e-6 * torch.eye(n_atoms, device=adj.device)
-            eigenvals = torch.linalg.eigvals(reg_adj).real
-            
-            # Count near-zero eigenvalues (connected components)
-            num_components = (eigenvals.abs() < 1e-3).float().sum()
-            return num_components
-            
-        except:
-            # Fallback: simple connectivity check
-            return self.count_components_simple(adj)
-
-    def count_components_simple(self, adj):
-        """Simple connectivity check using matrix powers"""
-        n_atoms = adj.shape[0]
-        
-        # Compute reachability matrix using matrix powers
-        reach = adj.clone()
-        for _ in range(n_atoms):
-            new_reach = torch.matmul(reach, adj)
-            new_reach = (reach + new_reach > 0).float()
-            if torch.allclose(new_reach, reach, atol=1e-6):
-                break
-            reach = new_reach
-        
-        # Count components by checking reachability from each node
-        visited = torch.zeros(n_atoms, device=adj.device)
-        num_components = 0
-        
+        nearest_distances = []
         for i in range(n_atoms):
-            if visited[i] == 0:
-                # Mark all nodes reachable from i
-                component = reach[i]
-                visited = torch.max(visited, component)
-                num_components += 1
-                
-        return torch.tensor(num_components, dtype=torch.float32, device=adj.device)
-
-    def connected_components_loss(self, coords, target_coords, mask):
+            distances_from_i = dist_matrix[i]
+            # Remove self-distance (0) and get k nearest
+            distances_from_i[i] = float('inf')
+            k_nearest_dists = torch.topk(distances_from_i, k_nearest, largest=False)[0]
+            nearest_distances.append(k_nearest_dists)
+        
+        # Use 90th percentile of nearest neighbor distances as threshold
+        # This captures most actual bonds while excluding longer non-bonds
+        all_near_distances = torch.cat(nearest_distances)
+        threshold = torch.quantile(all_near_distances, 0.9) * 1.1  # Small buffer
+        
+        return threshold
+        
+    def reachability_loss(self, coords, target_coords, mask, temperature=0.1):
         """
-        Compare predicted connectivity to target connectivity
-        Uses target-derived bond thresholds for each molecule
+        Compares reachability matrices of predicted vs target mols.
         """
         penalties = []
         
         for batch_idx in torch.unique(mask):
             pred_mol = coords[mask == batch_idx]
             target_mol = target_coords[mask == batch_idx]
+            n_atoms = pred_mol.shape[0]
             
-            # Get bond threshold from target molecule
-            bond_threshold = self.infer_bond_threshold(target_mol)
+            if n_atoms <= 1:
+                continue
+                
+            bond_threshold = self.infer_actual_bonds_threshold(target_mol)
             
-            # Count components using target-derived threshold
-            pred_components = self.count_connected_components(pred_mol, bond_threshold)
-            target_components = self.count_connected_components(target_mol, bond_threshold)
+            # Build soft adjacency matrices
+            pred_dist = torch.cdist(pred_mol, pred_mol)
+            target_dist = torch.cdist(target_mol, target_mol)
             
-            # Penalize fragmentation (more components than target)
-            fragmentation_penalty = F.relu(pred_components - target_components)
-            penalties.append(fragmentation_penalty)
+            pred_adj = torch.sigmoid(-(pred_dist - bond_threshold) / temperature)
+            target_adj = torch.sigmoid(-(target_dist - bond_threshold) / temperature)
+            
+            # Remove self-connections
+            eye = torch.eye(n_atoms, device=pred_adj.device)
+            pred_adj = pred_adj * (1 - eye)
+            target_adj = target_adj * (1 - eye)
+            
+            # Compute full reachability matrices
+            pred_reach = self.soft_reachability_matrix(pred_adj)
+            target_reach = self.soft_reachability_matrix(target_adj)
+            
+            # Compare entire matrices element-wise
+            matrix_loss = F.mse_loss(pred_reach, target_reach)
+            penalties.append(matrix_loss)
         
-        return torch.stack(penalties).mean() if penalties else torch.tensor(0.0, device=coords.device)
+        return torch.stack(penalties).mean() if penalties else torch.tensor(0.0)
+
+    def soft_reachability_matrix(self, adj_matrix):
+        """
+        Compute soft reachability matrix R where R[i,j] = reachability from i to j
+        """
+        n = adj_matrix.shape[0]
+        
+        # Start with direct connections
+        reachability = adj_matrix.clone()
+        
+        # Add paths of increasing length
+        adj_power = adj_matrix.clone()
+        for k in range(2, min(n + 1, 5)):  # Paths up to length 4
+            adj_power = torch.mm(adj_power, adj_matrix)
+            # Add with exponential decay (shorter paths matter more)
+            reachability += adj_power * (0.5 ** (k-1))
+        
+        # Normalize to [0,1] range for stable training
+        reachability = torch.tanh(reachability)
+        
+        return reachability
 
     def radius_of_gyration_loss(self, coords, target_coords, mask):
         """
@@ -459,41 +440,84 @@ class GeometricRegularizer(nn.Module):
         
         return torch.stack(penalties).mean() if penalties else torch.tensor(0.0, device=coords.device)
 
-    def cycle_detection_loss(self, coords, mask, bond_threshold=2.0):
+    def cycle_betti_loss(self, coords, mask, bond_threshold=2.0, temperature=0.15):
         """
-        Detect and reward cycle formation in molecular graphs
+        Differentiable cycle detection using Betti-1 numbers from algebraic topology.
+        
+        Rewards cycle formation by computing the soft Betti-1 number (number of 1D holes)
+        using the Euler characteristic: β₁ = E - V + C, where:
+        - E = number of edges (soft)
+        - V = number of vertices  
+        - C = number of connected components (soft)
+        
+        Args:
+            coords: [N, 3] atom coordinates
+            mask: [N] molecule indices for batching
+            bond_threshold: distance threshold for bonding (Angstroms)
+            temperature: softness parameter for sigmoid adjacency
+            
+        Returns:
+            Negative Betti-1 loss (rewards cycle formation)
         """
-        rewards = []
+        if coords.size(0) == 0:
+            return coords.new_zeros(())
+        
+        losses = []
         
         for batch_idx in torch.unique(mask):
+            # Extract molecule coordinates
             mol_coords = coords[mask == batch_idx]
-            n_atoms = mol_coords.shape[0]
+            n_atoms = mol_coords.size(0)
             
+            # Skip molecules too small to form cycles
             if n_atoms < 3:
                 continue
-                
-            # Build adjacency matrix based on distance threshold
-            dist_matrix = torch.cdist(mol_coords, mol_coords)
-            adj_matrix = (dist_matrix < bond_threshold).float()
-            adj_matrix = adj_matrix - torch.eye(n_atoms, device=adj_matrix.device)  # remove self-loops
             
-            # Count cycles by looking at powers of adjacency matrix
-            # This is a differentiable approximation
-            adj_squared = torch.matmul(adj_matrix, adj_matrix)
-            adj_cubed = torch.matmul(adj_squared, adj_matrix)
+            # Build soft adjacency matrix
+            distances = torch.cdist(mol_coords, mol_coords)
+            adjacency = torch.sigmoid(-(distances - bond_threshold) / temperature)
+            adjacency = adjacency * (1 - torch.eye(n_atoms, device=adjacency.device))
             
-            # 3-cycles (triangles)
-            triangles = torch.trace(adj_cubed) / 6.0
+            # Compute topological quantities
+            n_vertices = torch.tensor(n_atoms, dtype=torch.float32, device=coords.device)
+            n_edges_soft = adjacency.triu(diagonal=1).sum()  # Count upper triangular (unique edges)
+            n_components_soft = self.soft_connected_components(adjacency)
             
-            # 4-cycles and higher (approximation)
-            adj_fourth = torch.matmul(adj_cubed, adj_matrix)
-            four_cycles = torch.trace(adj_fourth) / 8.0
+            # Betti-1 number: β₁ = E - V + C (number of 1D holes/cycles)
+            betti_1 = (n_edges_soft - n_vertices + n_components_soft).clamp(min=0)
             
-            # Reward cycle formation (negative loss = reward)
-            cycle_reward = -(triangles + four_cycles)
-            rewards.append(cycle_reward)
+            # Negative loss = reward cycles
+            losses.append(-betti_1)
         
-        return torch.stack(rewards).mean() if rewards else torch.tensor(0.0, device=coords.device)
+        return torch.stack(losses).mean() if losses else coords.new_zeros(())
+
+    def soft_connected_components(self, adjacency):
+        """
+        Compute soft number of connected components using the soft reachability matrix.
+        
+        Args:
+            adjacency: [n, n] soft adjacency matrix
+            
+        Returns:
+            Soft component count (1.0 = fully connected, >1.0 = fragmented)
+        """
+        n = adjacency.size(0)
+        if n <= 1:
+            return torch.tensor(1.0, device=adjacency.device)
+        
+        # Use existing soft reachability matrix computation
+        reachability = self.soft_reachability_matrix(adjacency)
+        
+        # Measure connectivity: well-connected graphs have high reachability everywhere
+        # Remove diagonal since self-reachability is always 1
+        off_diagonal_reachability = reachability.sum() - torch.trace(reachability)
+        max_off_diagonal = n * (n - 1)  # Perfect connectivity (excluding diagonal)
+        
+        # Convert to component count: high reachability → ~1 component
+        connectivity_ratio = off_diagonal_reachability / max_off_diagonal
+        component_count = 1.0 + (1.0 - connectivity_ratio) * (n - 1)
+        
+        return component_count
 
     def pairwise_distance_loss(self, coords, mask, min_dist=0.8, max_dist=8.0):
         """
@@ -532,11 +556,11 @@ class GeometricRegularizer(nn.Module):
         Combine multiple geometric constraints
         """
         w_components, w_rg, w_cycles, w_distances = weights
-        
+
         total_loss = (
-            w_components * self.connected_components_loss(coords, target_coords, mask) +
+            w_components * self.reachability_loss(coords, target_coords, mask) +
             w_rg * self.radius_of_gyration_loss(coords, target_coords, mask) +
-            w_cycles * self.cycle_detection_loss(coords, mask) +
+            w_cycles * self.cycle_betti_loss(coords, mask) +
             w_distances * self.pairwise_distance_loss(coords, mask)
         )
         
