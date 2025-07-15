@@ -103,12 +103,12 @@ CONFIG = {
 
 # Hyperparameter search spaces
 HYPERPARAM_SPACES = {
-    'num_sampling_steps': [25, 50, 100, 200, 300],
+    'num_sampling_steps': [50, 100, 200, 300, 400],
     'joint_nf': [32, 64, 128, 256],
     'hidden_nf': [64, 128, 256],
     'n_layers': [2, 4, 6, 8],
-    'edge_embedding_dim': [4, 8, 16, 32],
-    'learning_rate': [1e-5, 5e-5, 1e-4, 5e-4, 1e-3],
+    'edge_embedding_dim': [8, 16, 32, 64],
+    'learning_rate': [5e-5, 1e-4, 5e-4, 1e-3, 5e-3],
     'batch_size': [16, 32, 64, 128]
 }
 
@@ -154,6 +154,9 @@ def parse_arguments():
     parser.add_argument('--wandb_entity', default='dagraber', help='Wandb entity name')
     parser.add_argument('--no_wandb', action='store_true', help='Disable wandb logging')
     
+    # Reproducibility options
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    
     return parser.parse_args()
 
 
@@ -196,6 +199,10 @@ def update_config_from_args(config: Dict, args) -> Dict:
     if args.no_wandb:
         config['wandb']['enabled'] = False
     
+    # Update seed
+    if args.seed is not None:
+        config['seed'] = args.seed
+    
     return config
 
 
@@ -227,6 +234,15 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
     """Create molecular model following the GenCFD setup"""
     
     print("Creating molecular diffusion model...")
+    
+    # Set random seeds for reproducibility
+    if 'seed' in config:
+        seed = config['seed']
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        np.random.seed(seed)
+        random.seed(seed)
     
     # Create noise schedule
     sigma_schedule = exponential_noise_schedule(
@@ -276,6 +292,15 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
     print(f"\n{'='*60}")
     print("TRAINING MOLECULAR DIFFUSION MODEL")
     print(f"{'='*60}")
+    
+    # Set random seeds for reproducibility
+    if 'seed' in config:
+        seed = config['seed']
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        np.random.seed(seed)
+        random.seed(seed)
     
     # Initialize wandb
     wandb.init(
@@ -682,6 +707,17 @@ def run_optimization_configs(configs: List[Dict], train_data: List[Dict], eval_d
             os.makedirs(config['run_dir'])
         config['checkpoint_path'] = f'{config["run_dir"]}/checkpoint.pt'
         
+        print(f"Configuration: {config}")
+
+        print("Main Hyperparameters:")
+        print(f"N-Layers: {config['n_layers']}")
+        print(f"Joint NF: {config['joint_nf']}")
+        print(f"Hidden NF: {config['hidden_nf']}")
+        print(f"Edge Embedding Dim: {config['edge_embedding_dim']}")
+        print(f"Learning Rate: {config['learning_rate']}")
+        print(f"Batch Size: {config['batch_size']}")
+        print(f"Num Sampling Steps: {config['num_sampling_steps']}")
+
         try:
             model = create_molecular_model(config)
             train_losses, eval_losses = train_model(model, train_data, eval_data, config)
@@ -876,6 +912,15 @@ def main():
             CONFIG['checkpoint_path'] = f'{CONFIG["run_dir"]}/checkpoint.pt'
 
             print(f"Configuration: {CONFIG}")
+
+            print("Main Hyperparameters:")
+            print(f"N-Layers: {CONFIG['n_layers']}")
+            print(f"Joint NF: {CONFIG['joint_nf']}")
+            print(f"Hidden NF: {CONFIG['hidden_nf']}")
+            print(f"Edge Embedding Dim: {CONFIG['edge_embedding_dim']}")
+            print(f"Learning Rate: {CONFIG['learning_rate']}")
+            print(f"Batch Size: {CONFIG['batch_size']}")
+            print(f"Num Sampling Steps: {CONFIG['num_sampling_steps']}")
             
             # 2. Create and initialize model
             print(f"\n{'='*60}")
