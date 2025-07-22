@@ -1,10 +1,10 @@
 __pycache__/
 wandb/
-*.pt
 *.out
 *.err
 *.sh
 *.db
+dataset*.pt
 
 optimization_runs/
 optimization_results/
