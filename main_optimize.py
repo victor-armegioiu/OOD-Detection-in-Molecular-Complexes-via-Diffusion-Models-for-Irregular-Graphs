@@ -21,6 +21,8 @@ from Dataset import PDBbind_Dataset
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
 from datetime import datetime
+import logging
+import sys
 
 # Import our molecular modules
 from molecular_diffusion import (
@@ -75,6 +77,8 @@ CONFIG = {
     'sigma_max': 100.0,      # Maximum noise level
     'sigma_min': 1e-4,      # Minimum noise level
     'update_pocket_coords': True,  # Joint modeling
+    'geometric_regularization': True,
+    'geom_loss_weight': 0.0,
     
     # Sampling parameters
     'num_sampling_steps': 16,
@@ -144,6 +148,8 @@ def parse_arguments():
     # Optimization parameters
     parser.add_argument('--max_combinations', type=int, default=100, help='Maximum number of combinations for grid search')
     parser.add_argument('--num_trials', type=int, default=20, help='Number of trials for random/bayesian search')
+    parser.add_argument('--study_name', default=None, help='Optuna study name (for resuming Bayesian optimization)')
+    parser.add_argument('--storage', default=None, help='Optuna storage URI (e.g. sqlite:///example-study.db)')
     
     # Output options
     parser.add_argument('--output_dir', default='optimization_results',help='Directory to save optimization results')
@@ -199,7 +205,7 @@ def update_config_from_args(config: Dict, args) -> Dict:
     if args.no_wandb:
         config['wandb']['enabled'] = False
     
-    # Update seed
+    # Add seed to config
     if args.seed is not None:
         config['seed'] = args.seed
     
@@ -276,6 +282,8 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         n_layers=config['n_layers'],
         edge_embedding_dim=config['edge_embedding_dim'],
         update_pocket_coords=config['update_pocket_coords'],
+        geometric_regularization=config['geometric_regularization'],
+        geom_loss_weight=config['geom_loss_weight'],
         scheme=scheme,
         noise_sampling=noise_sampling,
         noise_weighting=noise_weighting
@@ -323,9 +331,27 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
     if config['wandb']['log_gradients']:
         wandb.watch(model.denoiser, log='all', log_freq=config['log_interval'])
     
+    
+    # Early stopping state
+    early_stop_metrics = [
+        'percent_fragmented',
+        'mean_num_fragments',
+        # 'atoms_dist_js_divergence',
+        # 'aa_dist_js_divergence',
+        # 'ring_size_dist_js_divergence'
+    ]
+    best_metrics = {k: float('inf') for k in early_stop_metrics}
+    best_epoch = {k: -1 for k in early_stop_metrics}
+    patience_counter = 0
+    early_stopped = False
+    eval_history = []  # For debugging/logging
+
+    best_epoch_metrics = None
+    best_epoch_idx = -1
+
+
     # Training loop
     model.denoiser.train()
-    
     for epoch in range(config['num_epochs']):
         epoch_losses = []
         epoch_metrics = {
@@ -335,6 +361,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             'coord_loss_pocket': [],
             'categorical_loss_ligand': [],
             'categorical_loss_pocket': [],
+            'geometric_loss_total': [],
             'avg_sigma': []
         }
         
@@ -367,6 +394,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                       f"Cat: {metrics['categorical_loss']:.4f} "
                       f"(L:{metrics['categorical_loss_ligand']:.4f}, P:{metrics['categorical_loss_pocket']:.4f}), "
                       f"σ: {metrics['avg_sigma']:.3f}, "
+                      f"Geom: {metrics['geometric_loss_total']:.4f}"
                       )
                 
                 # Log batch metrics to wandb
@@ -378,13 +406,14 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                     'batch/coord_loss_pocket': metrics['coord_loss_pocket'],
                     'batch/categorical_loss_ligand': metrics['categorical_loss_ligand'],
                     'batch/categorical_loss_pocket': metrics['categorical_loss_pocket'],
+                    'batch/geometric_loss_total': metrics['geometric_loss_total'],
                     'batch/avg_sigma': metrics['avg_sigma'],
                     'batch/learning_rate': optimizer.param_groups[0]['lr'],
                     'epoch': epoch + 1,
                     'batch': batch_idx + 1
                 })
         
-#        scheduler.step()
+        # scheduler.step()
         
         # Calculate epoch metrics
         avg_epoch_loss = np.mean(epoch_losses)
@@ -401,6 +430,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             'epoch/coord_loss_pocket': avg_epoch_metrics['coord_loss_pocket'],
             'epoch/categorical_loss_ligand': avg_epoch_metrics['categorical_loss_ligand'],
             'epoch/categorical_loss_pocket': avg_epoch_metrics['categorical_loss_pocket'],
+            'epoch/geometric_loss_total': avg_epoch_metrics['geometric_loss_total'],
             'epoch/avg_sigma': avg_epoch_metrics['avg_sigma'],
             'epoch/learning_rate': optimizer.param_groups[0]['lr'],
             'epoch': epoch + 1
@@ -453,11 +483,36 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             for key, value in eval_losses.items(): print(f'{key}: {value}')
             
             # Log evaluation metrics
-            wandb.log({
-                f'eval/{key}': value 
-                for key, value in eval_losses.items()
-            })
-            
+            eval_log = {f'eval/{key}': value for key, value in eval_losses.items()}
+            eval_log['eval_epoch'] = epoch + 1
+            wandb.log(eval_log)
+
+            # Early stopping logic
+            improved = False
+            for k in early_stop_metrics:
+                v = eval_losses.get(k, float('inf'))
+                if v < best_metrics[k]:
+                    best_metrics[k] = v
+                    best_epoch[k] = epoch
+                    improved = True
+            eval_history.append({k: eval_losses.get(k, float('inf')) for k in early_stop_metrics})
+            if improved:
+                patience_counter = 0
+                # Save all metrics for this best epoch (eval_losses and epoch_metrics)
+                best_epoch_metrics = {**eval_losses, **epoch_metrics}
+                best_epoch_idx = epoch
+                print("[Early Stopping] Early Stopping Patience Reset. Model improved on metrics:")
+                for k in early_stop_metrics:
+                    print(f"    {k}: {best_metrics[k]}")
+            else:
+                patience_counter += 1
+                print(f"[Early Stopping] Patience Counter: {patience_counter}")
+
+            if patience_counter >= 2:
+                print(f"\n[EARLY STOPPING] No improvement in {early_stop_metrics} for two evaluation intervals ({config['eval_interval']} epochs). Stopping at epoch {epoch+1}.")
+                early_stopped = True
+                break
+        
         print(f"Epoch {epoch+1:3d} - Average Loss: {avg_epoch_loss:.4f}", flush=True)
     
     # Save model to wandb if configured
@@ -472,9 +527,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
     
     # Close wandb run
     wandb.finish()
-
-    # Return the metrics of the last epoch and the losses of the last evaluation    
-    return epoch_metrics, eval_losses
+    return best_epoch_metrics, early_stopped
 
 
 def evaluate_model(model: MolecularDenoisingModel, eval_data: List[Dict]) -> Dict:
@@ -620,79 +673,6 @@ def generate_random_search_configs(param_spaces: Dict, num_trials: int) -> List[
     return configs
 
 
-def objective_function(trial, param_spaces: Dict, train_data: List[Dict], 
-                      eval_data: List[Dict], base_config: Dict, csv_path: str = None, 
-                      optimization_id: str = None, trial_number: int = None) -> float:
-    """Objective function for Bayesian optimization"""
-    
-    # Suggest hyperparameters
-    config = base_config.copy()
-    for param_name, param_values in param_spaces.items():
-        if isinstance(param_values[0], int):
-            config[param_name] = trial.suggest_categorical(param_name, param_values)
-        elif isinstance(param_values[0], float):
-            config[param_name] = trial.suggest_categorical(param_name, param_values)
-    
-    try:
-        # Create and train model
-        model = create_molecular_model(config)
-        _ = train_model(model, train_data, eval_data, config)
-        
-        # Evaluate final performance
-        eval_losses = evaluate_model(model, eval_data)
-        final_loss = eval_losses.get('total_loss_lvl0', float('inf')) + \
-                     eval_losses.get('total_loss_lvl1', float('inf')) + \
-                     eval_losses.get('total_loss_lvl2', float('inf')) + \
-                     eval_losses.get('total_loss_lvl3', float('inf')) + \
-                     eval_losses.get('total_loss_lvl4', float('inf'))
-        
-        # Save result to CSV if path is provided
-        if csv_path is not None and optimization_id is not None and trial_number is not None:
-            run_id = f"{optimization_id}_trial_{trial_number}"
-            save_result_to_csv(csv_path, config, final_loss, run_id, 'completed')
-        
-        # Return validation loss as objective (minimize)
-        return final_loss
-        
-    except Exception as e:
-        print(f"Trial failed: {e}")
-        
-        # Save failed result to CSV if path is provided
-        if csv_path is not None and optimization_id is not None and trial_number is not None:
-            run_id = f"{optimization_id}_trial_{trial_number}"
-            save_result_to_csv(csv_path, config, float('inf'), run_id, 'failed')
-        
-        return float('inf')
-
-
-def run_bayesian_optimization(param_spaces: Dict, train_data: List[Dict], 
-                            eval_data: List[Dict], n_trials: int = 50, 
-                            csv_path: str = None, optimization_id: str = None) -> Tuple[Dict, float]:
-    """Run Bayesian optimization using Optuna"""
-    
-    if not OPTUNA_AVAILABLE:
-        raise ImportError("Optuna is required for Bayesian optimization")
-    
-    # Track trial number for CSV saving
-    trial_counter = 0
-    
-    def objective(trial):
-        nonlocal trial_counter
-        trial_counter += 1
-        return objective_function(trial, param_spaces, train_data, eval_data, CONFIG, 
-                                csv_path, optimization_id, trial_counter)
-    
-    study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=n_trials)
-    
-    best_config = CONFIG.copy()
-    for param_name in param_spaces.keys():
-        best_config[param_name] = study.best_params[param_name]
-    
-    return best_config, study.best_value
-
-
-
 def run_optimization_configs(configs: List[Dict], train_data: List[Dict], eval_data: List[Dict], 
                              csv_path: str, json_path: str, optimization_id: str, optimization_metrics: List[str]):
 
@@ -707,8 +687,6 @@ def run_optimization_configs(configs: List[Dict], train_data: List[Dict], eval_d
             os.makedirs(config['run_dir'])
         config['checkpoint_path'] = f'{config["run_dir"]}/checkpoint.pt'
         
-        print(f"Configuration: {config}")
-
         print("Main Hyperparameters:")
         print(f"N-Layers: {config['n_layers']}")
         print(f"Joint NF: {config['joint_nf']}")
@@ -720,29 +698,129 @@ def run_optimization_configs(configs: List[Dict], train_data: List[Dict], eval_d
 
         try:
             model = create_molecular_model(config)
-            train_losses, eval_losses = train_model(model, train_data, eval_data, config)
+            best_metrics, early_stopped = train_model(model, train_data, eval_data, config)
         
         except Exception as e:
             print(f"Configuration failed: {e}")
             for key in optimization_metrics:
                 config.update({key: float('inf')})
-            save_result_to_csv(csv_path, config, run_id, 'failed')
-            save_result_to_json(json_path, config, run_id, 'failed')
+            if csv_path: save_result_to_csv(csv_path, config, run_id, 'failed')
+            if json_path: save_result_to_json(json_path, config, run_id, 'failed')
             continue
 
 
         # Save result of this configuration to CSV and JSON   
         for key in optimization_metrics:
-            if key in train_losses:
-                config.update({key: train_losses.get(key, float('inf'))})
-            else:
-                config.update({key: eval_losses.get(key, float('inf'))})
-        save_result_to_csv(csv_path, config, run_id, 'completed')
-        save_result_to_json(json_path, config, run_id, 'completed')
+            config.update({key: best_metrics.get(key, float('inf'))})
+        status = 'completed' if not early_stopped else 'early_stopped'
+        if csv_path: save_result_to_csv(csv_path, config, run_id, status)
+        if json_path: save_result_to_json(json_path, config, run_id, status)
 
         print(f"Configuration {i+1}/{len(configs)} completed")
-            
 
+
+def objective_function(trial, param_spaces: Dict, train_data: List[Dict], eval_data: List[Dict],
+                       base_config: Dict, csv_path: str = None, json_path: str = None, 
+                       optimization_id: str = None, optimization_metrics: List[str] = None, 
+                       trial_number: int = None) -> float:
+    
+    config = base_config.copy()
+    
+    # Create name for the individual training run
+    run_id = f"{optimization_id}_trial_{trial_number}"
+    config['wandb']['name'] = run_id
+    config['run_dir'] = f'{config["run_dir"]}/{run_id}'
+    if not os.path.exists(config['run_dir']):
+        os.makedirs(config['run_dir'])
+    config['checkpoint_path'] = f'{config["run_dir"]}/checkpoint.pt'
+
+    print(f"\n\n\n[Optuna] Starting trial {trial_number} (run_id: {run_id})")
+    print("[Optuna] Suggesting hyperparameters:")
+    
+    # HYPERPARAMETER SUGGESTIONS
+    for param_name, param_values in param_spaces.items():
+        if isinstance(param_values[0], int):
+            config[param_name] = trial.suggest_categorical(param_name, param_values)
+        elif isinstance(param_values[0], float):
+            config[param_name] = trial.suggest_categorical(param_name, param_values)
+        print(f"    {param_name}: {config[param_name]}")
+    
+    try:
+        # Create and train model
+        model = create_molecular_model(config)
+        best_metrics, early_stopped = train_model(model, train_data, eval_data, config)
+        
+        final_loss = (best_metrics.get('atoms_dist_js_divergence', float('inf')) +
+                      best_metrics.get('aa_dist_js_divergence', float('inf')) +
+                      best_metrics.get('percent_fragmented', float('inf')) + 
+                      best_metrics.get('ring_size_dist_js_divergence', float('inf')))
+        
+    except Exception as e:
+        print(f"[Optuna] Trial {trial_number} failed with error: {e}")
+        for key in optimization_metrics:
+                config.update({key: float('inf')})
+        if csv_path: save_result_to_csv(csv_path, config, run_id, 'failed')
+        if json_path: save_result_to_json(json_path, config, run_id, 'failed')
+        return float('inf')
+
+    # Save result of this configuration to CSV and JSON
+    for key in optimization_metrics:
+        config.update({key: best_metrics.get(key, float('inf'))})
+    status = 'completed' if not early_stopped else 'early_stopped'
+    if csv_path: save_result_to_csv(csv_path, config, run_id, status)
+    if json_path: save_result_to_json(json_path, config, run_id, status)
+
+    print(f"[Optuna] Trial {trial_number} completed. Final loss: {final_loss}")
+    return final_loss
+
+
+def run_bayesian_optimization(param_spaces: Dict, train_data: List[Dict], 
+                            eval_data: List[Dict], num_trials: int = 50, 
+                            csv_path: str = None, json_path: str = None, 
+                            optimization_id: str = None, optimization_metrics: List[str] = None,
+                            study_name: str = None, storage: str = None) -> Tuple[Dict, float]:
+    
+    """Run Bayesian optimization using Optuna with persistent storage"""
+    
+    if not OPTUNA_AVAILABLE: raise ImportError("Optuna is required for Bayesian optimization")
+
+    optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))
+
+    print(f"\n[Optuna] Starting Bayesian optimization with {num_trials} trials...")
+    trial_counter = 0
+    
+    def objective(trial):
+        nonlocal trial_counter
+        trial_counter += 1
+        return objective_function(trial, param_spaces, train_data, eval_data, CONFIG, 
+                                 csv_path, json_path, optimization_id, optimization_metrics, trial_counter)
+
+    # Set up persistent storage if requested
+    if study_name is None:
+        study_name = optimization_id or f"optuna_study_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if storage is None:
+        storage = f"sqlite:///{study_name}.db"
+    print(f"[Optuna] Using study_name: {study_name}")
+    print(f"[Optuna] Using storage: {storage}")
+
+    try:
+        study = optuna.load_study(study_name=study_name, storage=storage)
+        print(f"[Optuna] Loaded existing study '{study_name}' from storage.")
+    except Exception:
+        study = optuna.create_study(direction='minimize', study_name=study_name, storage=storage)
+        print(f"[Optuna] Created new study '{study_name}' with storage.")
+
+    study.optimize(objective, n_trials=num_trials)
+    print(f"[Optuna] Optimization completed. Best trial:")
+    print(f"    Value: {study.best_value}")
+    print(f"    Params: {study.best_params}")
+    
+    best_config = CONFIG.copy()
+    for param_name in param_spaces.keys():
+        best_config[param_name] = study.best_params[param_name]
+    
+    return best_config, study.best_value
+            
 
 
 
@@ -750,7 +828,7 @@ def run_hyperparameter_optimization(optimization_type: str, param_spaces: Dict,
                                   train_data: List[Dict], eval_data: List[Dict], 
                                   **kwargs) -> List[Tuple[Dict, float]]:
     
-    print(f"\n{'='*60}\n" + f"HYPERPARAMETER OPTIMIZATION: {optimization_type.upper()}" + f"{'='*60}\n")
+    print(f"\n{'='*20}" + f"HYPERPARAMETER OPTIMIZATION: {optimization_type.upper()}" + f"{'='*20}\n")
 
     optimization_metrics = [
         # Training losses
@@ -829,18 +907,29 @@ def run_hyperparameter_optimization(optimization_type: str, param_spaces: Dict,
         print(f"Running random search with {len(configs)} trials...")
         run_optimization_configs(configs, train_data, eval_data, csv_path, json_path, optimization_id, optimization_metrics)
     
-    # elif optimization_type == 'bayesian':
-    #     n_trials = kwargs.get('n_trials', 20)
-    #     print(f"Running Bayesian optimization with {n_trials} trials...")
+    elif optimization_type == 'bayesian':
+        num_trials = kwargs.get('num_trials', 20)
+        study_name = kwargs.get('study_name', None)
+        storage = kwargs.get('storage', None)
+        print(f"Running Bayesian optimization with {num_trials} trials...")
         
-    #     best_config, best_loss = run_bayesian_optimization(
-    #         param_spaces, train_data, eval_data, n_trials, csv_path, optimization_id
-    #     )
-    #     results.append((best_config, best_loss))
-        
-    #     run_id = f"{optimization_id}_best"
-    #     save_result_to_csv(csv_path, best_config, best_loss, run_id, 'completed')
-    #     print(f"Best validation loss: {best_loss:.4f}")
+        best_config, best_loss = run_bayesian_optimization(
+            param_spaces, 
+            train_data, 
+            eval_data, 
+            num_trials, 
+            csv_path, 
+            json_path, 
+            optimization_id, 
+            optimization_metrics,
+            study_name=study_name,
+            storage=storage)
+
+        results.append((best_config, best_loss)) 
+
+        # Save best config to JSON at the run directory
+        with open(os.path.join(CONFIG['run_dir'], 'best_config.json'), 'w') as f:
+            json.dump(best_config, f, indent=2)
     
     else: raise ValueError(f"Unknown optimization type: {optimization_type}")
     
@@ -930,7 +1019,7 @@ def main():
             model = create_molecular_model(CONFIG)
             
             # 3. Train the model
-            train_model(model, train_data, eval_data, CONFIG)
+            best_metrics, early_stopped = train_model(model, train_data, eval_data, CONFIG)
             
             # 4. Save checkpoint
             save_checkpoint(model, CONFIG, save_path=CONFIG['checkpoint_path'].replace(".pt", "_final.pt"))
@@ -970,7 +1059,6 @@ def main():
 
             print(f"\n{'='*60}")
             print("HYPERPARAMETER OPTIMIZATION")
-            print(f"\n{'='*60}")
             
             # Define parameter spaces for optimization
             param_spaces = {}
@@ -990,7 +1078,8 @@ def main():
             optimization_kwargs = {
                 'max_combinations': args.max_combinations,
                 'num_trials': args.num_trials,
-                'n_trials': args.num_trials
+                'study_name': args.study_name,
+                'storage': args.storage,
             }
             results = run_hyperparameter_optimization(args.mode, param_spaces, train_data, eval_data, 
                                                     **optimization_kwargs)
@@ -1008,37 +1097,6 @@ def main():
 # Functions for saving optimization results
 # ------------------------------------------------------------------------------------------------
 
-def save_result_to_json(output_path: str, config: Dict, run_id: str, status: str = 'completed'):
-    """Save optimization results to JSON file"""
-    
-    # Convert results to serializable format
-
-    serializable_config = {}
-    for key, value in config.items():
-        if isinstance(value, (int, float, str, bool)):
-            serializable_config[key] = value
-        elif isinstance(value, tuple):
-            serializable_config[key] = list(value)
-        elif isinstance(value, dict):
-            serializable_config[key] = value
-
-        serializable_config['status'] = status
-
-    
-    if os.path.exists(output_path):
-        with open(output_path, 'r') as f:
-            existing_results = json.load(f)
-        existing_results.update({run_id: serializable_config})
-        with open(output_path, 'w') as f:
-            json.dump(existing_results, f, indent=2)
-    else:
-        with open(output_path, 'w') as f:
-            json.dump({run_id: serializable_config}, f, indent=2)
-    
-    print(f"Configuration results saved to {output_path}")
-
-
-
 def initialize_csv_results(csv_path: str, config_template: Dict, add_columns_start: List[str] = [], add_columns_end: List[str] = []):
     """Initialize CSV file with headers for all CONFIG parameters"""
     
@@ -1054,7 +1112,6 @@ def initialize_csv_results(csv_path: str, config_template: Dict, add_columns_sta
         writer.writerow(columns)
     
     print(f"CSV results file initialized: {csv_path}")
-
 
 
 
@@ -1081,34 +1138,35 @@ def save_result_to_csv(csv_path: str, config: Dict, run_id: str, status: str = '
     print(f"Result saved to CSV: {run_id} - Status: {status}")
 
 
+def save_result_to_json(output_path: str, config: Dict, run_id: str, status: str = 'completed'):
+    """Save optimization results to JSON file"""
+    
+    # Convert results to serializable format
+    serializable_config = {}
+    for key, value in config.items():
+        if isinstance(value, (int, float, str, bool)):
+            serializable_config[key] = value
+        elif isinstance(value, tuple):
+            serializable_config[key] = list(value)
+        elif isinstance(value, dict):
+            serializable_config[key] = value
+
+        serializable_config['status'] = status
+
+    
+    if os.path.exists(output_path):
+        with open(output_path, 'r') as f:
+            existing_results = json.load(f)
+        existing_results.update({run_id: serializable_config})
+        with open(output_path, 'w') as f:
+            json.dump(existing_results, f, indent=2)
+    else:
+        with open(output_path, 'w') as f:
+            json.dump({run_id: serializable_config}, f, indent=2)
+    
+    print(f"Configuration results saved to {output_path}")
+
+
+
 if __name__ == "__main__":
     main()
-
-
-# Train best model with full configuration
-# if results:
-#     best_config, best_loss = results[0]
-#     print(f"\n{'='*60}")
-#     print("TRAINING BEST MODEL")
-#     print(f"{'='*60}")
-    
-#     # Create run directory for best model
-#     run_id = best_config['wandb']['name'].split('_')[:-1] + '_best'
-#     best_config['wandb']['name'] = run_id
-#     best_config['run_dir'] = f'optimization_runs/{run_id}'
-#     if not os.path.exists(best_config['run_dir']):
-#         os.makedirs(best_config['run_dir'])
-#     best_config['checkpoint_path'] = f'{best_config["run_dir"]}/checkpoint.pt'
-    
-#     print(f"Best configuration: {best_config}")
-#     print(f"Expected validation loss: {best_loss:.4f}")
-    
-#     # Train best model
-#     model = create_molecular_model(best_config)
-#     best_config['num_epochs'] = 1000
-#     train_model(model, train_data, eval_data, best_config)
-#     save_checkpoint(model, best_config, save_path=best_config['checkpoint_path'].replace(".pt", "_best.pt"))
-    
-#     print(f"\n🎉 OPTIMIZATION COMPLETED SUCCESSFULLY!")
-#     print(f"Best model checkpoint: {best_config['checkpoint_path']}")
-#     print(f"Best validation loss: {best_loss:.4f}")

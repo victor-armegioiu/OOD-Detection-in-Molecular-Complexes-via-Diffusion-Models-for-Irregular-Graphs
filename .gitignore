@@ -4,6 +4,7 @@ wandb/
 *.out
 *.err
 *.sh
+*.db
 
 optimization_runs/
 optimization_results/
