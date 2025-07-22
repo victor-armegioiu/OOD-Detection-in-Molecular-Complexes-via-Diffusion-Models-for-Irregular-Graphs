@@ -41,7 +41,7 @@ class MolecularLikelihoodEvaluator:
         num_hutchinson_samples: int = 1,
         n_dims: int = 3,
         atom_nf: int = 10,
-        residue_nf: int = 20,
+        residue_nf: int = 21,
         joint_nf: int = 16,
     ):
         self.scheme = scheme
@@ -516,5 +516,131 @@ def test_molecular_likelihood_evaluator():
         traceback.print_exc()
 
 
-if __name__ == '__main__':
-    test_molecular_likelihood_evaluator()
+
+import argparse
+from typing import List
+from Dataset import PDBbind_Dataset
+from torch_geometric.loader import DataLoader
+from torch_geometric.data import Data
+from metrics import load_checkpoint
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate molecular likelihoods for a dataset.")
+    parser.add_argument("--dataset_path", type=str, required=True, help="Path to the dataset .pt file")
+    parser.add_argument("--checkpoint_path", type=str, required=True, help="Path to the model checkpoint")
+    parser.add_argument("--num_steps", type=int, default=50, help="Number of integration steps")
+    parser.add_argument("--num_hutchinson_samples", type=int, default=150, help="Hutchinson samples for divergence")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for evaluation")
+    args = parser.parse_args()
+
+    config = {
+        'batch_size': args.batch_size, 
+        'device': 'cuda'
+    }
+
+    print(f"Loading dataset from {args.dataset_path}")
+    print(f"Loading model from {args.checkpoint_path}")
+    print(f"Number of integration steps: {args.num_steps}")
+    print(f"Number of Hutchinson samples: {args.num_hutchinson_samples}")
+    print(f"Batch size: {config['batch_size']}")
+    print(f"Device: {config['device']}")
+    print()
+
+    dataset = torch.load(args.dataset_path)
+    dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, follow_batch=['lig_coords', 'prot_coords'])
+
+    # 2. Load model from checkpoint
+    model = load_checkpoint(args.checkpoint_path)
+
+    # 3. Create likelihood evaluator
+    evaluator = create_molecular_likelihood_evaluator_from_model(
+        model,
+        num_steps=args.num_steps,
+        num_hutchinson_samples=args.num_hutchinson_samples,
+    )
+
+    likelihoods = []
+    for batch in dataloader:
+
+        batch = batch.to(config['device'])
+        print(batch)
+        
+        
+        lig_features = batch.lig_features
+        pocket_features = batch.prot_features
+        print(f"lig_features.shape: {lig_features.shape}")
+        print(f"pocket_features.shape: {pocket_features.shape}")
+
+        # Convert one-hot features to embeddings
+        ligand_embeddings = model.denoiser.atom_encoder(lig_features)  # [N_lig, joint_nf]
+        pocket_embeddings = model.denoiser.residue_encoder(pocket_features)  # [N_pocket, joint_nf]
+        
+        print(f"ligand_embeddings.shape: {ligand_embeddings.shape}")
+        print(f"pocket_embeddings.shape: {pocket_embeddings.shape}")        
+
+        lig_coords = batch.lig_coords
+        pocket_coords = batch.prot_coords
+        ligand_mask = batch.lig_coords_batch
+        pocket_mask = batch.prot_coords_batch
+
+        print(f"lig_coords.shape: {lig_coords.shape}")
+        print(f"pocket_coords.shape: {pocket_coords.shape}")
+        print(f"ligand_mask.shape: {ligand_mask.shape}")
+        print(f"pocket_mask.shape: {pocket_mask.shape}")
+
+        # Concatenate coords and embeddings
+        ligand_data = torch.cat([lig_coords, ligand_embeddings], dim=1)
+        pocket_data = torch.cat([pocket_coords, pocket_embeddings], dim=1)
+
+        # Center-of-mass correction for this molecule
+        combined_coords = torch.cat([lig_coords, pocket_coords], dim=0)
+        combined_mask = torch.cat([ligand_mask, pocket_mask])
+        combined_coords_centered = remove_mean_batch(combined_coords, combined_mask)
+        ligand_data[:, :3] = combined_coords_centered[:lig_coords.shape[0]]
+        pocket_data[:, :3] = combined_coords_centered[lig_coords.shape[0]:]
+
+        print()
+        print(f"ligand_data.shape: {ligand_data.shape}")
+        print(f"pocket_data.shape: {pocket_data.shape}")
+        print(f"ligand_mask.shape: {ligand_mask.shape}")
+        print(f"pocket_mask.shape: {pocket_mask.shape}")
+        print()
+
+        # Separate the batch into individual graphs
+        print(torch.bincount(ligand_mask).tolist())
+        print(torch.bincount(pocket_mask).tolist())
+
+        ligand_data = torch.split(ligand_data, torch.bincount(ligand_mask).tolist())
+        pocket_data = torch.split(pocket_data, torch.bincount(pocket_mask).tolist())
+
+        for i in range(len(ligand_data)):
+            print(f"Ligand data shape: {ligand_data[i].shape}")
+            print(f"Pocket data shape: {pocket_data[i].shape}")
+
+            ligand_mask = torch.ones(ligand_data[i].shape[0], dtype=torch.long, device=config['device'])
+            pocket_mask = torch.ones(pocket_data[i].shape[0], dtype=torch.long, device=config['device'])
+
+            # Create molecular state
+            state = MolecularState(
+                ligand=ligand_data[i],
+                pocket=pocket_data[i],
+                ligand_mask=ligand_mask,
+                pocket_mask=pocket_mask,
+                batch_size=1
+            )
+
+            # Evaluate likelihood for this molecule
+            log_likelihood = evaluator.evaluate_likelihood(state)
+            print(f"Complex {batch.id[i]} Log-likelihood: {log_likelihood.item()}", flush=True)
+            likelihoods.append(log_likelihood.item())
+
+            print()
+            print()
+
+    # Print or return results
+    print("Log-likelihoods for dataset:", likelihoods)
+    print("Mean log-likelihood:", np.mean(likelihoods))
+
+if __name__ == "__main__":
+    main()
+    # test_molecular_likelihood_evaluator()
