@@ -275,6 +275,8 @@ class MolecularDenoisingModel:
     scheme: MolecularDiffusion = None
     noise_sampling: NoiseLevelSampling = None
     noise_weighting: NoiseLossWeighting = None
+    geometric_regularization: bool = True
+    geom_loss_weight: float = 0.1
     
     def __post_init__(self):
         """Initialize the denoiser and diffusion components"""
@@ -312,7 +314,9 @@ class MolecularDenoisingModel:
             n_layers=self.n_layers,
             condition_time=True,
             update_pocket_coords=self.update_pocket_coords,
-            edge_embedding_dim=self.edge_embedding_dim
+            edge_embedding_dim=self.edge_embedding_dim,
+            geometric_regularization=self.geometric_regularization,
+            geom_loss_weight=self.geom_loss_weight
         )
 
         denoiser = PreconditionedEGNNDynamics(denoiser)
@@ -438,12 +442,9 @@ class MolecularDenoisingModel:
         # Combine losses
         total_loss = (
             self.coord_loss_weight * coord_loss + 
-            self.categorical_loss_weight * categorical_loss
+            self.categorical_loss_weight * categorical_loss +
+            geometric_loss
         )
-
-         # Add geometric loss only if non-zero
-        if geometric_loss > 0:
-            total_loss += geometric_loss
         
         # Metrics
         metrics = {
@@ -461,11 +462,6 @@ class MolecularDenoisingModel:
             "atom_accuracy": (torch.argmax(pred_logits_lig, dim=-1) == true_atom_types).float().mean().item(),
             "residue_accuracy": (torch.argmax(pred_logits_pocket, dim=-1) == true_residue_types).float().mean().item()
         }
-
-        # Add geometric loss to metrics only if non-zero
-        if geometric_loss > 0:
-            metrics["geometric_loss_total"] = geometric_loss.item()
-        
         return total_loss, metrics
 
     def eval_fn(self, batch: dict) -> dict:
