@@ -53,7 +53,7 @@ except ImportError:
 
 # Configuration following framework patterns
 CONFIG = {
-    'train_dataset_path': 'dataset_pdbbind.pt',
+    'train_dataset_path': 'dataset_cleansplit.pt',
     'eval_dataset_path': 'dataset_casf2016.pt',
 
     # Model parameters
@@ -508,7 +508,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                 patience_counter += 1
                 print(f"[Early Stopping] Patience Counter: {patience_counter}")
 
-            if patience_counter >= 2:
+            if patience_counter >= 10:
                 print(f"\n[EARLY STOPPING] No improvement in {early_stop_metrics} for two evaluation intervals ({config['eval_interval']} epochs). Stopping at epoch {epoch+1}.")
                 early_stopped = True
                 break
