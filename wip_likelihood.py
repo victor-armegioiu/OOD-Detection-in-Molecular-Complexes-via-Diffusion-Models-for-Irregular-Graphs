@@ -1,19 +1,19 @@
 """
-Molecular Likelihood Evaluator for OOD Detection
+Modified Molecular Likelihood Evaluator for Per-Sample Evaluation
 
-Compares likelihood evaluation between two datasets using a single checkpoint.
-(work in progress)
+Key changes to produce likelihood for each complex in the batch:
+1. Loop over each sample in the batch
+2. Extract individual molecular states
+3. Compute likelihood for each sample separately
+4. Return tensor of shape (batch_size,)
 """
 
 import torch
 import numpy as np
-from typing import Tuple, Optional, Callable, Mapping, Any, NamedTuple, Protocol, Dict, List, Union
+from typing import Tuple, Optional, Callable, Mapping, Any, NamedTuple, Protocol, Dict
 from torch.autograd import grad
 from torch_scatter import scatter_mean
 import torch.nn.functional as F
-import os
-from torch_geometric.loader import DataLoader
-from torch_geometric.data import Data
 
 # Import from the existing molecular sampler module
 from molecular_samplers import (
@@ -21,11 +21,6 @@ from molecular_samplers import (
     MolecularSdeDynamics, MolecularEulerMaruyamaStep, remove_mean_batch,
     create_molecular_denoiser_wrapper, edm_noise_decay, dlog_dt, dsquare_dt
 )
-from metrics import load_checkpoint
-
-
-from Dataset import PDBbind_Dataset
-
 
 Tensor = torch.Tensor
 TensorMapping = Mapping[str, Tensor]
@@ -103,7 +98,8 @@ class MolecularLikelihoodEvaluator:
             drift_lig  = coeff * (state.ligand - x0_hat.ligand)
             drift_pock = coeff * (state.pocket - x0_hat.pocket)
         
-            # Project COM for consistency
+            # (Optional but IMPORTANT for consistency) Project COM here so the
+            # divergence you estimate matches the vector field we integrate.
             drift_coords = torch.cat([drift_lig[:, :self.n_dims], drift_pock[:, :self.n_dims]], 0)
             masks = torch.cat([state.ligand_mask, state.pocket_mask])
             drift_coords_centered = remove_mean_batch(drift_coords, masks)
@@ -250,8 +246,7 @@ class MolecularLikelihoodEvaluator:
             # Estimate divergence at current point
             div_estimate = self._estimate_divergence_single(current_state, t_curr, params, dynamics)
             total_divergence = total_divergence + div_estimate * dt
-
-            # print('Here:', dt, div_estimate)
+            
             # Use Heun's method for better accuracy
             current_state = self._heun_step(current_state, t_curr, t_next, dynamics, params)
         
@@ -290,7 +285,8 @@ class MolecularLikelihoodEvaluator:
         new_ligand = state.ligand + 0.5 * (k1.ligand + k2.ligand) * dt
         new_pocket = state.pocket + 0.5 * (k1.pocket + k2.pocket) * dt
         
-        # Apply COM constraint
+        # Apply COM constraint (this is redundant since I did it befor)
+        # But I prefer doing it again so that small errors don't accumulate.
         combined_coords = torch.cat([
             new_ligand[:, :self.n_dims],
             new_pocket[:, :self.n_dims]
@@ -384,6 +380,7 @@ class MolecularLikelihoodEvaluator:
             # Extract conditioning for this sample if provided
             sample_cond = None
             if cond is not None:
+                # Assume conditioning has same batch structure - you may need to adapt this
                 sample_cond = {}
                 for key, value in cond.items():
                     if isinstance(value, torch.Tensor) and value.shape[0] == batch_size:
@@ -406,22 +403,6 @@ class MolecularLikelihoodEvaluator:
         return log_likelihoods
 
 
-def load_dataset_safely(dataset_path):
-    """Load dataset with fallback methods if class import fails"""
-    try:
-        # Method 1: Try normal loading (works if class is imported)
-        return torch.load(dataset_path, weights_only=False)
-    except AttributeError as e:
-        if "PDBbind_Dataset" in str(e):
-            print(f"Warning: Could not load dataset class. Trying alternative method...")
-            # Method 2: Load with pickle module directly
-            import pickle
-            with open(dataset_path, 'rb') as f:
-                return pickle.load(f)
-        else:
-            raise e
-
-
 def create_molecular_likelihood_evaluator_from_model(
     model,
     num_steps: int = 50,
@@ -438,7 +419,9 @@ def create_molecular_likelihood_evaluator_from_model(
     tspan_likelihood = torch.flip(tspan_sampling, dims=[0])
     
     # Create the SAME denoiser wrapper as sampling
-    molecular_denoise_fn = create_molecular_denoiser_wrapper(model.denoiser, model.scheme)
+    molecular_denoise_fn = create_molecular_denoiser_wrapper(
+        model.denoiser, model.scheme, requires_grad=True
+    )
     
     # Create evaluator
     evaluator = MolecularLikelihoodEvaluator(
@@ -456,194 +439,105 @@ def create_molecular_likelihood_evaluator_from_model(
     return evaluator
 
 
-def process_dataset(dataset, evaluator, device, dataset_name):
-    """Process a dataset and return likelihood statistics"""
-    print(f"\nProcessing {dataset_name}...")
+def test_per_sample_likelihood_evaluator():
+    """Test the per-sample molecular likelihood evaluator"""
     
-    dataloader = DataLoader(dataset, batch_size=16, shuffle=True, follow_batch=['lig_coords', 'prot_coords'])
+    print("Testing Per-Sample Molecular Likelihood Evaluator (CUDA)...")
     
-    all_likelihoods = []
-    batch_count = 0
-    
-    for batch in dataloader:
-        batch = batch.to(device)
-        print(batch)
+    try:
+        # Import the molecular diffusion model
+        from molecular_diffusion import MolecularDenoisingModel
         
-        lig_features = batch.lig_features
-        pocket_features = batch.prot_features
-        print(f"lig_features.shape: {lig_features.shape}")
-        print(f"pocket_features.shape: {pocket_features.shape}")
-
-        # Convert one-hot features to embeddings
-        ligand_embeddings = evaluator._model.denoiser.atom_encoder(lig_features)  # [N_lig, joint_nf]
-        pocket_embeddings = evaluator._model.denoiser.residue_encoder(pocket_features)  # [N_pocket, joint_nf]
+        atom_nf = 4
+        residue_nf = 5
         
-        print(f"ligand_embeddings.shape: {ligand_embeddings.shape}")
-        print(f"pocket_embeddings.shape: {pocket_embeddings.shape}")        
-
-        lig_coords = batch.lig_coords
-        pocket_coords = batch.prot_coords
-        ligand_mask = batch.lig_coords_batch
-        pocket_mask = batch.prot_coords_batch
-
-        print(f"lig_coords.shape: {lig_coords.shape}")
-        print(f"pocket_coords.shape: {pocket_coords.shape}")
-        print(f"ligand_mask.shape: {ligand_mask.shape}")
-        print(f"pocket_mask.shape: {pocket_mask.shape}")
-
-        # Concatenate coords and embeddings
-        ligand_data = torch.cat([lig_coords, ligand_embeddings], dim=1)
-        pocket_data = torch.cat([pocket_coords, pocket_embeddings], dim=1)
-
-        # Center-of-mass correction for this molecule
-        combined_coords = torch.cat([lig_coords, pocket_coords], dim=0)
-        combined_mask = torch.cat([ligand_mask, pocket_mask])
-        combined_coords_centered = remove_mean_batch(combined_coords, combined_mask)
-        ligand_data[:, :3] = combined_coords_centered[:lig_coords.shape[0]]
-        pocket_data[:, :3] = combined_coords_centered[lig_coords.shape[0]:]
-
-        print()
-        print(f"ligand_data.shape: {ligand_data.shape}")
-        print(f"pocket_data.shape: {pocket_data.shape}")
-        print(f"ligand_mask.shape: {ligand_mask.shape}")
-        print(f"pocket_mask.shape: {pocket_mask.shape}")
-        print()
-
-        # Separate the batch into individual graphs
-        print(torch.bincount(ligand_mask).tolist())
-        print(torch.bincount(pocket_mask).tolist())
-
-        ligand_data = torch.split(ligand_data, torch.bincount(ligand_mask).tolist())
-        pocket_data = torch.split(pocket_data, torch.bincount(pocket_mask).tolist())
-
-        for i in range(len(ligand_data)):
-            print(f"Ligand data shape: {ligand_data[i].shape}")
-            print(f"Pocket data shape: {pocket_data[i].shape}")
-
-            ligand_mask = torch.zeros(ligand_data[i].shape[0], dtype=torch.long, device=device)
-            pocket_mask = torch.zeros(pocket_data[i].shape[0], dtype=torch.long, device=device)
-
-            # Create molecular state
-            state = MolecularState(
-                ligand=ligand_data[i],
-                pocket=pocket_data[i],
-                ligand_mask=ligand_mask,
-                pocket_mask=pocket_mask,
-                batch_size=1
-            )
-
-            # Evaluate likelihood for this molecule
-            log_likelihood = evaluator.evaluate_likelihood(state)
-            print(f"Complex {batch.id[i]} Log-likelihood: {log_likelihood.item()}", flush=True)
-            all_likelihoods.append(log_likelihood.item())
-
-            print()
-            print()
-
-            batch_count += 1
-            if batch_count > 2:
-                break
-
-    return all_likelihoods, [f"{dataset_name}_{i}" for i in range(len(all_likelihoods))]
-
-
-def main():
-    # Configuration
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    # File paths
-    base_dir = os.getcwd()
-    dataset_path = os.path.join(base_dir, 'dataset_pdbbind.pt')
-    ood_dataset_path = os.path.join(base_dir, 'ood_casf2016.pt')
-    checkpoint_path = os.path.join(base_dir, 'checkpoint_epoch_999.pt')
-    
-    # Parameters
-    num_steps = 10
-    num_hutchinson_samples = 20
-    
-    print(f"Device: {device}")
-    print(f"Number of integration steps: {num_steps}")
-    print(f"Number of Hutchinson samples: {num_hutchinson_samples}")
-    print()
-    
-    # Check file existence
-    for path, name in [(dataset_path, 'Main dataset'), 
-                       (ood_dataset_path, 'OOD dataset'), 
-                       (checkpoint_path, 'Checkpoint')]:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"{name} not found at {path}")
-        print(f"Found {name}: {path}")
-    
-    # Load datasets and model
-    print("\nLoading datasets and model...")
-    main_dataset = load_dataset_safely(dataset_path)
-    ood_dataset = load_dataset_safely(ood_dataset_path)
-    model = load_checkpoint(checkpoint_path)
-    
-    print(f"Main dataset size: {len(main_dataset)}")
-    print(f"OOD dataset size: {len(ood_dataset)}")
-    
-    # Create likelihood evaluator
-    evaluator = create_molecular_likelihood_evaluator_from_model(
-        model,
-        num_steps=num_steps,
-        num_hutchinson_samples=num_hutchinson_samples,
-    )
-    
-    # Process both datasets
-    #main_likelihoods, main_ids = process_dataset(main_dataset, evaluator, device, "Main Dataset")
-    ood_likelihoods, ood_ids = process_dataset(ood_dataset, evaluator, device, "OOD Dataset")
-    
-    # Compute statistics
-    main_mean = np.mean(main_likelihoods)
-    main_std = np.std(main_likelihoods)
-    ood_mean = np.mean(ood_likelihoods)
-    ood_std = np.std(ood_likelihoods)
-    
-    # Print results
-    print("\n" + "="*60)
-    print("LIKELIHOOD COMPARISON RESULTS")
-    print("="*60)
-    print(f"Main Dataset (n={len(main_likelihoods)}):")
-    print(f"  Mean log-likelihood: {main_mean:.4f}")
-    print(f"  Std log-likelihood:  {main_std:.4f}")
-    print(f"  Min log-likelihood:  {min(main_likelihoods):.4f}")
-    print(f"  Max log-likelihood:  {max(main_likelihoods):.4f}")
-    print()
-    print(f"OOD Dataset (n={len(ood_likelihoods)}):")
-    print(f"  Mean log-likelihood: {ood_mean:.4f}")
-    print(f"  Std log-likelihood:  {ood_std:.4f}")
-    print(f"  Min log-likelihood:  {min(ood_likelihoods):.4f}")
-    print(f"  Max log-likelihood:  {max(ood_likelihoods):.4f}")
-    print()
-    print(f"Difference (Main - OOD): {main_mean - ood_mean:.4f}")
-    print("="*60)
-    
-    # Save results
-    results = {
-        'main_dataset': {
-            'likelihoods': main_likelihoods,
-            'ids': main_ids,
-            'mean': main_mean,
-            'std': main_std
-        },
-        'ood_dataset': {
-            'likelihoods': ood_likelihoods,
-            'ids': ood_ids,
-            'mean': ood_mean,
-            'std': ood_std
-        },
-        'config': {
-            'num_steps': num_steps,
-            'num_hutchinson_samples': num_hutchinson_samples,
-            'device': device
-        }
-    }
-    
-    results_path = 'likelihood_comparison_results.pt'
-    torch.save(results, results_path)
-    print(f"\nResults saved to: {results_path}")
+        # Create dummy model for testing
+        model = MolecularDenoisingModel(
+            atom_nf=atom_nf,
+            residue_nf=residue_nf,
+            joint_nf=8,
+            hidden_nf=16,
+            n_layers=1
+        )
+        model.initialize()
+        
+        # Create likelihood evaluator
+        print("Creating per-sample likelihood evaluator...")
+        evaluator = create_molecular_likelihood_evaluator_from_model(
+            model=model,
+            num_steps=10,  # Small for testing
+            num_hutchinson_samples=5,
+        )
+        
+        # Create a batch with multiple molecular states
+        ligand_sizes = [3, 4, 2]  # 3 samples
+        pocket_sizes = [8, 6, 5]  # 3 samples
+        batch_size = len(ligand_sizes)
+        
+        total_lig_atoms = sum(ligand_sizes)
+        total_pocket_atoms = sum(pocket_sizes)
+        
+        # Create masks
+        ligand_mask = torch.cat([
+            torch.full((size,), i, dtype=torch.long, device='cuda')
+            for i, size in enumerate(ligand_sizes)
+        ])
+        pocket_mask = torch.cat([
+            torch.full((size,), i, dtype=torch.long, device='cuda')
+            for i, size in enumerate(pocket_sizes)
+        ])
+        
+        # Create clean molecular state
+        ligand_coords = torch.randn(total_lig_atoms, 3, device='cuda') * 0.1
+        ligand_features = torch.zeros(total_lig_atoms, 8, device='cuda')  # joint_nf
+        ligand_data = torch.cat([ligand_coords, ligand_features], dim=1)
+        
+        pocket_coords = torch.randn(total_pocket_atoms, 3, device='cuda') * 0.1
+        pocket_features = torch.zeros(total_pocket_atoms, 8, device='cuda')  # joint_nf
+        pocket_data = torch.cat([pocket_coords, pocket_features], dim=1)
+        
+        # Make COM-free for each sample separately
+        for i in range(batch_size):
+            lig_mask = ligand_mask == i
+            poc_mask = pocket_mask == i
+            
+            sample_coords = torch.cat([ligand_coords[lig_mask], pocket_coords[poc_mask]], dim=0)
+            sample_mask = torch.cat([
+                torch.zeros(lig_mask.sum(), dtype=torch.long, device='cuda'),
+                torch.zeros(poc_mask.sum(), dtype=torch.long, device='cuda')
+            ])
+            
+            sample_coords_centered = remove_mean_batch(sample_coords, sample_mask)
+            
+            ligand_data[lig_mask, :3] = sample_coords_centered[:lig_mask.sum()]
+            pocket_data[poc_mask, :3] = sample_coords_centered[lig_mask.sum():]
+        
+        clean_state = MolecularState(
+            ligand=ligand_data,
+            pocket=pocket_data,
+            ligand_mask=ligand_mask,
+            pocket_mask=pocket_mask,
+            batch_size=batch_size
+        )
+        
+        print("Evaluating likelihood of clean molecular states...")
+        log_likelihoods = evaluator.evaluate_likelihood(clean_state)
+        
+        print(f"✅ Per-sample likelihood evaluation successful!")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Output shape: {log_likelihoods.shape}")
+        print(f"  Log-likelihoods: {log_likelihoods}")
+        
+        # Verify we get one likelihood per sample
+        assert log_likelihoods.shape == (batch_size,), f"Expected shape ({batch_size},), got {log_likelihoods.shape}"
+        
+        print("✅ Test completed successfully!")
+        
+    except Exception as e:
+        print(f"❌ Error during likelihood evaluation: {e}")
+        import traceback
+        traceback.print_exc()
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    test_per_sample_likelihood_evaluator()
