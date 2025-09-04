@@ -647,7 +647,8 @@ class MolecularSdeSampler(MolecularSampler):
 # Molecular Denoiser Wrapper
 # ********************
 
-def create_molecular_denoiser_wrapper(egnn_model, scheme) -> MolecularDenoiseFn:
+def create_molecular_denoiser_wrapper(egnn_model, scheme, requires_grad: bool = False,
+) -> MolecularDenoiseFn:
     """    
     Wraps the EGNN to handle MolecularState inputs/outputs with CDCD-style
     score interpolation for categorical features.
@@ -658,11 +659,13 @@ def create_molecular_denoiser_wrapper(egnn_model, scheme) -> MolecularDenoiseFn:
     def molecular_denoiser(
         molecular_state: MolecularState,
         sigma: Tensor,
-        cond: TensorMapping | None = None
+        cond: TensorMapping | None = None,
     ) -> MolecularState:
-        
-        # Forward pass through EGNN - predicts coords + logits
-        with torch.no_grad():
+
+        import contextlib
+        context = contextlib.nullcontext() if requires_grad else torch.no_grad()
+    
+        with context:
             pred_output_lig, pred_output_pocket = egnn_model(
                 molecular_state.ligand,
                 molecular_state.pocket,
@@ -670,6 +673,7 @@ def create_molecular_denoiser_wrapper(egnn_model, scheme) -> MolecularDenoiseFn:
                 molecular_state.ligand_mask,
                 molecular_state.pocket_mask
             )
+            
         
         # Split EGNN output: coordinates + logits
         n_dims = 3  # assuming 3D coordinates
