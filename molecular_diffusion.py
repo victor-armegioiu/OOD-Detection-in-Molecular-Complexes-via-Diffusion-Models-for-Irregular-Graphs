@@ -36,7 +36,7 @@ class InvertibleSchedule:
     
     forward: ScheduleFn
     inverse: ScheduleFn
-    device: str = 'cuda'
+    device: str = 'cpu'
     
     def __call__(self, t: Numeric) -> Tensor:
         result = self.forward(t)
@@ -45,12 +45,12 @@ class InvertibleSchedule:
         return result.to(self.device)
 
 
-def _linear_rescale(in_min: float, in_max: float, out_min: float, out_max: float) -> InvertibleSchedule:
+def _linear_rescale(in_min: float, in_max: float, out_min: float, out_max: float, device: str = 'cpu') -> InvertibleSchedule:
     in_range = in_max - in_min
     out_range = out_max - out_min
     fwd = lambda x: out_min + (x - in_min) / in_range * out_range
     inv = lambda y: in_min + (y - out_min) / out_range * in_range
-    return InvertibleSchedule(fwd, inv, device='cuda')
+    return InvertibleSchedule(fwd, inv, device=device)
 
 
 def exponential_noise_schedule(
@@ -58,6 +58,7 @@ def exponential_noise_schedule(
     base: float = np.e**0.5,
     start: float = 0.0,
     end: float = 5.0,
+    device: str = 'cpu'
 ) -> InvertibleSchedule:
     
     if not (start < end and base > 1.0):
@@ -68,24 +69,26 @@ def exponential_noise_schedule(
         in_max=MAX_DIFFUSION_TIME,
         out_min=start,
         out_max=end,
+        device=device,
     )
     out_rescale = _linear_rescale(
-        in_min=base**start, in_max=base**end, out_min=0.0, out_max=clip_max
+        in_min=base**start, in_max=base**end, out_min=0.0, out_max=clip_max,
+        device=device
     )
 
     def sigma(t):
-        t_tensor = torch.as_tensor(t, device='cuda', dtype=torch.float32)
-        base_tensor = torch.tensor(base, device='cuda', dtype=torch.float32)
+        t_tensor = torch.as_tensor(t, device=device, dtype=torch.float32)
+        base_tensor = torch.tensor(base, device=device, dtype=torch.float32)
         return out_rescale(torch.pow(base_tensor, in_rescale(t_tensor)))
     
     def inverse(y):
-        y_tensor = torch.as_tensor(y, device='cuda', dtype=torch.float32)
-        base_tensor = torch.tensor(base, device='cuda', dtype=torch.float32)
+        y_tensor = torch.as_tensor(y, device=device, dtype=torch.float32)
+        base_tensor = torch.tensor(base, device=device, dtype=torch.float32)
         return in_rescale.inverse(
             torch.log(out_rescale.inverse(y_tensor)) / torch.log(base_tensor)
         )
     
-    return InvertibleSchedule(sigma, inverse, device='cuda')
+    return InvertibleSchedule(sigma, inverse, device=device)
 
 
 # ********************
@@ -106,7 +109,7 @@ class MolecularDiffusion:
     feature_bias: float = 0.0
     categorical_temperature: float = 1.0
     
-    device: str = 'cuda'
+    device: str = 'cpu'
     
     @property
     def sigma_max(self) -> float:
@@ -177,16 +180,16 @@ class MolecularDiffusion:
         feature_norm: float = 1.0,
         feature_bias: float = 0.0,
         categorical_temperature: float = 1.0,
+        device: str = 'cpu'
     ) -> 'MolecularDiffusion':
         """Create variance exploding scheme"""
-        
         return cls(
             sigma=sigma,
             coord_norm=coord_norm,
             feature_norm=feature_norm,
             feature_bias=feature_bias,
             categorical_temperature=categorical_temperature,
-            device='cuda'
+            device=device
         )
 
 
@@ -206,16 +209,16 @@ def log_uniform_sampling(
 
     def _noise_sampling(shape: Tuple[int, ...]) -> Tensor:
         if uniform_grid:
-            s0 = torch.rand((), dtype=torch.float32, device='cuda')
+            s0 = torch.rand((), dtype=torch.float32, device=scheme.device)
             num_elements = int(np.prod(shape))
             step_size = 1 / num_elements
-            grid = torch.linspace(0, 1 - step_size, num_elements, dtype=torch.float32, device='cuda')
+            grid = torch.linspace(0, 1 - step_size, num_elements, dtype=torch.float32, device=scheme.device)
             samples = torch.remainder(grid + s0, 1).reshape(shape)
         else:
-            samples = torch.rand(shape, dtype=torch.float32, device='cuda')
+            samples = torch.rand(shape, dtype=torch.float32, device=scheme.device)
         
-        log_min = torch.log(torch.tensor(clip_min, dtype=torch.float32, device='cuda'))
-        log_max = torch.log(torch.tensor(scheme.sigma_max, dtype=torch.float32, device='cuda'))
+        log_min = torch.log(torch.tensor(clip_min, dtype=torch.float32, device=scheme.device))
+        log_max = torch.log(torch.tensor(scheme.sigma_max, dtype=torch.float32, device=scheme.device))
         samples = (log_max - log_min) * samples + log_min
         return torch.exp(samples)
 
@@ -277,20 +280,21 @@ class MolecularDenoisingModel:
     noise_weighting: NoiseLossWeighting = None
     geometric_regularization: bool = True
     geom_loss_weight: float = 0.1
+    device: str = 'cpu'
     
     def __post_init__(self):
         """Initialize the denoiser and diffusion components"""
         
         # Create default scheme if not provided
         if self.scheme is None:
-            sigma_schedule = exponential_noise_schedule(clip_max=100.0) 
+            sigma_schedule = exponential_noise_schedule(clip_max=100.0, device=self.device) 
             scheme = MolecularDiffusion.create_variance_exploding(
                 sigma=sigma_schedule,
                 coord_norm=1.0,
                 feature_norm=1.0,
                 feature_bias=0.0,
                 categorical_temperature=1.0
-            )
+            , device=self.device)
             object.__setattr__(self, 'scheme', scheme)
         
         # Create default noise sampling if not provided
@@ -310,7 +314,7 @@ class MolecularDenoisingModel:
             n_dims=self.n_dims,
             joint_nf=self.joint_nf,
             hidden_nf=self.hidden_nf,
-            device='cuda',
+            device=self.device,
             n_layers=self.n_layers,
             condition_time=True,
             update_pocket_coords=self.update_pocket_coords,
@@ -335,12 +339,12 @@ class MolecularDenoisingModel:
         """
         
         # Extract molecular data
-        lig_coords = batch['ligand_coords'].cuda()
-        lig_features = batch['ligand_features'].cuda()  # One-hot features
-        pocket_coords = batch['pocket_coords'].cuda()
-        pocket_features = batch['pocket_features'].cuda()  # One-hot features
-        lig_mask = batch['ligand_mask'].cuda()
-        pocket_mask = batch['pocket_mask'].cuda()
+        lig_coords = batch['ligand_coords'].to(self.device)
+        lig_features = batch['ligand_features'].to(self.device)  # One-hot features
+        pocket_coords = batch['pocket_coords'].to(self.device)
+        pocket_features = batch['pocket_features'].to(self.device)  # One-hot features
+        lig_mask = batch['ligand_mask'].to(self.device)
+        pocket_mask = batch['pocket_mask'].to(self.device)
         batch_size = len(torch.unique(torch.cat([lig_mask, pocket_mask])))
         
         # Get true atom/residue type indices for cross-entropy loss
@@ -375,8 +379,8 @@ class MolecularDenoisingModel:
         sigma = self.noise_sampling(shape=(batch_size,))  # [batch_size]
         
         # Generate Gaussian noise for the entire state
-        noise_lig = torch.randn_like(xh_lig_clean)
-        noise_pocket = torch.randn_like(xh_pocket_clean)
+        noise_lig = torch.randn_like(xh_lig_clean, device=self.device)
+        noise_pocket = torch.randn_like(xh_pocket_clean, device=self.device)
         
         # Make coordinate noise COM-free (but not embedding noise)
         noise_coords_combined = torch.cat([noise_lig[:, :self.n_dims], noise_pocket[:, :self.n_dims]], dim=0)
@@ -402,7 +406,8 @@ class MolecularDenoisingModel:
         # print('pocket_mask', pocket_mask.shape)
         
         pred_output_lig, pred_output_pocket = self.denoiser(
-            xh_lig_noisy, xh_pocket_noisy, sigma, lig_mask, pocket_mask,
+            xh_lig_noisy.to(self.device), xh_pocket_noisy.to(self.device), sigma.to(self.device) if hasattr(sigma,'to') else sigma,
+            lig_mask, pocket_mask,
             target_atoms=lig_coords_centered, target_residues=pocket_coords_centered,
         )
         
@@ -468,12 +473,12 @@ class MolecularDenoisingModel:
         """Evaluate denoising at multiple noise levels with proper loss breakdown"""
         
         # Extract data
-        lig_coords = batch['ligand_coords'].cuda()
-        lig_features = batch['ligand_features'].cuda()  # One-hot features
-        pocket_coords = batch['pocket_coords'].cuda()
-        pocket_features = batch['pocket_features'].cuda()  # One-hot features
-        lig_mask = batch['ligand_mask'].cuda()
-        pocket_mask = batch['pocket_mask'].cuda()
+        lig_coords = batch['ligand_coords'].to(self.device)
+        lig_features = batch['ligand_features'].to(self.device)  # One-hot features
+        pocket_coords = batch['pocket_coords'].to(self.device)
+        pocket_features = batch['pocket_features'].to(self.device)  # One-hot features
+        lig_mask = batch['ligand_mask'].to(self.device)
+        pocket_mask = batch['pocket_mask'].to(self.device)
         batch_size = batch['batch_size']
         
         # Get true categories for evaluation
@@ -483,7 +488,7 @@ class MolecularDenoisingModel:
         # Cache training quantiles.
         if not hasattr(self, '_cached_sigma_levels'):
             training_sigmas = self.noise_sampling(shape=(10000,))
-            sigma_levels = torch.quantile(training_sigmas, torch.tensor([0.1, 0.3, 0.5, 0.7, 0.9], device='cuda'))
+            sigma_levels = torch.quantile(training_sigmas, torch.tensor([0.1, 0.3, 0.5, 0.7, 0.9], device=self.device))
             object.__setattr__(self, '_cached_sigma_levels', sigma_levels)
         else:
             sigma_levels = self._cached_sigma_levels
@@ -517,8 +522,8 @@ class MolecularDenoisingModel:
             xh_pocket_clean = torch.cat([pocket_coords_centered, pocket_embeddings_clean], dim=1)
             
             # Add noise at this level
-            noise_lig = torch.randn_like(xh_lig_clean)
-            noise_pocket = torch.randn_like(xh_pocket_clean)
+            noise_lig = torch.randn_like(xh_lig_clean, device=self.device)
+            noise_pocket = torch.randn_like(xh_pocket_clean, device=self.device)
             
             # COM-free noise for coordinates only
             noise_coords_combined = torch.cat([noise_lig[:, :self.n_dims], noise_pocket[:, :self.n_dims]], dim=0)

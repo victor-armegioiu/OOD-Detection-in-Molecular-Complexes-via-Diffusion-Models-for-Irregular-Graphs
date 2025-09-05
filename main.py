@@ -6,6 +6,7 @@ All operations are CUDA-optimized.
 """
 
 import torch
+import dataclasses
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
@@ -72,7 +73,7 @@ CONFIG = {
     'pocket_size_range': (15, 30),   # Min/max pocket residues
     
     # I/O
-    'device': 'cuda',
+    'device': 'cpu',
     
     # Weights & Biases configuration
     'wandb': {
@@ -97,8 +98,8 @@ CONFIG['checkpoint_path'] = f'{CONFIG["run_dir"]}/checkpoint.pt'
 
 def create_fake_molecular_batch(batch_size: int, ligand_size_range: tuple, 
                                pocket_size_range: tuple, atom_nf: int, 
-                               residue_nf: int) -> Dict:
-    """Create realistic fake molecular data for training (all CUDA)"""
+                               residue_nf: int, device: str = 'cuda') -> Dict:
+    """Create realistic fake molecular data for training on `device`"""
     
     # Sample molecule sizes
     ligand_sizes = [
@@ -115,26 +116,26 @@ def create_fake_molecular_batch(batch_size: int, ligand_size_range: tuple,
     
     # Create masks (CUDA)
     ligand_mask = torch.cat([
-        torch.full((size,), i, dtype=torch.long, device='cuda')
+        torch.full((size,), i, dtype=torch.long, device=device)
         for i, size in enumerate(ligand_sizes)
     ])
     pocket_mask = torch.cat([
-        torch.full((size,), i, dtype=torch.long, device='cuda')
+        torch.full((size,), i, dtype=torch.long, device=device)
         for i, size in enumerate(pocket_sizes)
     ])
     
     # Generate coordinates (CUDA) - somewhat realistic molecular geometry
     # Ligands: smaller, more compact
-    ligand_coords = torch.randn(total_lig_atoms, 3, device='cuda') * 2.0
+    ligand_coords = torch.randn(total_lig_atoms, 3, device=device) * 2.0
     
     # Pockets: larger, more spread out
-    pocket_coords = torch.randn(total_pocket_atoms, 3, device='cuda') * 5.0
+    pocket_coords = torch.randn(total_pocket_atoms, 3, device=device) * 5.0
     
     # Generate categorical features (one-hot encoded, CUDA)
-    ligand_atom_types = torch.randint(0, atom_nf, (total_lig_atoms,), device='cuda')
+    ligand_atom_types = torch.randint(0, atom_nf, (total_lig_atoms,), device=device)
     ligand_features = F.one_hot(ligand_atom_types, atom_nf).float()
     
-    pocket_residue_types = torch.randint(0, residue_nf, (total_pocket_atoms,), device='cuda')
+    pocket_residue_types = torch.randint(0, residue_nf, (total_pocket_atoms,), device=device)
     pocket_features = F.one_hot(pocket_residue_types, residue_nf).float()
     
     # Make ligands roughly centered around pocket regions (more realistic)
@@ -144,7 +145,7 @@ def create_fake_molecular_batch(batch_size: int, ligand_size_range: tuple,
         
         if lig_mask_i.any() and pocket_mask_i.any():
             pocket_center = pocket_coords[pocket_mask_i].mean(dim=0)
-            ligand_coords[lig_mask_i] += pocket_center + torch.randn(3, device='cuda') * 1.0
+            ligand_coords[lig_mask_i] += pocket_center + torch.randn(3, device=device) * 1.0
     
     return {
         'ligand_coords': ligand_coords,
@@ -171,7 +172,8 @@ def create_random_training_data(config: Dict) -> List[Dict]:
             ligand_size_range=config['ligand_size_range'],
             pocket_size_range=config['pocket_size_range'],
             atom_nf=config['atom_nf'],
-            residue_nf=config['residue_nf']
+            residue_nf=config['residue_nf'],
+            device=config.get('device', 'cuda')
         )
         train_data.append(batch)
     
@@ -191,7 +193,8 @@ def create_random_eval_data(config: Dict) -> List[Dict]:
             ligand_size_range=config['ligand_size_range'],
             pocket_size_range=config['pocket_size_range'],
             atom_nf=config['atom_nf'],
-            residue_nf=config['residue_nf']
+            residue_nf=config['residue_nf'],
+            device=config.get('device', 'cuda')
         )
         eval_data.append(batch)
     
@@ -203,7 +206,9 @@ def create_batches_from_dataset(dataset_path: str, config: Dict) -> List[Dict]:
     """Create dataset from PDBbind dataset"""
     data = []
 
-    dataset = torch.load(dataset_path)
+    # Load dataset onto CPU and let DataLoader/torch move tensors as needed.
+    map_loc = torch.device(config.get('device', 'cuda'))
+    dataset = torch.load(dataset_path, map_location=map_loc)
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, follow_batch=['lig_coords', 'prot_coords'])
 
     for batch in dataloader:
@@ -234,7 +239,8 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         clip_max=config['sigma_max'],
         base=np.e**0.5,
         start=0.0,
-        end=5.0
+        end=5.0,
+        device=config.get('device', 'cpu')
     )
     
     # Create diffusion scheme 
@@ -242,7 +248,8 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         sigma=sigma_schedule,
         coord_norm=10.0, # TODO: check if okay.
         feature_norm=1.0,
-        feature_bias=0.0
+        feature_bias=0.0,
+        device=config.get('device', 'cpu')
     )
     
     # Create noise sampling and weighting
@@ -269,7 +276,15 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         noise_weighting=noise_weighting
     )
     
+    # Propagate device into model dataclass (it is frozen, use object.__setattr__)
+    try:
+        object.__setattr__(model, 'device', config.get('device', 'cpu'))
+    except Exception:
+        pass
     model.initialize()
+    # Move model parameters to configured device
+    model_device = torch.device(config.get('device', 'cpu'))
+    model.denoiser.to(model_device)
     return model
 
 
@@ -557,8 +572,11 @@ def main():
         print("GENERATING TRAINING DATA")
         print(f"{'='*60}")
         
-        train_data = create_batches_from_dataset(CONFIG['train_dataset_path'], CONFIG)
-        eval_data = create_batches_from_dataset(CONFIG['eval_dataset_path'], CONFIG)
+        # train_data = create_batches_from_dataset(CONFIG['train_dataset_path'], CONFIG)
+        # eval_data = create_batches_from_dataset(CONFIG['eval_dataset_path'], CONFIG)
+        # create random data for demonstration
+        train_data = create_random_training_data(CONFIG)
+        eval_data = create_random_eval_data(CONFIG)
         
         # Show example batch 
         example_batch = train_data[0]
@@ -609,7 +627,10 @@ def main():
         
         print(f"\n🎉 PIPELINE COMPLETED SUCCESSFULLY!")
         print(f"Checkpoint saved at: {CONFIG['checkpoint_path']}")
-        print(f"Used {torch.cuda.get_device_name()} for computation")
+        if CONFIG.get('device', 'cpu').startswith('cuda') and torch.cuda.is_available():
+            print(f"Used {torch.cuda.get_device_name()} for computation")
+        else:
+            print("Used CPU for computation")
         
     except Exception as e:
         # Log error to wandb if it's initialized

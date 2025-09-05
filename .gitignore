@@ -5,6 +5,8 @@ wandb/
 *.sh
 *.db
 dataset*.pt
+datasets/
+*.pdf
 
 optimization_runs/
 optimization_results/
