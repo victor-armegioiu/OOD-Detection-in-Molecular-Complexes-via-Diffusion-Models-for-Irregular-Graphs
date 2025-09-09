@@ -53,17 +53,17 @@ except ImportError:
 
 # Configuration following framework patterns
 CONFIG = {
-    'train_dataset_path': 'dataset_cleansplit.pt',
-    'eval_dataset_path': 'dataset_casf2016.pt',
+    'train_dataset_path': 'dataset_pdbbind_train.pt',
+    'eval_dataset_path': 'dataset_pdbbind_validation.pt',
 
     # Model parameters
-    'atom_nf': 10,            # Number of atom types
-    'residue_nf': 21,         # Number of residue types  
-    'n_dims': 3,              # 3D coordinates
-    'n_layers': 4,            # Number of EGNN layers
-    'joint_nf': 256,          # Even richer shared space
-    'hidden_nf': 128,         # More EGNN capacity
-    'edge_embedding_dim': 32, # Edge embeddings
+    'atom_nf': 10,           
+    'residue_nf': 21,         
+    'n_dims': 3,             
+    'n_layers': 4,           
+    'joint_nf': 256,          
+    'hidden_nf': 128,         
+    'edge_embedding_dim': 32, 
     
     # Training parameters
     'num_epochs': 1000,
@@ -71,7 +71,8 @@ CONFIG = {
     'batch_size': 16,
     'log_interval': 20,
     'eval_interval': 10,
-    'num_eval_samples': 100,
+    'num_eval_samples': 50,
+    'early_stopping_patience': 5,
     
     # Diffusion parameters
     'sigma_max': 100.0,      # Maximum noise level
@@ -108,11 +109,12 @@ CONFIG = {
 # Hyperparameter search spaces
 HYPERPARAM_SPACES = {
     'num_sampling_steps': [50, 100, 200, 300, 400],
-    'joint_nf': [32, 64, 128, 256],
-    'hidden_nf': [64, 128, 256],
-    'n_layers': [2, 4, 6, 8],
-    'edge_embedding_dim': [8, 16, 32, 64],
-    'learning_rate': [5e-5, 1e-4, 5e-4, 1e-3, 5e-3],
+    'joint_nf': [32, 64, 128],#, 256],
+    'hidden_nf': [64, 128],#, 256],
+    'n_layers': [2, 4, 6],#, 8],
+    'edge_embedding_dim': [8, 16, 32],#, 64],
+    'learning_rate': [5e-4, 1e-3, 5e-3],
+    # 'learning_rate': [5e-5, 1e-4, 5e-4, 1e-3, 5e-3],
     'batch_size': [16, 32, 64, 128]
 }
 
@@ -127,8 +129,8 @@ def parse_arguments():
     
     
     # Dataset options
-    parser.add_argument('--train_dataset', default='dataset_pdbbind.pt', help='Path to training dataset')
-    parser.add_argument('--eval_dataset', default='dataset_casf2016.pt', help='Path to evaluation dataset')
+    parser.add_argument('--train_dataset', default='dataset_pdbbind_train.pt', help='Path to training dataset')
+    parser.add_argument('--eval_dataset', default='dataset_pdbbind_validation.pt', help='Path to evaluation dataset')
     
     # Model parameters (for single mode or to override defaults)
     parser.add_argument('--joint_nf', type=int, help='Joint embedding dimension')
@@ -141,6 +143,7 @@ def parse_arguments():
     parser.add_argument('--batch_size', type=int, help='Batch size')
     parser.add_argument('--num_epochs', type=int, help='Number of training epochs')
     parser.add_argument('--eval_interval', type=int, help='Interval for evaluation')
+    parser.add_argument('--early_stopping_patience', type=int, help='Patience for early stopping')
     
     # Sampling parameters
     parser.add_argument('--num_sampling_steps', type=int, help='Number of sampling steps')
@@ -194,6 +197,8 @@ def update_config_from_args(config: Dict, args) -> Dict:
         config['num_epochs'] = args.num_epochs
     if args.eval_interval is not None:
         config['eval_interval'] = args.eval_interval
+    if args.early_stopping_patience is not None:
+        config['early_stopping_patience'] = args.early_stopping_patience
     
     # Update sampling parameters
     if args.num_sampling_steps is not None:
@@ -336,6 +341,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
     early_stop_metrics = [
         'percent_fragmented',
         'mean_num_fragments',
+        'mean_ring_size',
         # 'atoms_dist_js_divergence',
         # 'aa_dist_js_divergence',
         # 'ring_size_dist_js_divergence'
@@ -443,7 +449,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             eval_losses = evaluate_model(model, eval_data)
 
             # Sampling-based losses
-            save_path = config['checkpoint_path'].replace(".pt", f"_epoch_{epoch}.pt")
+            save_path = config['checkpoint_path'].replace(".pt", f"_epoch_{epoch + 1}.pt")
             save_checkpoint(model, config, save_path)
             loaded_model = load_checkpoint(save_path)
             samples = sample_molecules(loaded_model,
@@ -488,6 +494,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             wandb.log(eval_log)
 
             # Early stopping logic
+            print(f"\n ----- Epoch {epoch+1}: Early Stopping Logic: -----")
             improved = False
             for k in early_stop_metrics:
                 v = eval_losses.get(k, float('inf'))
@@ -506,14 +513,14 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                     print(f"    {k}: {best_metrics[k]}")
             else:
                 patience_counter += 1
-                print(f"[Early Stopping] Patience Counter: {patience_counter}")
+                print(f"[Early Stopping] Patience Counter: {patience_counter} / {config['early_stopping_patience']}")
 
-            if patience_counter >= 10:
-                print(f"\n[EARLY STOPPING] No improvement in {early_stop_metrics} for two evaluation intervals ({config['eval_interval']} epochs). Stopping at epoch {epoch+1}.")
+            if patience_counter >= config['early_stopping_patience']:
+                print(f"[EARLY STOPPING] No improvement in {early_stop_metrics} for {config['early_stopping_patience']} evaluation intervals ({config['eval_interval']} epochs each). Stopping at epoch {epoch+1}.")
                 early_stopped = True
                 break
         
-        print(f"Epoch {epoch+1:3d} - Average Loss: {avg_epoch_loss:.4f}", flush=True)
+        print(f"\n ===== Epoch {epoch+1:3d} - Average Loss: {avg_epoch_loss:.4f} =====\n", flush=True)
     
     # Save model to wandb if configured
     if config['wandb']['log_model']:
@@ -1029,7 +1036,7 @@ def main():
             print("LOADING MODEL FROM CHECKPOINT")
             print(f"{'='*60}")
             
-            loaded_model = load_checkpoint(CONFIG['checkpoint_path'])
+            loaded_model = load_checkpoint(CONFIG['checkpoint_path'].replace(".pt", "_final.pt"))
             
             # 6. Sample new molecules
             samples = sample_molecules(loaded_model,
@@ -1051,7 +1058,7 @@ def main():
             analyze_samples(samples, CONFIG)
             
             print(f"\n🎉 PIPELINE COMPLETED SUCCESSFULLY!")
-            print(f"Checkpoint saved at: {CONFIG['checkpoint_path']}")
+            print(f"Checkpoint saved at: {CONFIG['checkpoint_path'].replace('.pt', '_final.pt')}")
             print(f"Used {torch.cuda.get_device_name()} for computation")
             
 
