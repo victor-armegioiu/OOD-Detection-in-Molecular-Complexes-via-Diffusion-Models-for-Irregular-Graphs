@@ -4,10 +4,13 @@ wandb/
 *.err
 *.sh
 *.db
+*.txt
 dataset*.pt
 
 optimization_runs/
 optimization_results/
 training_runs/
 diffsbdd_stuff/
+lkhd_results/
+samples/
 combine_csvs.py
