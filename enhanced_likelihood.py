@@ -6,24 +6,21 @@ during forward integration for improved OOD detection beyond just likelihood sco
 """
 
 import torch
-import json
-import argparse
 import numpy as np
-from typing import Tuple, Optional, Callable, Mapping, Any, NamedTuple, Protocol, Dict, List, Union
+from typing import Tuple, Optional, Callable, Mapping, Any, NamedTuple, Protocol, Dict, List
 from torch.autograd import grad
 from torch_scatter import scatter_mean
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
+
 from dataclasses import dataclass
-import os
-from torch_geometric.loader import DataLoader
-from torch_geometric.data import Data
+
 from molecular_samplers import (
     MolecularState, MolecularDenoiseFn, MolecularSdeCoefficientFn, 
     MolecularSdeDynamics, MolecularEulerMaruyamaStep, remove_mean_batch,
     create_molecular_denoiser_wrapper, edm_noise_decay, dlog_dt, dsquare_dt
 )
-from metrics import load_checkpoint
-from Dataset import PDBbind_Dataset
+
 Tensor = torch.Tensor
 TensorMapping = Mapping[str, Tensor]
 MolecularParams = Mapping[str, Any]
@@ -516,9 +513,10 @@ class MolecularLikelihoodEvaluator:
     def _forward_integrate_with_stats_single(
         self, 
         clean_state: MolecularState, 
-        cond: TensorMapping | None = None
+        cond: TensorMapping | None = None,
+        checkpoint_segments: int = 10
     ) -> Tuple[MolecularState, Tensor, Dict[str, float]]:
-        """Forward integrate with trajectory statistics collection for single sample"""
+        """Forward integrate with trajectory statistics collection for single sample using gradient checkpointing"""
         
         assert clean_state.batch_size == 1, "This method expects single sample"
         
@@ -529,10 +527,51 @@ class MolecularLikelihoodEvaluator:
         # Initialize trajectory statistics
         trajectory_stats = TrajectoryStatistics(n_dims=self.n_dims) if self.collect_trajectory_stats else None
         
+        # Split integration steps into segments for checkpointing
+        total_steps = len(self.tspan) - 1
+        segment_size = max(1, total_steps // checkpoint_segments)
+        
         current_state = clean_state
         total_divergence = torch.tensor(0.0, device=clean_state.ligand.device)
         
-        for i in range(len(self.tspan) - 1):
+        for segment_start in range(0, total_steps, segment_size):
+            segment_end = min(segment_start + segment_size, total_steps)
+            
+            # Define segment integration function for checkpointing
+            def integrate_segment(state_in):
+                return self._integrate_segment_with_divergence(
+                    state_in, segment_start, segment_end, dynamics, params, trajectory_stats
+                )
+            
+            # Use gradient checkpointing for this segment
+            current_state, segment_divergence = checkpoint.checkpoint(
+                integrate_segment, 
+                current_state,
+                use_reentrant=False
+            )
+            
+            total_divergence = total_divergence + segment_divergence
+        
+        # Get final trajectory statistics summary
+        stats_summary = trajectory_stats.get_summary() if trajectory_stats is not None else {}
+        
+        return current_state, total_divergence, stats_summary
+
+    def _integrate_segment_with_divergence(
+        self,
+        initial_state: MolecularState,
+        start_idx: int,
+        end_idx: int,
+        dynamics: MolecularSdeDynamics,
+        params: MolecularParams,
+        trajectory_stats: TrajectoryStatistics
+    ) -> Tuple[MolecularState, Tensor]:
+        """Integrate a segment of the trajectory with divergence computation"""
+        
+        current_state = initial_state
+        segment_divergence = torch.tensor(0.0, device=initial_state.ligand.device)
+        
+        for i in range(start_idx, end_idx):
             t_curr = self.tspan[i]
             t_next = self.tspan[i + 1]
             dt = t_next - t_curr
@@ -540,21 +579,19 @@ class MolecularLikelihoodEvaluator:
             # Compute vector field for this step
             vector_field = dynamics.drift(current_state, t_curr, params["drift"])
             
-            # Collect trajectory statistics
+            # Collect trajectory statistics (no gradients needed for this)
             if trajectory_stats is not None:
-                trajectory_stats.update(current_state, vector_field, dt)
+                with torch.no_grad():
+                    trajectory_stats.update(current_state, vector_field, dt)
             
-            # Estimate divergence at current point
+            # Estimate divergence at current point (this needs gradients)
             div_estimate = self._estimate_divergence_single(current_state, t_curr, params, dynamics)
-            total_divergence = total_divergence + div_estimate * dt
+            segment_divergence = segment_divergence + div_estimate * dt
             
-            # Use Heun's method for better accuracy
+            # Integration step
             current_state = self._heun_step(current_state, t_curr, t_next, dynamics, params)
         
-        # Get final trajectory statistics summary
-        stats_summary = trajectory_stats.get_summary() if trajectory_stats is not None else {}
-        
-        return current_state, total_divergence, stats_summary
+        return current_state, segment_divergence
     
     def _heun_step(
         self, 
