@@ -6,6 +6,7 @@ during forward integration for improved OOD detection beyond just likelihood sco
 """
 
 import torch
+import json
 import argparse
 import numpy as np
 from typing import Tuple, Optional, Callable, Mapping, Any, NamedTuple, Protocol, Dict, List, Union
@@ -896,10 +897,10 @@ def process_dataset(dataset, evaluator, device, dataset_name):
     """Process a dataset and return likelihood statistics"""
     print(f"\nProcessing {dataset_name}...")
     
-    dataloader = DataLoader(dataset, batch_size=16, shuffle=True, follow_batch=['lig_coords', 'prot_coords'])
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, follow_batch=['lig_coords', 'prot_coords'])
     
-    all_likelihoods = []
-    batch_count = 0
+    all_metrics = {}
+    # batch_count = 0
     
     for batch in dataloader:
         batch = batch.to(device)
@@ -952,28 +953,17 @@ def process_dataset(dataset, evaluator, device, dataset_name):
 
             # Evaluate likelihood for this molecule
             log_likelihood, trajectory_stats = evaluator.evaluate_likelihood_with_stats(state)
-            print(f"--- Complex {batch.id[i]} Log-likelihood: {log_likelihood.item()}", flush=True)
-            all_likelihoods.append(log_likelihood.item())
 
-            # Display trajectory statistics for first sample
+            all_metrics[batch.id[i]] = {'log_likelihood': float(log_likelihood.item())}
             if trajectory_stats:
-                print(f"\n📊 Trajectory statistics for {batch.id[i]}:")
-                for key, value in trajectory_stats[0].items():
-                    print(f"    {key}: {value:.4f}")
+                trajectory_stats = {k: np.float32(v) for k, v in trajectory_stats[0].items()}
+                all_metrics[batch.id[i]].update(trajectory_stats)
 
             # batch_count += 1
             # if batch_count > 10:
             #     break
-
-        # Count the number of saved likelihoods that are not NAN
-        nan_count = torch.isnan(torch.tensor(all_likelihoods)).sum().item()
-        if len(all_likelihoods) - nan_count >= 500:
-            break
-        else:
-            print(f"Number of saved likelihoods: {len(all_likelihoods)}")
-            print(f"Number of NANs: {nan_count}")
-
-    return all_likelihoods, [f"{dataset_name}_{i}" for i in range(len(all_likelihoods))]
+        
+    return all_metrics
 
 
 def main(dataset_path, checkpoint_path, results_folder, num_steps, num_hutchinson_samples):
@@ -1009,27 +999,31 @@ def main(dataset_path, checkpoint_path, results_folder, num_steps, num_hutchinso
     )
     
     # Process dataset
-    ood_likelihoods, ood_ids = process_dataset(dataset, evaluator, device, name)
+    likelihoods, metrics = process_dataset(dataset, evaluator, device, name)
     
     # Compute statistics
-    ood_mean = np.mean(ood_likelihoods)
-    ood_std = np.std(ood_likelihoods)
+    ood_mean = np.mean(likelihoods)
+    ood_std = np.std(likelihoods)
     
     # Print results
     print("\n" + "="*60)
     print("LIKELIHOOD RESULTS")
     print("="*60)
-    print(f"{name} (n={len(ood_likelihoods)}):")
+    print(f"{name} (n={len(likelihoods)}):")
     print(f"  Mean log-likelihood: {ood_mean:.4f}")
     print(f"  Std log-likelihood:  {ood_std:.4f}")
-    print(f"  Min log-likelihood:  {min(ood_likelihoods):.4f}")
-    print(f"  Max log-likelihood:  {max(ood_likelihoods):.4f}")
+    print(f"  Min log-likelihood:  {min(likelihoods):.4f}")
+    print(f"  Max log-likelihood:  {max(likelihoods):.4f}")
     print("="*60)
 
-    results_file = os.path.join(results_folder, f'{name}')
-    torch.save(ood_likelihoods, results_file)
+    # results_file = os.path.join(results_folder, f'{name}')
+    # torch.save(likelihoods, results_file)
+    # print(f"\nLog-likelihoods saved to: {results_file}")
 
-    print(f"\nLog-likelihoods saved to: {results_file}")
+    with open(os.path.join(results_folder, f'{name.replace(".pt", "")}_metrics.json'), 'w') as f:
+        json.dump(metrics, f, indent=4)
+
+    
 
 if __name__ == '__main__':
     # test_trajectory_ood_detection()
