@@ -6,19 +6,23 @@ during forward integration for improved OOD detection beyond just likelihood sco
 """
 
 import torch
+import argparse
 import numpy as np
-from typing import Tuple, Optional, Callable, Mapping, Any, NamedTuple, Protocol, Dict, List
+from typing import Tuple, Optional, Callable, Mapping, Any, NamedTuple, Protocol, Dict, List, Union
 from torch.autograd import grad
 from torch_scatter import scatter_mean
 import torch.nn.functional as F
 from dataclasses import dataclass
-
+import os
+from torch_geometric.loader import DataLoader
+from torch_geometric.data import Data
 from molecular_samplers import (
     MolecularState, MolecularDenoiseFn, MolecularSdeCoefficientFn, 
     MolecularSdeDynamics, MolecularEulerMaruyamaStep, remove_mean_batch,
     create_molecular_denoiser_wrapper, edm_noise_decay, dlog_dt, dsquare_dt
 )
-
+from metrics import load_checkpoint
+from Dataset import PDBbind_Dataset
 Tensor = torch.Tensor
 TensorMapping = Mapping[str, Tensor]
 MolecularParams = Mapping[str, Any]
@@ -888,5 +892,154 @@ def test_trajectory_ood_detection():
         traceback.print_exc()
 
 
+def process_dataset(dataset, evaluator, device, dataset_name):
+    """Process a dataset and return likelihood statistics"""
+    print(f"\nProcessing {dataset_name}...")
+    
+    dataloader = DataLoader(dataset, batch_size=16, shuffle=True, follow_batch=['lig_coords', 'prot_coords'])
+    
+    all_likelihoods = []
+    batch_count = 0
+    
+    for batch in dataloader:
+        batch = batch.to(device)
+        print("\nStarting batch...")
+        print(batch)
+        
+        lig_features = batch.lig_features
+        pocket_features = batch.prot_features
+
+        # Convert one-hot features to embeddings
+        ligand_embeddings = evaluator._model.denoiser.atom_encoder(lig_features)  # [N_lig, joint_nf]
+        pocket_embeddings = evaluator._model.denoiser.residue_encoder(pocket_features)  # [N_pocket, joint_nf]
+
+        lig_coords = batch.lig_coords
+        pocket_coords = batch.prot_coords
+        ligand_mask = batch.lig_coords_batch
+        pocket_mask = batch.prot_coords_batch
+
+        # Concatenate coords and embeddings
+        ligand_data = torch.cat([lig_coords, ligand_embeddings], dim=1)
+        pocket_data = torch.cat([pocket_coords, pocket_embeddings], dim=1)
+
+        # Center-of-mass correction for this molecule
+        combined_coords = torch.cat([lig_coords, pocket_coords], dim=0)
+        combined_mask = torch.cat([ligand_mask, pocket_mask])
+        combined_coords_centered = remove_mean_batch(combined_coords, combined_mask)
+        ligand_data[:, :3] = combined_coords_centered[:lig_coords.shape[0]]
+        pocket_data[:, :3] = combined_coords_centered[lig_coords.shape[0]:]
+
+        # Separate the batch into individual graphs
+        print(torch.bincount(ligand_mask).tolist())
+        print(torch.bincount(pocket_mask).tolist())
+
+        ligand_data = torch.split(ligand_data, torch.bincount(ligand_mask).tolist())
+        pocket_data = torch.split(pocket_data, torch.bincount(pocket_mask).tolist())
+
+        for i in range(len(ligand_data)):
+
+            ligand_mask = torch.zeros(ligand_data[i].shape[0], dtype=torch.long, device=device)
+            pocket_mask = torch.zeros(pocket_data[i].shape[0], dtype=torch.long, device=device)
+
+            # Create molecular state
+            state = MolecularState(
+                ligand=ligand_data[i],
+                pocket=pocket_data[i],
+                ligand_mask=ligand_mask,
+                pocket_mask=pocket_mask,
+                batch_size=1
+            )
+
+            # Evaluate likelihood for this molecule
+            log_likelihood, trajectory_stats = evaluator.evaluate_likelihood_with_stats(state)
+            print(f"--- Complex {batch.id[i]} Log-likelihood: {log_likelihood.item()}", flush=True)
+            all_likelihoods.append(log_likelihood.item())
+
+            # Display trajectory statistics for first sample
+            if trajectory_stats:
+                print(f"\n📊 Trajectory statistics for {batch.id[i]}:")
+                for key, value in trajectory_stats[0].items():
+                    print(f"    {key}: {value:.4f}")
+
+            # batch_count += 1
+            # if batch_count > 10:
+            #     break
+
+        # Count the number of saved likelihoods that are not NAN
+        nan_count = torch.isnan(torch.tensor(all_likelihoods)).sum().item()
+        if len(all_likelihoods) - nan_count >= 500:
+            break
+        else:
+            print(f"Number of saved likelihoods: {len(all_likelihoods)}")
+            print(f"Number of NANs: {nan_count}")
+
+    return all_likelihoods, [f"{dataset_name}_{i}" for i in range(len(all_likelihoods))]
+
+
+def main(dataset_path, checkpoint_path, results_folder, num_steps, num_hutchinson_samples):
+    
+    # Configuration
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    print(f"Device: {device}")
+    print(f"Number of integration steps: {num_steps}")
+    print(f"Number of Hutchinson samples: {num_hutchinson_samples}")
+    print()
+    
+    # Check file existence
+    for path in [dataset_path, checkpoint_path]:
+        name = os.path.basename(path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"{name} not found at {path}")
+        print(f"Found {name}: {path}")
+    
+    # Load datasets and model
+    print("\nLoading dataset and model...")
+    dataset = torch.load(dataset_path)
+    name = os.path.basename(dataset_path)
+
+    model = load_checkpoint(checkpoint_path)
+    
+    
+    # Create likelihood evaluator
+    evaluator = create_molecular_likelihood_evaluator_from_model(
+        model,
+        num_steps=num_steps,
+        num_hutchinson_samples=num_hutchinson_samples,
+    )
+    
+    # Process dataset
+    ood_likelihoods, ood_ids = process_dataset(dataset, evaluator, device, name)
+    
+    # Compute statistics
+    ood_mean = np.mean(ood_likelihoods)
+    ood_std = np.std(ood_likelihoods)
+    
+    # Print results
+    print("\n" + "="*60)
+    print("LIKELIHOOD RESULTS")
+    print("="*60)
+    print(f"{name} (n={len(ood_likelihoods)}):")
+    print(f"  Mean log-likelihood: {ood_mean:.4f}")
+    print(f"  Std log-likelihood:  {ood_std:.4f}")
+    print(f"  Min log-likelihood:  {min(ood_likelihoods):.4f}")
+    print(f"  Max log-likelihood:  {max(ood_likelihoods):.4f}")
+    print("="*60)
+
+    results_file = os.path.join(results_folder, f'{name}')
+    torch.save(ood_likelihoods, results_file)
+
+    print(f"\nLog-likelihoods saved to: {results_file}")
+
 if __name__ == '__main__':
-    test_trajectory_ood_detection()
+    # test_trajectory_ood_detection()
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset_path', default='dataset_cleansplit_train.pt', type=str)
+    parser.add_argument('--checkpoint_path', default='training_runs/0725_115513_dataset_cleansplit_train/checkpoint_epoch_579.pt', type=str)
+    parser.add_argument('--results_folder', default='likelihood_results', type=str)
+    parser.add_argument('--num_steps', type=int, default=10)
+    parser.add_argument('--num_hutchinson_samples', type=int, default=20)
+    args = parser.parse_args()
+
+    main(args.dataset_path, args.checkpoint_path, args.results_folder, args.num_steps, args.num_hutchinson_samples)

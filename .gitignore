@@ -11,6 +11,6 @@ optimization_runs/
 optimization_results/
 training_runs/
 diffsbdd_stuff/
-lkhd_results/
+lkhd_results*/
 samples/
 combine_csvs.py
