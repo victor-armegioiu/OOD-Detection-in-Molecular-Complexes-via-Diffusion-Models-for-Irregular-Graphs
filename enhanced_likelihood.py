@@ -999,26 +999,7 @@ def main(dataset_path, checkpoint_path, results_folder, num_steps, num_hutchinso
     )
     
     # Process dataset
-    likelihoods, metrics = process_dataset(dataset, evaluator, device, name)
-    
-    # Compute statistics
-    ood_mean = np.mean(likelihoods)
-    ood_std = np.std(likelihoods)
-    
-    # Print results
-    print("\n" + "="*60)
-    print("LIKELIHOOD RESULTS")
-    print("="*60)
-    print(f"{name} (n={len(likelihoods)}):")
-    print(f"  Mean log-likelihood: {ood_mean:.4f}")
-    print(f"  Std log-likelihood:  {ood_std:.4f}")
-    print(f"  Min log-likelihood:  {min(likelihoods):.4f}")
-    print(f"  Max log-likelihood:  {max(likelihoods):.4f}")
-    print("="*60)
-
-    # results_file = os.path.join(results_folder, f'{name}')
-    # torch.save(likelihoods, results_file)
-    # print(f"\nLog-likelihoods saved to: {results_file}")
+    metrics = process_dataset(dataset, evaluator, device, name)
 
     with open(os.path.join(results_folder, f'{name.replace(".pt", "")}_metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=4)
