@@ -337,17 +337,15 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
         wandb.watch(model.denoiser, log='all', log_freq=config['log_interval'])
     
     
-    # Early stopping state
+    # Early stopping metrics (k) with worst possible value (w) and direction (d) of improvement
     early_stop_metrics = [
-        'percent_fragmented',
-        'mean_num_fragments',
-        'mean_ring_size',
-        # 'atoms_dist_js_divergence',
-        # 'aa_dist_js_divergence',
-        # 'ring_size_dist_js_divergence'
+        ('percent_fragmented', 1.0, '-'),
+        ('mean_num_fragments', float('inf'), '-'),
+        ('mean_ring_size', 0.0, '+')
     ]
-    best_metrics = {k: float('inf') for k in early_stop_metrics}
-    best_epoch = {k: -1 for k in early_stop_metrics}
+
+    best_metrics = {k: w for k, w, _ in early_stop_metrics}
+    best_epoch = {k: -1 for k, _, _ in early_stop_metrics}
     patience_counter = 0
     early_stopped = False
     eval_history = []  # For debugging/logging
@@ -493,32 +491,44 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             eval_log['eval_epoch'] = epoch + 1
             wandb.log(eval_log)
 
+
             # Early stopping logic
+            # ------------------------------------------------------------------------------------
             print(f"\n ----- Epoch {epoch+1}: Early Stopping Logic: -----")
+            print(f"Early stopping metrics: {[k for k, _, _ in early_stop_metrics]}")
+            eval_history.append({k: eval_losses.get(k, w) for k, w, _ in early_stop_metrics})
+
             improved = False
-            for k in early_stop_metrics:
-                v = eval_losses.get(k, float('inf'))
-                if v < best_metrics[k]:
+            for k, w, d in early_stop_metrics:
+                v = eval_losses.get(k, w) # Fallback to worst possible value if metric not found
+                if v < best_metrics[k] and d == '-':
+                    print(f"    Improved {k} from {best_metrics[k]} to {v}")
                     best_metrics[k] = v
                     best_epoch[k] = epoch
                     improved = True
-            eval_history.append({k: eval_losses.get(k, float('inf')) for k in early_stop_metrics})
+                elif v > best_metrics[k] and d == '+':
+                    print(f"    Improved {k} from {best_metrics[k]} to {v}")
+                    best_metrics[k] = v
+                    best_epoch[k] = epoch
+                    improved = True
+                else:
+                    print(f"    No improvement in {k} from {best_metrics[k]} to {v}")
+
             if improved:
                 patience_counter = 0
-                # Save all metrics for this best epoch (eval_losses and epoch_metrics)
                 best_epoch_metrics = {**eval_losses, **epoch_metrics}
                 best_epoch_idx = epoch
-                print("[Early Stopping] Early Stopping Patience Reset. Model improved on metrics:")
-                for k in early_stop_metrics:
-                    print(f"    {k}: {best_metrics[k]}")
+                print("[Early Stopping] Early Stopping Patience Reset.")
+
             else:
                 patience_counter += 1
                 print(f"[Early Stopping] Patience Counter: {patience_counter} / {config['early_stopping_patience']}")
 
             if patience_counter >= config['early_stopping_patience']:
-                print(f"[EARLY STOPPING] No improvement in {early_stop_metrics} for {config['early_stopping_patience']} evaluation intervals ({config['eval_interval']} epochs each). Stopping at epoch {epoch+1}.")
+                print(f"[Early Stopping] No improvement in for {config['early_stopping_patience']} evaluation intervals ({config['eval_interval']} epochs each). Stopping at epoch {epoch+1}.")
                 early_stopped = True
                 break
+            # ------------------------------------------------------------------------------------
         
         print(f"\n ===== Epoch {epoch+1:3d} - Average Loss: {avg_epoch_loss:.4f} =====\n", flush=True)
     
