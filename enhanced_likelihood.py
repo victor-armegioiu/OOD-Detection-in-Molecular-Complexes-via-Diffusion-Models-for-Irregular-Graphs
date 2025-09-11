@@ -6,11 +6,16 @@ during forward integration for improved OOD detection beyond just likelihood sco
 """
 
 import torch
+import json
+import argparse
 import numpy as np
-from typing import Tuple, Optional, Callable, Mapping, Any, NamedTuple, Protocol, Dict, List
+from typing import Tuple, Optional, Callable, Mapping, Any, NamedTuple, Protocol, Dict, List, Union
 from torch.autograd import grad
 from torch_scatter import scatter_mean
 import torch.nn.functional as F
+import os
+from torch_geometric.loader import DataLoader
+from torch_geometric.data import Data
 import torch.utils.checkpoint as checkpoint
 
 from dataclasses import dataclass
@@ -20,6 +25,9 @@ from molecular_samplers import (
     MolecularSdeDynamics, MolecularEulerMaruyamaStep, remove_mean_batch,
     create_molecular_denoiser_wrapper, edm_noise_decay, dlog_dt, dsquare_dt
 )
+from metrics import load_checkpoint
+from Dataset import PDBbind_Dataset
+
 
 Tensor = torch.Tensor
 TensorMapping = Mapping[str, Tensor]
@@ -993,7 +1001,7 @@ def process_dataset(dataset, evaluator, device, dataset_name):
 
             all_metrics[batch.id[i]] = {'log_likelihood': float(log_likelihood.item())}
             if trajectory_stats:
-                trajectory_stats = {k: np.float32(v) for k, v in trajectory_stats[0].items()}
+                trajectory_stats = {k: float(v) for k, v in trajectory_stats[0].items()}
                 all_metrics[batch.id[i]].update(trajectory_stats)
 
             # batch_count += 1
@@ -1026,7 +1034,6 @@ def main(dataset_path, checkpoint_path, results_folder, num_steps, num_hutchinso
     name = os.path.basename(dataset_path)
 
     model = load_checkpoint(checkpoint_path)
-    
     
     # Create likelihood evaluator
     evaluator = create_molecular_likelihood_evaluator_from_model(
