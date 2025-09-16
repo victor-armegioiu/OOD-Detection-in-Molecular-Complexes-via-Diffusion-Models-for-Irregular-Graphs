@@ -109,12 +109,11 @@ CONFIG = {
 # Hyperparameter search spaces
 HYPERPARAM_SPACES = {
     'num_sampling_steps': [50, 100, 200, 300, 400],
-    'joint_nf': [32, 64, 128],#, 256],
-    'hidden_nf': [64, 128],#, 256],
-    'n_layers': [2, 4, 6],#, 8],
-    'edge_embedding_dim': [8, 16, 32],#, 64],
-    'learning_rate': [5e-4, 1e-3, 5e-3],
-    # 'learning_rate': [5e-5, 1e-4, 5e-4, 1e-3, 5e-3],
+    'joint_nf': [32, 64, 128, 256],
+    'hidden_nf': [64, 128, 256],
+    'n_layers': [4, 6, 8],
+    'edge_embedding_dim': [8, 16, 32, 64],
+    'learning_rate': [5e-5, 1e-4, 5e-4, 1e-3, 5e-3],
     'batch_size': [16, 32, 64, 128]
 }
 
