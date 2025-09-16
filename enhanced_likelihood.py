@@ -522,7 +522,7 @@ class MolecularLikelihoodEvaluator:
         self, 
         clean_state: MolecularState, 
         cond: TensorMapping | None = None,
-        checkpoint_segments: int = 10
+        checkpoint_segments: int = 20
     ) -> Tuple[MolecularState, Tensor, Dict[str, float]]:
         """Forward integrate with trajectory statistics collection for single sample using gradient checkpointing"""
         
@@ -938,14 +938,29 @@ def test_trajectory_ood_detection():
         traceback.print_exc()
 
 
-def process_dataset(dataset, evaluator, device, dataset_name):
+
+def save_dict_to_json(data, output_path):
+    ''' Save dictionary to JSON file. Initialize new file if it doesn't exist. Append to existing file if it does.'''
+    if os.path.exists(output_path):
+        with open(output_path, 'r') as f:
+            existing_data = json.load(f)
+        existing_data.update(data)
+        with open(output_path, 'w') as f:
+            json.dump(existing_data, f, indent=4)
+    else:
+        with open(output_path, 'w') as f:
+            json.dump(data, f, indent=4)
+    print(f"Results saved to: {output_path}")
+
+
+def process_dataset(dataset, evaluator, device, dataset_name, output_path):
     """Process a dataset and return likelihood statistics"""
-    print(f"\nProcessing {dataset_name}...")
+    print(f"\nProcessing {dataset_name}...", flush=True)
     
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, follow_batch=['lig_coords', 'prot_coords'])
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, follow_batch=['lig_coords', 'prot_coords'])
     
     all_metrics = {}
-    # batch_count = 0
+    batch_count = 0
     
     for batch in dataloader:
         batch = batch.to(device)
@@ -997,31 +1012,42 @@ def process_dataset(dataset, evaluator, device, dataset_name):
             )
 
             # Evaluate likelihood for this molecule
-            log_likelihood, trajectory_stats = evaluator.evaluate_likelihood_with_stats(state)
+            try:
+                log_likelihood, trajectory_stats = evaluator.evaluate_likelihood_with_stats(state)
+            except Exception as e:
+                print(f"Error evaluating likelihood for molecule {batch.id[i]}: {e}")
+                continue
 
             all_metrics[batch.id[i]] = {'log_likelihood': float(log_likelihood.item())}
             if trajectory_stats:
                 trajectory_stats = {k: float(v) for k, v in trajectory_stats[0].items()}
                 all_metrics[batch.id[i]].update(trajectory_stats)
-
-            # batch_count += 1
-            # if batch_count > 10:
-            #     break
         
+        # Intermediate save if batch_count is a multiple of 10
+        if batch_count == 0 or batch_count % 10 == 0:
+            save_dict_to_json(all_metrics, output_path)
+        batch_count += 1
+
+    save_dict_to_json(all_metrics, output_path)
     return all_metrics
 
 
-def main(dataset_path, checkpoint_path, results_folder, num_steps, num_hutchinson_samples):
+def main(dataset_path, checkpoint_path, results_folder, num_steps, num_hutchinson_samples, start_idx=None, stop_idx=None):
     
     # Configuration
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     print(f"Device: {device}")
+    print(f"Dataset path: {dataset_path}")
+    print(f"Checkpoint path: {checkpoint_path}")
+    print(f"Results folder: {results_folder}")
     print(f"Number of integration steps: {num_steps}")
     print(f"Number of Hutchinson samples: {num_hutchinson_samples}")
+    if start_idx is not None and stop_idx is not None:
+        print(f"Processing dataset slice: indices {start_idx} to {stop_idx-1}")
     print()
     
-    # Check file existence
+    # Check checkpoint existence
     for path in [dataset_path, checkpoint_path]:
         name = os.path.basename(path)
         if not os.path.exists(path):
@@ -1029,24 +1055,68 @@ def main(dataset_path, checkpoint_path, results_folder, num_steps, num_hutchinso
         print(f"Found {name}: {path}")
     
     # Load datasets and model
-    print("\nLoading dataset and model...")
-    dataset = torch.load(dataset_path)
+    print("\nLoading dataset and model...", flush=True)
+    full_dataset = torch.load(dataset_path)
     name = os.path.basename(dataset_path)
+    
+    # Apply slicing if specified
+    if start_idx is not None and stop_idx is not None:
+        print(f"Slicing dataset: using indices {start_idx} to {stop_idx-1}")
+        
+        if hasattr(full_dataset, 'input_data') and hasattr(full_dataset, '__len__'):
+            # This is a PDBbind_Dataset with input_data dictionary
+            total_size = len(full_dataset)
+            print(f"Total dataset length: {total_size}")
+            
+            # Clamp indices to valid range
+            start_idx = max(0, start_idx)
+            stop_idx = min(total_size, stop_idx)
+            
+            if start_idx >= stop_idx:
+                raise ValueError(f"Invalid slice range: start_idx ({start_idx}) >= stop_idx ({stop_idx})")
+            
+            # Create sliced input_data dictionary
+            sliced_input_data = {}
+            slice_idx = 0
+            for original_idx in range(start_idx, stop_idx):
+                if original_idx in full_dataset.input_data:
+                    sliced_input_data[slice_idx] = full_dataset.input_data[original_idx]
+                    slice_idx += 1
+            
+            # Create a new dataset instance with sliced input_data
+            dataset = PDBbind_Dataset.create_sliced_dataset(sliced_input_data)
+            
+            print(f"Sliced dataset length: {len(dataset)}")
+            del full_dataset
+        
+        else:
+            raise ValueError("Dataset does not support length operation for slicing")
+    else:
+        dataset = full_dataset
+        print(f"Using full dataset, size: {len(dataset) if hasattr(dataset, '__len__') else 'unknown'}")
+
 
     model = load_checkpoint(checkpoint_path)
     
     # Create likelihood evaluator
+    print("\nCreating likelihood evaluator...", flush=True)
     evaluator = create_molecular_likelihood_evaluator_from_model(
         model,
         num_steps=num_steps,
         num_hutchinson_samples=num_hutchinson_samples,
     )
     
-    # Process dataset
-    metrics = process_dataset(dataset, evaluator, device, name)
+    # Determine save path
+    output_filename = f'{name.replace(".pt", "")}_metrics.json'
+    if start_idx is not None and stop_idx is not None:
+        output_filename = f'{name.replace(".pt", "")}_metrics_{start_idx}_{stop_idx}.json'    
+    output_path = os.path.join(results_folder, output_filename)
 
-    with open(os.path.join(results_folder, f'{name.replace(".pt", "")}_metrics.json'), 'w') as f:
-        json.dump(metrics, f, indent=4)
+    # -----------------------------------------------------------
+    #metrics = process_dataset(dataset, evaluator, device, name, output_path)
+    # -----------------------------------------------------------
+    
+    print(f"Done! Processed {len(metrics)} graphs.")
 
     
 
@@ -1059,6 +1129,8 @@ if __name__ == '__main__':
     parser.add_argument('--results_folder', default='likelihood_results', type=str)
     parser.add_argument('--num_steps', type=int, default=10)
     parser.add_argument('--num_hutchinson_samples', type=int, default=20)
+    parser.add_argument('--start_idx', type=int, default=None, help='Start index for dataset slicing (inclusive)')
+    parser.add_argument('--stop_idx', type=int, default=None, help='Stop index for dataset slicing (exclusive)')
     args = parser.parse_args()
 
-    main(args.dataset_path, args.checkpoint_path, args.results_folder, args.num_steps, args.num_hutchinson_samples)
+    main(args.dataset_path, args.checkpoint_path, args.results_folder, args.num_steps, args.num_hutchinson_samples, args.start_idx, args.stop_idx)
