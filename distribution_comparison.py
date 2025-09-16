@@ -1,7 +1,7 @@
 """
 Distribution Comparison Tool
 
-This script loads .pt tensor files from a directory and compares their distributions
+This script loads .json metrics files from a directory and compares the distributions of a given metric between the files
 visually and statistically. It provides:
 - Histogram plots of all distributions
 - Statistical metrics (mean, std, skewness, kurtosis)
@@ -13,6 +13,7 @@ visually and statistically. It provides:
 
 import os
 import sys
+import json
 import argparse
 import numpy as np
 import torch
@@ -31,11 +32,40 @@ warnings.filterwarnings('ignore')
 plt.style.use('seaborn-v0_8')
 sns.set_palette("husl")
 
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Compare distributions from .json metrics files')
+
+    # Required arguments
+    parser.add_argument('directory', type=str, help='Directory containing .json files')
+    parser.add_argument('--metric', type=str, required=True, help='Metric to compare')
+
+    # Preprocessing options
+    parser.add_argument('--save_plot', '-s', 
+                        help='Path to save the comparison plot')
+    parser.add_argument('--clip_percentiles', nargs=2, type=float, 
+                        help='Clip data to specified percentiles (e.g., 1 99 for 1st to 99th percentile)')
+    parser.add_argument('--cut_outliers', action='store_true',
+                        help='Cut outliers instead of clipping them')
+    parser.add_argument('--normalize_outliers', action='store_true',
+                        help='Normalize outliers using robust scaling (brings outliers closer to main distribution)')
+    parser.add_argument('--normalize_range', nargs=2, type=float,
+                        help='Normalize entire distributions to specified range (e.g., 0 1 for [0,1] range)')
+    parser.add_argument('--merge_patterns', nargs='+', type=str,
+                        help='Patterns to merge datasets (e.g., train validation will merge datasets containing these words)')
+    parser.add_argument('--export', 
+                        help='Path to export processed data as CSV file')
+    parser.add_argument('--figsize', nargs=2, type=int, default=[20, 16], 
+                        help='Figure size as width height (default: 16 12)')
+    
+    return parser.parse_args()
+
+
 class DistributionComparator:
-    """A class to compare multiple distributions from .pt tensor files."""
+    """A class to compare multiple distributions from .json metrics files."""
     
     def __init__(self, 
                 directory_path: str, 
+                metric: str,
                 clip_percentiles: Optional[Tuple[float, float]] = None, 
                 cut_outliers: bool = False,
                 normalize_outliers: bool = False, 
@@ -45,7 +75,7 @@ class DistributionComparator:
         Initialize the comparator with a directory path.
         
         Args:
-            directory_path: Path to directory containing .pt files
+            directory_path: Path to directory containing .json files
             clip_percentiles: Tuple of (lower_percentile, upper_percentile) for clipping, e.g., (1, 99)
             cut_outliers: Whether to cut outliers instead of clipping them
             normalize_outliers: Whether to normalize outliers using robust scaling
@@ -53,6 +83,7 @@ class DistributionComparator:
             merge_patterns: List of patterns to merge datasets (e.g., ['train', 'validation'] will merge datasets containing these words)
         """
         self.directory_path = Path(directory_path)
+        self.metric = metric
         self.clip_percentiles = clip_percentiles
         self.cut_outliers = cut_outliers
         self.normalize_outliers = normalize_outliers
@@ -64,6 +95,7 @@ class DistributionComparator:
         self.pairwise_metrics = {}
 
         print(f"Comparing distributions in {self.directory_path}")
+        print(f"  Metric: {self.metric}")
         print(f"  Clip percentiles: {self.clip_percentiles}")
         print(f"  Cut outliers: {self.cut_outliers}")
         print(f"  Normalize outliers: {self.normalize_outliers}")
@@ -156,6 +188,7 @@ class DistributionComparator:
         
         return processed_data
     
+
     def _merge_datasets_by_patterns(self, loaded_data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         """
         Merge datasets based on specified patterns.
@@ -199,6 +232,7 @@ class DistributionComparator:
         
         return merged_data
     
+
     def export_processed_data(self, export_path: str) -> None:
         """
         Export processed values and their dataset membership to a CSV file.
@@ -229,9 +263,10 @@ class DistributionComparator:
         for dataset_name, data in self.distributions.items():
             print(f"  {dataset_name}: {len(data)} values")
     
+
     def load_distributions(self) -> Dict[str, torch.Tensor]:
         """
-        Load all .pt files from the directory and apply preprocessing.
+        Load all .json files from the directory and apply preprocessing.
         
         Returns:
             Dictionary mapping filename to tensor data
@@ -239,47 +274,47 @@ class DistributionComparator:
         if not self.directory_path.exists():
             raise FileNotFoundError(f"Directory {self.directory_path} does not exist")
             
-        pt_files = list(self.directory_path.glob("*.pt"))
-        if not pt_files:
-            raise FileNotFoundError(f"No .pt files found in {self.directory_path}")
+        json_files = list(self.directory_path.glob("*metrics.json"))
+        if not json_files:
+            raise FileNotFoundError(f"No .json files found in {self.directory_path}")
             
-        print(f"Found {len(pt_files)} .pt files:")
+        print(f"Found {len(json_files)} .json files:")
         
         loaded_data = {}
-        for pt_file in pt_files:
+        for json_file in json_files:
             try:
-                # Load tensor data
-                data = torch.load(pt_file, map_location='cpu')
-                data = torch.tensor(data)
+                print(f"Loading {json_file.name}...")
+                with open(json_file, 'r') as f:
+                    data = json.load(f)
                 
-                # Handle different tensor formats
-                if isinstance(data, torch.Tensor):
-                    # If it's a tensor, flatten it
-                    flat_data = data.flatten().numpy()
-                elif isinstance(data, dict):
-                    # If it's a dict, try to find tensor values
-                    flat_data = self._extract_tensor_from_dict(data)
-                elif isinstance(data, list):
-                    # If it's a list, concatenate all tensors
-                    flat_data = np.concatenate([t.flatten().numpy() if isinstance(t, torch.Tensor) else t for t in data])
-                else:
-                    print(f"Warning: Skipping {pt_file.name} - unsupported data type: {type(data)}")
+                valid_data = []
+                missing_metric_count = 0
+                for cmplx in data.values():
+                    if self.metric in cmplx:
+                        valid_data.append(cmplx[self.metric])
+                    else:
+                        missing_metric_count += 1
+                
+                if not valid_data:
+                    print(f"  Skipping {json_file.name} - no valid data found for metric '{self.metric}'")
                     continue
+
+                data = torch.tensor(valid_data)
+                flat_data = data.flatten().numpy()
+                print(f"  Loaded {json_file.name} with {len(valid_data)} values, {missing_metric_count} missing values")
                 
                 # Remove any NaN or infinite values
                 flat_data = flat_data[np.isfinite(flat_data)]
                 
                 if len(flat_data) == 0:
-                    print(f"Warning: Skipping {pt_file.name} - no valid data")
+                    print(f"Warning: Skipping {json_file.name} - no valid data")
                     continue
                 
                 # Store original data
-                loaded_data[pt_file.stem] = flat_data.copy()
-                
-                print(f"  Loading {pt_file.name}...")
+                loaded_data[json_file.stem] = flat_data.copy()
                 
             except Exception as e:
-                print(f"Warning: Could not load {pt_file.name}: {e}")
+                print(f"Warning: Could not load {json_file.name}: {e}")
                 
         if not loaded_data:
             raise ValueError("No valid distributions could be loaded")
@@ -301,6 +336,7 @@ class DistributionComparator:
         
         return self.distributions
     
+
     def _extract_tensor_from_dict(self, data_dict: dict) -> np.ndarray:
         """Extract tensor data from a dictionary."""
         tensors = []
@@ -387,7 +423,8 @@ class DistributionComparator:
                 }
         
         return self.pairwise_metrics
-    
+
+
     def create_comparison_plot(self, save_path: Optional[str] = None, 
                              figsize: Tuple[int, int] = (16, 12)) -> None:
         """
@@ -414,7 +451,7 @@ class DistributionComparator:
         
         ax1.set_xlabel('Value')
         ax1.set_ylabel('Density')
-        ax1.set_title('Distribution Comparison', fontsize=16, fontweight='bold')
+        ax1.set_title(f'Distribution Comparison - {self.metric}', fontsize=16, fontweight='bold')
         ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         ax1.grid(True, alpha=0.3)
         
@@ -427,7 +464,7 @@ class DistributionComparator:
         metrics_data = []
         for name, metrics in self.metrics.items():
             metrics_data.append([
-                name.replace('dataset_', ''),
+                name.replace('dataset_', '').replace('_metrics', '').replace('pdbbind_', ''),
                 f"{metrics['mean']:.2e}",
                 f"{metrics['std']:.2e}",
                 f"{metrics['skewness']:.3f}",
@@ -454,7 +491,7 @@ class DistributionComparator:
                 else:
                     cell.set_facecolor('#E8F5E8' if i % 2 == 0 else 'white')
         
-        ax2.set_title('Individual Distribution Metrics', fontsize=14, fontweight='bold', pad=20)
+        ax2.set_title(f'Individual Distribution Metrics - {self.metric}', fontsize=14, fontweight='bold', pad=20)
         
         # Pairwise metrics table
         ax3 = fig.add_subplot(gs[1, 1])
@@ -465,7 +502,7 @@ class DistributionComparator:
             pairwise_data = []
             for pair_name, metrics in self.pairwise_metrics.items():
                 pairwise_data.append([
-                    pair_name.replace('_vs_', ' vs ').replace('dataset_', ''),
+                    pair_name.replace('_vs_', ' vs ').replace('dataset_', '').replace('_metrics', '').replace('pdbbind_', ''),
                     f"{metrics['wasserstein_distance']:.2e}",
                     f"{metrics['jensen_shannon_divergence']:.3f}",
                     f"{metrics['ks_pvalue']:.3e}"
@@ -490,12 +527,13 @@ class DistributionComparator:
                     else:
                         cell.set_facecolor('#E3F2FD' if i % 2 == 0 else 'white')
             
-            ax3.set_title('Pairwise Distribution Differences', fontsize=14, fontweight='bold', pad=20)
+            ax3.set_title(f'Pairwise Distribution Differences - {self.metric}', fontsize=14, fontweight='bold', pad=20)
         
         # Box plot
         ax4 = fig.add_subplot(gs[2, :])
         data_for_box = [data for data in self.distributions.values()]
         labels = list(self.distributions.keys())
+        labels = [label.replace('_metrics', '').replace('dataset_', '').replace('pdbbind_', '') for label in labels]
         
         bp = ax4.boxplot(data_for_box, labels=labels, patch_artist=True)
         
@@ -505,7 +543,7 @@ class DistributionComparator:
             patch.set_alpha(0.7)
         
         ax4.set_ylabel('Value')
-        ax4.set_title('Distribution Summary (Box Plot)', fontsize=14, fontweight='bold')
+        ax4.set_title(f'Distribution Summary (Box Plot) - {self.metric}', fontsize=14, fontweight='bold')
         ax4.grid(True, alpha=0.3)
         
         # Rotate x-axis labels if they're long
@@ -513,7 +551,7 @@ class DistributionComparator:
             plt.setp(ax4.get_xticklabels(), rotation=45, ha='right')
         
         # Add overall title
-        title_parts = [f'Distribution Comparison Analysis\nDirectory: {self.directory_path}']
+        title_parts = [f'Distribution Comparison Analysis - {self.metric}\nDirectory: {self.directory_path}']
         
         # Add preprocessing information to title
         preprocessing_info = []
@@ -601,27 +639,12 @@ class DistributionComparator:
         
         print("\n" + "="*80)
 
+
 def main():
     """Main function to run the distribution comparison."""
-    parser = argparse.ArgumentParser(description='Compare distributions from .pt tensor files')
-    parser.add_argument('directory', help='Directory containing .pt files')
-    parser.add_argument('--save_plot', '-s', help='Path to save the comparison plot')
-    parser.add_argument('--figsize', nargs=2, type=int, default=[20, 16], 
-                       help='Figure size as width height (default: 16 12)')
-    parser.add_argument('--clip_percentiles', nargs=2, type=float, 
-                       help='Clip data to specified percentiles (e.g., 1 99 for 1st to 99th percentile)')
-    parser.add_argument('--cut_outliers', action='store_true',
-                       help='Cut outliers instead of clipping them')
-    parser.add_argument('--normalize_outliers', action='store_true',
-                       help='Normalize outliers using robust scaling (brings outliers closer to main distribution)')
-    parser.add_argument('--normalize_range', nargs=2, type=float,
-                       help='Normalize entire distributions to specified range (e.g., 0 1 for [0,1] range)')
-    parser.add_argument('--merge_patterns', nargs='+', type=str,
-                       help='Patterns to merge datasets (e.g., train validation will merge datasets containing these words)')
-    parser.add_argument('--export', help='Path to export processed data as CSV file')
-    
-    args = parser.parse_args()
-    
+
+    args = parse_arguments()
+
     try:
         # Parse clip percentiles if provided
         clip_percentiles = None
@@ -646,6 +669,7 @@ def main():
         # Initialize comparator with preprocessing options
         comparator = DistributionComparator(
             args.directory, 
+            metric=args.metric,
             clip_percentiles=clip_percentiles,
             cut_outliers=args.cut_outliers,
             normalize_outliers=args.normalize_outliers,
