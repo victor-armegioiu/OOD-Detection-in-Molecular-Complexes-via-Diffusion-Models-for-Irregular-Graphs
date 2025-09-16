@@ -519,10 +519,10 @@ def test_molecular_likelihood_evaluator():
 
 import argparse
 from typing import List
-from Dataset import PDBbind_Dataset
+from moldiff.Dataset import PDBbind_Dataset
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
-from metrics import load_checkpoint
+from moldiff.metrics import load_checkpoint
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate molecular likelihoods for a dataset.")

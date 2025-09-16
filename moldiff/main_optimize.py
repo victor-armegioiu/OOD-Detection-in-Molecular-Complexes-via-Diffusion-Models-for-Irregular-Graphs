@@ -17,7 +17,7 @@ import json
 import csv
 import random
 from typing import List, Dict, Tuple, Optional
-from Dataset import PDBbind_Dataset
+from moldiff.Dataset import PDBbind_Dataset
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
 from datetime import datetime
@@ -32,14 +32,14 @@ from molecular_diffusion import (
     edm_weighting,
     MolecularDiffusion
 )
-from metrics import (
+from moldiff.metrics import (
     load_checkpoint,
     sample_molecules, 
     evaluate_atom_aa_distributions,
     evaluate_mols,
     build_mol_objects
 )
-from egnn_dynamics import EGNNDynamics
+from moldiff.egnn_dynamics import EGNNDynamics
 import torch.nn.functional as F
 
 # Try to import optuna for Bayesian optimization

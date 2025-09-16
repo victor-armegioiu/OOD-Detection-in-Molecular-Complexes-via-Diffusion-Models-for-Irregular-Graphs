@@ -9,7 +9,7 @@ import numpy as np
 from typing import Callable, Tuple, Optional, Protocol
 from torch_scatter import scatter_mean
 
-from egnn_dynamics import EGNNDynamics, PreconditionedEGNNDynamics
+from moldiff.egnn_dynamics import EGNNDynamics, PreconditionedEGNNDynamics
 
 Tensor = torch.Tensor
 Numeric = float | int | Tensor

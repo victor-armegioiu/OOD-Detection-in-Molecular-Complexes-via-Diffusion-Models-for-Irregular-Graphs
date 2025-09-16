@@ -13,7 +13,7 @@ from torch_geometric.data import Data
 from molecular_diffusion import MolecularDenoisingModel
 import argparse
 from molecular_samplers import create_molecular_sampler_from_model
-import utils
+import moldiff.utils as utils
 from molecular_diffusion import (
     log_uniform_sampling,
     edm_weighting,

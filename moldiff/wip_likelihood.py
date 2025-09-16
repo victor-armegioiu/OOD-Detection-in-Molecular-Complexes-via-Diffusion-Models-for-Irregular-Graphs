@@ -21,10 +21,10 @@ from molecular_samplers import (
     MolecularSdeDynamics, MolecularEulerMaruyamaStep, remove_mean_batch,
     create_molecular_denoiser_wrapper, edm_noise_decay, dlog_dt, dsquare_dt
 )
-from metrics import load_checkpoint
+from moldiff.metrics import load_checkpoint
 
 
-from Dataset import PDBbind_Dataset
+from moldiff.Dataset import PDBbind_Dataset
 
 
 Tensor = torch.Tensor

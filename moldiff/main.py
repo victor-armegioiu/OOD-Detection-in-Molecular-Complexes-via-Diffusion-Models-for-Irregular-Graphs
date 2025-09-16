@@ -13,7 +13,7 @@ import numpy as np
 import os
 import wandb
 from typing import List, Dict
-from Dataset import PDBbind_Dataset
+from moldiff.Dataset import PDBbind_Dataset
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
 from datetime import datetime
@@ -26,12 +26,12 @@ from molecular_diffusion import (
     edm_weighting,
     MolecularDiffusion
 )
-from metrics import (
+from moldiff.metrics import (
     load_checkpoint,
     sample_molecules, 
     evaluate_atom_aa_distributions
 )
-from egnn_dynamics import EGNNDynamics
+from moldiff.egnn_dynamics import EGNNDynamics
 import torch.nn.functional as F
 
 
