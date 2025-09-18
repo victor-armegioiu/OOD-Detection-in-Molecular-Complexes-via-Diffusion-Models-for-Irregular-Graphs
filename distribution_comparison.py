@@ -48,8 +48,6 @@ def parse_arguments():
                         help='Cut outliers instead of clipping them')
     parser.add_argument('--normalize_outliers', action='store_true',
                         help='Normalize outliers using robust scaling (brings outliers closer to main distribution)')
-    parser.add_argument('--normalize_range', nargs=2, type=float,
-                        help='Normalize entire distributions to specified range (e.g., 0 1 for [0,1] range)')
     parser.add_argument('--merge_patterns', nargs='+', type=str,
                         help='Patterns to merge datasets (e.g., train validation will merge datasets containing these words)')
     parser.add_argument('--export', 
@@ -69,7 +67,6 @@ class DistributionComparator:
                 clip_percentiles: Optional[Tuple[float, float]] = None, 
                 cut_outliers: bool = False,
                 normalize_outliers: bool = False, 
-                normalize_range: Optional[Tuple[float, float]] = None,
                 merge_patterns: Optional[List[str]] = None):
         """
         Initialize the comparator with a directory path.
@@ -79,7 +76,6 @@ class DistributionComparator:
             clip_percentiles: Tuple of (lower_percentile, upper_percentile) for clipping, e.g., (1, 99)
             cut_outliers: Whether to cut outliers instead of clipping them
             normalize_outliers: Whether to normalize outliers using robust scaling
-            normalize_range: Tuple of (min_val, max_val) to normalize distributions to, e.g., (0, 1)
             merge_patterns: List of patterns to merge datasets (e.g., ['train', 'validation'] will merge datasets containing these words)
         """
         self.directory_path = Path(directory_path)
@@ -87,7 +83,6 @@ class DistributionComparator:
         self.clip_percentiles = clip_percentiles
         self.cut_outliers = cut_outliers
         self.normalize_outliers = normalize_outliers
-        self.normalize_range = normalize_range
         self.merge_patterns = merge_patterns or []
         self.distributions = {}
         self.original_distributions = {}  # Store original data for reference
@@ -99,7 +94,6 @@ class DistributionComparator:
         print(f"  Clip percentiles: {self.clip_percentiles}")
         print(f"  Cut outliers: {self.cut_outliers}")
         print(f"  Normalize outliers: {self.normalize_outliers}")
-        print(f"  Normalize range: {self.normalize_range}")
         print(f"  Merge patterns: {self.merge_patterns}")
 
         
@@ -172,19 +166,6 @@ class DistributionComparator:
                 processed_data = processed_data[(processed_data > lower_bound) & (processed_data < upper_bound)]
                 print(f"  Cut off outliers at [{lower_percentile}th, {upper_percentile}th] percentiles: "
                     f"[{lower_bound:.2e}, {upper_bound:.2e}]")
-        
-        # Step 3: Normalize entire distribution to specified range (after clipping)
-        if self.normalize_range is not None:
-            target_min, target_max = self.normalize_range
-            data_min = np.min(processed_data)
-            data_max = np.max(processed_data)
-            
-            if data_max > data_min:  # Avoid division by zero
-                # Min-max normalization to target range
-                processed_data = (processed_data - data_min) / (data_max - data_min) * (target_max - target_min) + target_min
-                print(f"  Normalized entire distribution to range [{target_min}, {target_max}]")
-            else:
-                print(f"  Warning: Cannot normalize - all values are identical ({data_min})")
         
         return processed_data
     
@@ -561,8 +542,6 @@ class DistributionComparator:
             preprocessing_info.append("Outliers normalized")
         if self.clip_percentiles is not None:
             preprocessing_info.append(f"Clipped: {self.clip_percentiles[0]}-{self.clip_percentiles[1]}th percentile")
-        if self.normalize_range is not None:
-            preprocessing_info.append(f"Range: [{self.normalize_range[0]}, {self.normalize_range[1]}]")
         
         if preprocessing_info:
             title_parts.append(f"Preprocessing: {', '.join(preprocessing_info)}")
@@ -604,10 +583,6 @@ class DistributionComparator:
         else:
             print("✗ No clipping applied")
             
-        if self.normalize_range is not None:
-            print(f"✓ Range normalization: Normalized to [{self.normalize_range[0]}, {self.normalize_range[1]}]")
-        else:
-            print("✗ No range normalization applied")
         
         print("\nIndividual Distribution Statistics:")
         print("-" * 50)
@@ -656,15 +631,6 @@ def main():
                 raise ValueError("clip_percentiles must be between 0 and 100, with lower < upper")
             clip_percentiles = (lower, upper)
         
-        # Parse normalization range if provided
-        normalize_range = None
-        if args.normalize_range:
-            if len(args.normalize_range) != 2:
-                raise ValueError("normalize_range must specify exactly 2 values (min, max)")
-            min_val, max_val = args.normalize_range
-            if min_val >= max_val:
-                raise ValueError("normalize_range min value must be less than max value")
-            normalize_range = (min_val, max_val)
         
         # Initialize comparator with preprocessing options
         comparator = DistributionComparator(
@@ -673,7 +639,6 @@ def main():
             clip_percentiles=clip_percentiles,
             cut_outliers=args.cut_outliers,
             normalize_outliers=args.normalize_outliers,
-            normalize_range=normalize_range,
             merge_patterns=args.merge_patterns
         )
         
