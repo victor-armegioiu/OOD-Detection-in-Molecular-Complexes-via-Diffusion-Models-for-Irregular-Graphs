@@ -959,12 +959,17 @@ def process_dataset(dataset, evaluator, device, dataset_name, output_path):
     
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, follow_batch=['lig_coords', 'prot_coords'])
     
-    all_metrics = {}
+    # If JSON output_path exists, load it, otherwise initialize empty dictionary
+    if os.path.exists(output_path):
+        with open(output_path, 'r') as f:
+            all_metrics = json.load(f)
+    else:
+        all_metrics = {}
+        
     batch_count = 0
-    
     for batch in dataloader:
         batch = batch.to(device)
-        print("\nStarting batch...")
+        print(f"\nStarting batch...{batch.id}")
         print(batch)
         
         lig_features = batch.lig_features
@@ -998,6 +1003,10 @@ def process_dataset(dataset, evaluator, device, dataset_name, output_path):
         pocket_data = torch.split(pocket_data, torch.bincount(pocket_mask).tolist())
 
         for i in range(len(ligand_data)):
+
+            if batch.id[i] in all_metrics:
+                print(f"Molecule {batch.id[i]} already processed, skipping...")
+                continue
 
             ligand_mask = torch.zeros(ligand_data[i].shape[0], dtype=torch.long, device=device)
             pocket_mask = torch.zeros(pocket_data[i].shape[0], dtype=torch.long, device=device)
@@ -1107,13 +1116,15 @@ def main(dataset_path, checkpoint_path, results_folder, num_steps, num_hutchinso
     )
     
     # Determine save path
-    output_filename = f'{name.replace(".pt", "")}_metrics.json'
     if start_idx is not None and stop_idx is not None:
-        output_filename = f'{name.replace(".pt", "")}_metrics_{start_idx}_{stop_idx}.json'    
+        output_filename = f'{name.replace(".pt", "")}_metrics_{start_idx}_{stop_idx}.json'
+    else:
+        output_filename = f'{name.replace(".pt", "")}_metrics.json'
+    
     output_path = os.path.join(results_folder, output_filename)
 
     # -----------------------------------------------------------
-    #metrics = process_dataset(dataset, evaluator, device, name, output_path)
+    metrics = process_dataset(dataset, evaluator, device, name, output_path)
     # -----------------------------------------------------------
     
     print(f"Done! Processed {len(metrics)} graphs.")
