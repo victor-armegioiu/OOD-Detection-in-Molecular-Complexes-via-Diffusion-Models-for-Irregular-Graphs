@@ -644,6 +644,84 @@ class MolecularSdeSampler(MolecularSampler):
             )
         
         return MolecularSdeDynamics(_molecular_drift, _molecular_diffusion)
+    
+class ConditionalMolecularSdeSampler(MolecularSdeSampler): 
+
+    def __init__(
+        self,
+        ligand_sizes: list[int],
+        pocket_sizes: list[int],
+        scheme: MolecularDiffusion,
+        denoise_fn: MolecularDenoiseFn,
+        tspan: Tensor,
+        integrator: MolecularEulerMaruyama = None,
+        apply_denoise_at_end: bool = True,
+        return_full_paths: bool = False,
+        n_dims: int = 3,
+        atom_nf: int = 10,
+        residue_nf: int = 20,
+        joint_nf: int = 16,
+    ):
+        super().__init__(
+            ligand_sizes=ligand_sizes,
+            pocket_sizes=pocket_sizes,
+            scheme=scheme,
+            denoise_fn=denoise_fn,
+            tspan=tspan,
+            apply_denoise_at_end=apply_denoise_at_end,
+            return_full_paths=return_full_paths,
+            n_dims=n_dims,
+            atom_nf=atom_nf,
+            residue_nf=residue_nf,
+            joint_nf=joint_nf,
+            integrator=integrator
+        )
+
+    def _create_molecular_dynamics(self, cond: TensorMapping | None) -> MolecularSdeDynamics:
+        """
+        Create molecular SDE dynamics.
+        
+        Implements the reverse SDE formula:
+        dx = [2σ̇/σ + ṡ/s]x - [2sσ̇/σ]D(x/s, σ) dt + s√[2σ̇σ] dW
+        """
+        # calculate dynamics with inherited function: MolecularSdeDynamics
+        dynamics = super()._create_molecular_state(cond)
+
+        def _molecular_drift(
+            molecular_state: MolecularState,
+            t: Tensor,
+            params: MolecularParams,
+        ) -> MolecularState:
+            """Molecular drift"""
+            
+            drift_molecular_state = dynamics.drift(molecular_state, t, params)
+
+            return MolecularState(
+                ligand=drift_molecular_state.ligand,
+                pocket=0, # TODO check whether correct
+                ligand_mask=molecular_state.ligand_mask,
+                pocket_mask=molecular_state.pocket_mask,
+                batch_size=molecular_state.batch_size
+            )
+        
+        def _molecular_diffusion(
+            molecular_state: MolecularState,
+            t: Tensor,
+            params: MolecularParams
+        ) -> MolecularState:
+            """Molecular diffusion following GenCFD diffusion computation"""
+            
+            diff_molecular_state = dynamics.diffusion(molecular_state, t, params)
+
+            return MolecularState(
+                ligand=diff_molecular_state.ligand,
+                pocket=0, # TODO check whether correct
+                ligand_mask=molecular_state.ligand_mask,
+                pocket_mask=molecular_state.pocket_mask,
+                batch_size=molecular_state.batch_size
+            )
+        
+        return MolecularSdeDynamics(_molecular_drift, _molecular_diffusion)
 
 
 # ********************

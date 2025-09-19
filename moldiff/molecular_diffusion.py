@@ -565,7 +565,7 @@ class MolecularDenoisingModel:
             true_atom_types, 
             true_residue_types
 
-    ):
+    ) -> MolecularLossResults:
         # Split predictions: coordinates + logits
         pred_coords_lig = pred_output_lig[:, : self.n_dims]  # [N_lig, 3]
         pred_logits_lig = pred_output_lig[:, self.n_dims :]  # [N_lig, atom_nf] - LOGITS
@@ -583,6 +583,104 @@ class MolecularDenoisingModel:
 
         coord_loss_lig = torch.mean(weights_lig * (pred_coords_lig - clean_coords_lig) ** 2)
         coord_loss_pocket = torch.mean(weights_pocket * (pred_coords_pocket - clean_coords_pocket) ** 2)
+        coord_loss = coord_loss_lig + coord_loss_pocket
+
+        # Categorical loss: Cross-entropy between logits and true atom types
+        ce_loss_lig = F.cross_entropy(pred_logits_lig, true_atom_types, reduction="none")
+        ce_loss_pocket = F.cross_entropy(pred_logits_pocket, true_residue_types, reduction="none")
+
+        # Weight categorical loss by noise level (like coordinates)
+        # categorical_loss_lig = torch.mean(weights[lig_mask] * ce_loss_lig)
+        # categorical_loss_pocket = torch.mean(weights[pocket_mask] * ce_loss_pocket)
+        # categorical_loss = categorical_loss_lig + categorical_loss_pocket
+
+        categorical_loss_lig = ce_loss_lig.mean()
+        categorical_loss_pocket = ce_loss_pocket.mean()
+        categorical_loss = categorical_loss_lig + categorical_loss_pocket
+        geometric_loss = self.denoiser.last_geometric_loss
+
+        # Combine losses
+        total_loss = self.coord_loss_weight * coord_loss + self.categorical_loss_weight * categorical_loss + geometric_loss
+
+        return MolecularLossResults(
+            total_loss,
+            coord_loss,
+            categorical_loss,
+            coord_loss_lig,
+            coord_loss_pocket,
+            categorical_loss_lig,
+            categorical_loss_pocket,
+            geometric_loss,
+            pred_coords_lig,
+            pred_coords_pocket,
+            pred_logits_lig,
+            pred_logits_pocket,
+        )
+    
+    # dataclass(frozen=True, kw_only=True)
+class ConditionalMolecularDenoisingModel(MolecularDenoisingModel): 
+    
+    def __post_init__(self):
+        """Initializes the noiser and denoiser components"""
+        super().__post_init__()
+
+        # TODO ask victor whether it even makes sense to freeze them (I would have to take from pretrained), 
+        # or if I can still learn them even though I don't freeze at all
+        # # freeze pocket encoder to lookup embeddings if using pocket conditioning
+        # for param in self.denoiser.residue_encoder.parameters():
+        #         param.requires_grad = False
+        
+    def _noise_clean_embeddings(self, xh_lig_clean, xh_pocket_clean, combined_mask, lig_coords, sigma, lig_mask, pocket_mask) -> Tuple:
+
+        # Generate Gaussian noise for the entire state
+        noise_lig = torch.randn_like(xh_lig_clean, device=self.device)
+        # noise_pocket = torch.randn_like(xh_pocket_clean, device=self.device)
+
+        # Make coordinate noise COM-free (but not embedding noise)
+        noise_lig[:, :self.n_dims] = remove_mean_batch(noise_lig, lig_mask)
+
+        # Add noise
+        sigma_expanded_lig = sigma[lig_mask].unsqueeze(1)  # [N_lig, 1]
+
+        xh_lig_noisy = xh_lig_clean + sigma_expanded_lig * noise_lig
+
+        # return noisy lidand but clean ligand
+        return xh_lig_noisy, xh_pocket_clean
+    
+    def _calculate_loss_from_noisy_embeddings(
+            self, 
+            pred_output_lig, 
+            pred_output_pocket, 
+            sigma, 
+            lig_mask, 
+            pocket_mask, 
+            batch_size, 
+            xh_lig_clean, 
+            xh_pocket_clean, 
+            true_atom_types, 
+            true_residue_types
+
+    ) -> MolecularLossResults:
+        # TODO: clarify whether categorical loss on pocket embeddings stills applies, 
+        # so far all I have changed is the coord loss of pocket to be zero
+
+        # Split predictions: coordinates + logits
+        pred_coords_lig = pred_output_lig[:, :self.n_dims]  # [N_lig, 3]
+        pred_logits_lig = pred_output_lig[:, self.n_dims :]  # [N_lig, atom_nf] - LOGITS
+        pred_coords_pocket = pred_output_pocket[:, : self.n_dims]  # [N_pocket, 3]
+        pred_logits_pocket = pred_output_pocket[:, self.n_dims :]  # [N_pocket, residue_nf] - LOGITS
+
+        # Loss weighting
+        weights = self.noise_weighting(sigma)  # [batch_size]
+        weights_lig = weights[lig_mask].unsqueeze(1)  # [N_lig, 1]
+        # weights_pocket = weights[pocket_mask].unsqueeze(1) 
+
+        # Coordinate loss: L2 between predicted and clean coordinates
+        clean_coords_lig = xh_lig_clean[:, : self.n_dims]
+        # clean_coords_pocket = xh_pocket_clean[:, : self.n_dims]
+
+        coord_loss_lig = torch.mean(weights_lig * (pred_coords_lig - clean_coords_lig) ** 2)
+        coord_loss_pocket = 0# torch.mean(weights_pocket * (pred_coords_pocket - clean_coords_pocket) ** 2)
         coord_loss = coord_loss_lig + coord_loss_pocket
 
         # Categorical loss: Cross-entropy between logits and true atom types

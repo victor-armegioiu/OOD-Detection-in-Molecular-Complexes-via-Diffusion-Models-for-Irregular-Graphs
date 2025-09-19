@@ -20,6 +20,7 @@ from datetime import datetime
 
 # Import our molecular modules
 from moldiff.molecular_diffusion import (
+    ConditionalMolecularDenoisingModel,
     MolecularDenoisingModel, 
     exponential_noise_schedule,
     log_uniform_sampling,
@@ -50,7 +51,7 @@ CONFIG = {
     'edge_embedding_dim': 32, # Edge embeddings
     
     # Training parameters
-    'num_epochs': 1000,
+    'num_epochs': 1,
     'learning_rate': 1e-4,
     'batch_size': 16,
     'log_interval': 20,
@@ -297,8 +298,10 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
     )
     
     noise_weighting = edm_weighting(data_std=1.0)
+
+
     
-    # Create model
+    # Create model (conditional if pocket_conditioning is enabled)
     model = MolecularDenoisingModel(
         atom_nf=config['atom_nf'],
         residue_nf=config['residue_nf'],
@@ -310,8 +313,19 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         update_pocket_coords=config['update_pocket_coords'],
         scheme=scheme,
         noise_sampling=noise_sampling,
-        noise_weighting=noise_weighting, 
-        pocket_conditioning=config["pocket_conditioning"]
+        noise_weighting=noise_weighting
+    ) if not config["pocket_conditioning"] else ConditionalMolecularDenoisingModel(
+        atom_nf=config['atom_nf'],
+        residue_nf=config['residue_nf'],
+        n_dims=config['n_dims'],
+        joint_nf=config['joint_nf'],
+        hidden_nf=config['hidden_nf'],
+        n_layers=config['n_layers'],
+        edge_embedding_dim=config['edge_embedding_dim'],
+        update_pocket_coords=config['update_pocket_coords'],
+        scheme=scheme,
+        noise_sampling=noise_sampling,
+        noise_weighting=noise_weighting
     )
     
     # Propagate device into model dataclass (it is frozen, use object.__setattr__)
