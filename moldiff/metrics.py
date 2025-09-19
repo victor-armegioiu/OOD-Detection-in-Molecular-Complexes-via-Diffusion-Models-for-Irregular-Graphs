@@ -10,17 +10,17 @@ from rdkit.Chem import inchi
 from collections import Counter
 import numpy as np
 from torch_geometric.data import Data
-from molecular_diffusion import MolecularDenoisingModel
 import argparse
-from molecular_samplers import create_molecular_sampler_from_model
+from moldiff.molecular_samplers import create_molecular_sampler_from_model
 import moldiff.utils as utils
-from molecular_diffusion import (
+from moldiff.molecular_diffusion import (
     log_uniform_sampling,
     edm_weighting,
     MolecularDiffusion,
+    MolecularDenoisingModel,
     exponential_noise_schedule
 )
-from constants import (
+from moldiff.constants import (
     ligand_size_distribution, 
     ligand_to_pocket_size_mapping, 
     atom_decoder, 

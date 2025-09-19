@@ -13,8 +13,8 @@ from torch_scatter import scatter_mean
 import torch.nn.functional as F
 
 
-from molecular_diffusion import MolecularDiffusion, remove_mean_batch
-import molecular_diffusion
+from moldiff.molecular_diffusion import MolecularDiffusion, remove_mean_batch
+import moldiff.molecular_diffusion as molecular_diffusion
 
 Tensor = torch.Tensor
 TensorMapping = Mapping[str, Tensor]
@@ -115,6 +115,7 @@ class MolecularEulerMaruyamaStep:
         # Euler-Maruyama update.
         sqrt_dt = torch.sqrt(torch.abs(dt))
         
+        # xt+dt​=xt​+f(xt​,t)dt+g(xt​,t)ξdt
         new_ligand = (
             molecular_state.ligand
             + dt * drift_state.ligand
@@ -182,7 +183,7 @@ class MolecularEulerMaruyama(MolecularEulerMaruyamaStep):
             # Update state with centered coordinates
             new_ligand = torch.cat([
                 combined_coords_centered[:len(current_state.ligand)],
-                current_state.ligand[:, self.n_dims:]
+                current_state.ligand[:, self.n_dims:] # dicrete features
             ], dim=1)
             new_pocket = torch.cat([
                 combined_coords_centered[len(current_state.ligand):],
@@ -552,6 +553,7 @@ class MolecularSdeSampler(MolecularSampler):
             sigma = self.scheme.sigma(t)
             
             # Compute derivatives using automatic differentiation.
+            # Note that d/dt log(s) = d/dt s / s
             dlog_sigma_dt = dlog_dt(self.scheme.sigma)(t)
             dlog_s_dt = 0#dlog_dt(self.scheme.scale)(t)
             
@@ -578,6 +580,7 @@ class MolecularSdeSampler(MolecularSampler):
             drift_coeff = 2 * dlog_sigma_dt + dlog_s_dt
             denoiser_coeff = 2 * dlog_sigma_dt * s
             
+            # Ensure correct shape for coefficients of protein and ligand
             if isinstance(drift_coeff, Tensor):
                 drift_coeff_lig = drift_coeff.expand_as(molecular_state.ligand)
                 drift_coeff_pocket = drift_coeff.expand_as(molecular_state.pocket)
@@ -731,7 +734,7 @@ def edm_noise_decay(
     scheme: molecular_diffusion.MolecularDiffusion,
     rho: int = 7,
     num_steps: int = 256,
-    end_sigma: float | None = 1e-3,
+    end_sigma: float | None = 1e-3, # corresponds to sigma min in equation
     dtype: torch.dtype = torch.float32,
     device: torch.device = None,
 ) -> Tensor:

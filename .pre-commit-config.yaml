@@ -1,5 +1,5 @@
 # .pre-commit-config.yaml
-# better to this in CI than locally
+# better to this in CI than locally: run "pre-commit install" to set up
 # repos:
 # - repo: https://github.com/psf/black
 #   rev: 24.4.2

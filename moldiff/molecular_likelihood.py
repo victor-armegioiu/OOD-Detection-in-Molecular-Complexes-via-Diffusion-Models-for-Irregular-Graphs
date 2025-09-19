@@ -14,7 +14,7 @@ from torch_scatter import scatter_mean
 import torch.nn.functional as F
 
 # Import from the existing molecular sampler module
-from molecular_samplers import (
+from moldiff.molecular_samplers import (
     MolecularState, MolecularDenoiseFn, MolecularSdeCoefficientFn, 
     MolecularSdeDynamics, MolecularEulerMaruyamaStep, remove_mean_batch,
     create_molecular_denoiser_wrapper, edm_noise_decay, dlog_dt, dsquare_dt

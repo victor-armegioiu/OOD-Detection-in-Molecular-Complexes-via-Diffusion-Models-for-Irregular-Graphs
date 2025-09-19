@@ -19,7 +19,7 @@ from torch_geometric.data import Data
 from datetime import datetime
 
 # Import our molecular modules
-from molecular_diffusion import (
+from moldiff.molecular_diffusion import (
     MolecularDenoisingModel, 
     exponential_noise_schedule,
     log_uniform_sampling,
@@ -83,7 +83,10 @@ CONFIG = {
         'notes': 'Training run for molecular diffusion model',
         'log_model': False,
         'log_gradients': False,  # Set to True to log gradient distributions
-    }
+    },
+
+    # Pocket conditioning
+    "pocket_conditioning": False
 }
 
 # Create a run id with a timestamp
@@ -226,6 +229,40 @@ def create_batches_from_dataset(dataset_path: str, config: Dict) -> List[Dict]:
 
     print(f"✅ Created {len(data)} batches from PDBbind dataset")
     return data
+
+def create_schemes(config: Dict) -> MolecularDenoisingModel:
+    """Create molecular model following the GenCFD setup"""
+    
+    # print("Creating molecular diffusion model...")
+    
+    # Create noise schedule
+    sigma_schedule = exponential_noise_schedule(
+        clip_max=config['sigma_max'],
+        base=np.e**0.5,
+        start=0.0,
+        end=5.0,
+        device=config.get('device', 'cpu')
+    )
+    
+    # Create diffusion scheme 
+    scheme = MolecularDiffusion.create_variance_exploding(
+        sigma=sigma_schedule,
+        coord_norm=10.0, # TODO: check if okay.
+        feature_norm=1.0,
+        feature_bias=0.0,
+        device=config.get('device', 'cpu')
+    )
+    
+    # Create noise sampling and weighting
+    noise_sampling = log_uniform_sampling(
+        scheme=scheme,
+        clip_min=config['sigma_min'],
+        uniform_grid=True,
+    )
+    
+    noise_weighting = edm_weighting(data_std=1.0)
+    
+    return scheme, noise_sampling, noise_weighting
     
     
 
@@ -273,7 +310,8 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         update_pocket_coords=config['update_pocket_coords'],
         scheme=scheme,
         noise_sampling=noise_sampling,
-        noise_weighting=noise_weighting
+        noise_weighting=noise_weighting, 
+        pocket_conditioning=config["pocket_conditioning"]
     )
     
     # Propagate device into model dataclass (it is frozen, use object.__setattr__)
@@ -606,7 +644,7 @@ def main():
         
         # 6. Sample new molecules
         samples = sample_molecules(
-            loaded_model,
+            loaded_model, # MolecularDenoisingModel
             num_steps=CONFIG['num_sampling_steps'],
             schedule_type=CONFIG['schedule_type'],
             num_samples=CONFIG['num_eval_samples'],

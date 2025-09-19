@@ -25,7 +25,7 @@ import logging
 import sys
 
 # Import our molecular modules
-from molecular_diffusion import (
+from moldiff.molecular_diffusion import (
     MolecularDenoisingModel, 
     exponential_noise_schedule,
     log_uniform_sampling,

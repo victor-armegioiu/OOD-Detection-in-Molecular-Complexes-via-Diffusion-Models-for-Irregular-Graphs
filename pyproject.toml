@@ -18,8 +18,8 @@ requires-python = ">=3.10"
 # [tool] Holds configuration for local and external tools.
 # Here, it will look for local packages.
 [tool.setuptools.packages.find]
-# where = ["core"]
-include = ["moldiff"]
+where = ["moldiff"]
+# include = ["moldiff"]
 
 [tool.black]
 line-length = 200
