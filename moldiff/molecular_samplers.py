@@ -250,7 +250,7 @@ class MolecularSampler:
         self.pocket_sizes = pocket_sizes
         self.scheme = scheme
         self.denoise_fn = denoise_fn
-        self.tspan = tspan.cuda()
+        self.tspan = tspan.cuda() if torch.cuda.is_available() else tspan.cpu()
         self.apply_denoise_at_end = apply_denoise_at_end
         self.return_full_paths = return_full_paths
         self.n_dims = n_dims
@@ -321,11 +321,11 @@ class MolecularSampler:
         
         # Create masks
         ligand_mask = torch.cat([
-            torch.full((size,), i, dtype=torch.long, device='cuda')
+            torch.full((size,), i, dtype=torch.long, device=self.tspan.device)
             for i, size in enumerate(self.ligand_sizes)
         ])
         pocket_mask = torch.cat([
-            torch.full((size,), i, dtype=torch.long, device='cuda')
+            torch.full((size,), i, dtype=torch.long, device=self.tspan.device)
             for i, size in enumerate(self.pocket_sizes)
         ])
         
@@ -334,11 +334,11 @@ class MolecularSampler:
         initial_scale = self.scheme.scale(self.tspan[0])
         
         ligand_noise = (
-            torch.randn(total_lig_atoms, self.n_dims + self.joint_nf, device='cuda') 
+            torch.randn(total_lig_atoms, self.n_dims + self.joint_nf, device=self.tspan.device) 
             * initial_sigma * initial_scale
         )
         pocket_noise = (
-            torch.randn(total_pocket_atoms, self.n_dims + self.joint_nf, device='cuda')
+            torch.randn(total_pocket_atoms, self.n_dims + self.joint_nf, device=self.tspan.device)
             * initial_sigma * initial_scale
         )
         
@@ -842,7 +842,7 @@ def create_molecular_sampler_from_model(
     """Create a molecular sampler from a trained model"""
     
     # Create time span 
-    # tspan = torch.linspace(1.0, 0.0, num_steps + 1, device='cuda')
+    # tspan = torch.linspace(1.0, 0.0, num_steps + 1, device=self.tspan.device)
     tspan = edm_noise_decay(scheme=model.scheme, num_steps=num_steps)
     
     # Create denoiser wrapper - now passing the scheme for proper normalization

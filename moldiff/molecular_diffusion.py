@@ -478,19 +478,20 @@ class MolecularDenoisingModel:
             xh_lig_clean = torch.cat([lig_coords_centered, lig_embeddings_clean], dim=1)
             xh_pocket_clean = torch.cat([pocket_coords_centered, pocket_embeddings_clean], dim=1)
 
+            # Create sigma tensor for this evaluation (broadcast to batch_size)
+            sigma_batch = torch.full((batch_size, ), sigma_val)
 
             xh_lig_noisy, xh_pocket_noisy = self._noise_clean_embeddings(
             xh_lig_clean, 
             xh_pocket_clean, 
             combined_mask, 
             lig_coords, 
-            sigma_val, 
+            sigma_batch, 
             lig_mask, 
             pocket_mask
             )
 
-            # Create sigma tensor for this evaluation (broadcast to batch_size)
-            sigma_batch = sigma_val
+
 
             # print('In eval:')
             # print('Noise level:', i, sigma_val)
@@ -508,7 +509,7 @@ class MolecularDenoisingModel:
             losses = self._calculate_loss_from_noisy_embeddings(
                 pred_output_lig, 
                 pred_output_pocket, 
-                sigma_val, 
+                sigma_batch, 
                 lig_mask, 
                 pocket_mask, 
                 batch_size, 

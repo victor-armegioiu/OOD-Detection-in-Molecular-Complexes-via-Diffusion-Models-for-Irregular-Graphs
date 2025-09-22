@@ -84,10 +84,7 @@ CONFIG = {
         'notes': 'Training run for molecular diffusion model',
         'log_model': False,
         'log_gradients': False,  # Set to True to log gradient distributions
-    },
-
-    # Pocket conditioning
-    "pocket_conditioning": False
+    }
 }
 
 # Create a run id with a timestamp
@@ -301,7 +298,7 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
 
 
     
-    # Create model (conditional if pocket_conditioning is enabled)
+    # Create model (joint if config['update_pocket_coords'] is enabled else conditional)
     model = MolecularDenoisingModel(
         atom_nf=config['atom_nf'],
         residue_nf=config['residue_nf'],
@@ -314,7 +311,7 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         scheme=scheme,
         noise_sampling=noise_sampling,
         noise_weighting=noise_weighting
-    ) if not config["pocket_conditioning"] else ConditionalMolecularDenoisingModel(
+    ) if config['update_pocket_coords'] else ConditionalMolecularDenoisingModel(
         atom_nf=config['atom_nf'],
         residue_nf=config['residue_nf'],
         n_dims=config['n_dims'],
@@ -612,49 +609,51 @@ def analyze_samples(samples: Dict, config: Dict):
 
 
 def main():
-    """Main pipeline demonstrating the complete molecular diffusion workflow"""
+    # """Main pipeline demonstrating the complete molecular diffusion workflow"""
     
-    print(f"🧬 MOLECULAR DIFFUSION PIPELINE")
-    print(f"Device: {CONFIG['device']}")
-    print(f"Configuration: {CONFIG}")
+    # print(f"🧬 MOLECULAR DIFFUSION PIPELINE")
+    # print(f"Device: {CONFIG['device']}")
+    # print(f"Configuration: {CONFIG}")
     
     try:
-        # 1. Generate training and evaluation data
-        print(f"\n{'='*60}")
-        print("GENERATING TRAINING DATA")
-        print(f"{'='*60}")
+    #     # 1. Generate training and evaluation data
+    #     print(f"\n{'='*60}")
+    #     print("GENERATING TRAINING DATA")
+    #     print(f"{'='*60}")
         
-        # train_data = create_batches_from_dataset(CONFIG['train_dataset_path'], CONFIG)
-        # eval_data = create_batches_from_dataset(CONFIG['eval_dataset_path'], CONFIG)
-        # create random data for demonstration
-        train_data = create_random_training_data(CONFIG)
-        eval_data = create_random_eval_data(CONFIG)
+    #     # train_data = create_batches_from_dataset(CONFIG['train_dataset_path'], CONFIG)
+    #     # eval_data = create_batches_from_dataset(CONFIG['eval_dataset_path'], CONFIG)
+    #     # create random data for demonstration
+    #     train_data = create_random_training_data(CONFIG)
+    #     eval_data = create_random_eval_data(CONFIG)
         
-        # Show example batch 
-        example_batch = train_data[0]
-        print(f"\nExample batch:")
-        print(f"  Ligand atoms: {example_batch['ligand_coords'].shape[0]}")
-        print(f"  Pocket residues: {example_batch['pocket_coords'].shape[0]}")
+    #     # Show example batch 
+    #     example_batch = train_data[0]
+    #     print(f"\nExample batch:")
+    #     print(f"  Ligand atoms: {example_batch['ligand_coords'].shape[0]}")
+    #     print(f"  Pocket residues: {example_batch['pocket_coords'].shape[0]}")
         
-        # 2. Create and initialize model
-        print(f"\n{'='*60}")
-        print("CREATING MODEL")
-        print(f"{'='*60}")
+    #     # 2. Create and initialize model
+    #     print(f"\n{'='*60}")
+    #     print("CREATING MODEL")
+    #     print(f"{'='*60}")
         
-        model = create_molecular_model(CONFIG)
+    #     model = create_molecular_model(CONFIG)
         
-        # 3. Train the model
-        train_model(model, train_data, eval_data, CONFIG)
+    #     # 3. Train the model
+    #     train_model(model, train_data, eval_data, CONFIG)
         
-        # 4. Save checkpoint
-        save_checkpoint(model, CONFIG, save_path=CONFIG['checkpoint_path'].replace(".pt", "_final.pt"))
+    #     # 4. Save checkpoint
+    #     save_checkpoint(model, CONFIG, save_path=CONFIG['checkpoint_path'].replace(".pt", "_final.pt"))
+
+        CONFIG['checkpoint_path'] = 'training_runs/0922_1022_dataset_pdbbind/checkpoint.pt'
         
         # 5. Load checkpoint to demonstrate persistence
         print(f"\n{'='*60}")
         print("LOADING MODEL FROM CHECKPOINT")
         print(f"{'='*60}")
         
-        loaded_model = load_checkpoint(CONFIG['checkpoint_path'])
+        loaded_model = load_checkpoint(CONFIG['checkpoint_path'].replace(".pt", "_final.pt"))
         
         # 6. Sample new molecules
         samples = sample_molecules(
