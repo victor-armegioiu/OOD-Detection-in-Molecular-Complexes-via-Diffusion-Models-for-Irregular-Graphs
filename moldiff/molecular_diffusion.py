@@ -638,7 +638,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         # noise_pocket = torch.randn_like(xh_pocket_clean, device=self.device)
 
         # Make coordinate noise COM-free (but not embedding noise)
-        noise_lig[:, :self.n_dims] = remove_mean_batch(noise_lig, lig_mask)
+        noise_lig[:, :self.n_dims] = remove_mean_batch(noise_lig[:, :self.n_dims], lig_mask)
 
         # Add noise
         sigma_expanded_lig = sigma[lig_mask].unsqueeze(1)  # [N_lig, 1]
@@ -681,7 +681,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         # clean_coords_pocket = xh_pocket_clean[:, : self.n_dims]
 
         coord_loss_lig = torch.mean(weights_lig * (pred_coords_lig - clean_coords_lig) ** 2)
-        coord_loss_pocket = 0# torch.mean(weights_pocket * (pred_coords_pocket - clean_coords_pocket) ** 2)
+        coord_loss_pocket = torch.zeros_like(coord_loss_lig) # torch.mean(weights_pocket * (pred_coords_pocket - clean_coords_pocket) ** 2)
         coord_loss = coord_loss_lig + coord_loss_pocket
 
         # Categorical loss: Cross-entropy between logits and true atom types

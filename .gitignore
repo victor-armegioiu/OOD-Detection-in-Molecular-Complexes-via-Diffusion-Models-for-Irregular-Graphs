@@ -7,6 +7,7 @@ wandb/
 dataset*.pt
 datasets/
 *.pdf
+logs/
 
 optimization_runs/
 optimization_results/

@@ -18,6 +18,7 @@ from moldiff.molecular_diffusion import (
     edm_weighting,
     MolecularDiffusion,
     MolecularDenoisingModel,
+    ConditionalMolecularDenoisingModel,
     exponential_noise_schedule
 )
 from moldiff.constants import (
@@ -65,6 +66,18 @@ def load_checkpoint(checkpoint_path: str) -> MolecularDenoisingModel:
     noise_weighting = edm_weighting(data_std=1.0)
     
     model = MolecularDenoisingModel(
+        atom_nf=model_params['atom_nf'],
+        residue_nf=model_params['residue_nf'],
+        n_dims=model_params['n_dims'],
+        joint_nf=model_params['joint_nf'],
+        hidden_nf=model_params['hidden_nf'],
+        n_layers=model_params['n_layers'],
+        edge_embedding_dim=model_params['edge_embedding_dim'],
+        update_pocket_coords=model_params['update_pocket_coords'],
+        scheme=scheme,
+        noise_sampling=noise_sampling,
+        noise_weighting=noise_weighting
+    ) if model_params['update_pocket_coords'] else ConditionalMolecularDenoisingModel(
         atom_nf=model_params['atom_nf'],
         residue_nf=model_params['residue_nf'],
         n_dims=model_params['n_dims'],
@@ -382,12 +395,13 @@ def build_molecule(positions, atom_types, add_coords=False,
     Returns:
         RDKit molecule
     """
-    if use_openbabel:
-        mol = make_mol_openbabel(positions, atom_types, atom_decoder)
-    else:
-        mol = make_mol_edm(positions, atom_types, dataset_info, add_coords)
+    # if use_openbabel:
+    #     mol = make_mol_openbabel(positions, atom_types, atom_decoder)
+    # else:
+    #     mol = make_mol_edm(positions, atom_types, dataset_info, add_coords)
 
-    return mol
+    # return mol
+    return NotImplementedError
 
 
 

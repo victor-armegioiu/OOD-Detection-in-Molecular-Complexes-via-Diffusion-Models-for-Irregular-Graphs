@@ -6,6 +6,8 @@ All operations are CUDA-optimized.
 """
 
 import torch
+import time
+import warnings
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
@@ -23,10 +25,14 @@ from torch_geometric.data import Data
 from datetime import datetime
 import logging
 import sys
+sys.stdout.reconfigure(line_buffering=True)
+
+from pathlib import Path
 
 # Import our molecular modules
 from moldiff.molecular_diffusion import (
     MolecularDenoisingModel, 
+    ConditionalMolecularDenoisingModel,
     exponential_noise_schedule,
     log_uniform_sampling,
     edm_weighting,
@@ -50,11 +56,13 @@ except ImportError:
     OPTUNA_AVAILABLE = False
     print("Warning: optuna not available. Bayesian optimization will be disabled.")
 
+DATA_PATH = Path("datasets")
+
 
 # Configuration following framework patterns
 CONFIG = {
-    'train_dataset_path': 'dataset_cleansplit.pt',
-    'eval_dataset_path': 'dataset_casf2016.pt',
+    'train_dataset_path': DATA_PATH / 'dataset_cleansplit_train.pt',
+    'eval_dataset_path': DATA_PATH / 'dataset_cleansplit_validation.pt',
 
     # Model parameters
     'atom_nf': 10,            # Number of atom types
@@ -95,8 +103,8 @@ CONFIG = {
     
     # Weights & Biases configuration
     'wandb': {
-        'project': 'molecular-diffusion',
-        'entity': 'dagraber',
+        'project': 'equivariant-diffusion',
+        'entity': 'paertschi-eth',
         'tags': ['molecular-diffusion', 'training'],
         'notes': 'Training run for molecular diffusion model',
         'log_model': False,
@@ -116,6 +124,18 @@ HYPERPARAM_SPACES = {
     'batch_size': [16, 32, 64, 128]
 }
 
+# helpers to measure time and potentially log as warning if using flag --use_warnings from bash
+def log(msg: str, use_warnings: bool = False, flush: bool = True):
+    """Log message to stdout or warnings depending on flag"""
+    if use_warnings:
+        warnings.warn(msg, RuntimeWarning)
+    else:
+        print(msg, flush=flush)
+
+def log_time(msg: str, start: float, end: float, use_warnings: bool = False):
+    """Log timing info with chosen method"""
+    log(f"{msg} completed in {end - start:.2f} seconds", use_warnings)
+
 def parse_arguments():
     """Parse command line arguments"""
     
@@ -127,10 +147,11 @@ def parse_arguments():
     
     
     # Dataset options
-    parser.add_argument('--train_dataset', default='dataset_pdbbind.pt', help='Path to training dataset')
-    parser.add_argument('--eval_dataset', default='dataset_casf2016.pt', help='Path to evaluation dataset')
+    parser.add_argument('--train_dataset', default=DATA_PATH / 'dataset_cleansplit_train.pt', help='Path to training dataset')
+    parser.add_argument('--eval_dataset', default=DATA_PATH / 'dataset_cleansplit_validation.pt', help='Path to evaluation dataset')
     
     # Model parameters (for single mode or to override defaults)
+    parser.add_argument('--freeze_pocket_coords', action='store_false', help='Enables conditional model')
     parser.add_argument('--joint_nf', type=int, help='Joint embedding dimension')
     parser.add_argument('--hidden_nf', type=int, help='Hidden layer size')
     parser.add_argument('--n_layers', type=int, help='Number of EGNN layers')
@@ -156,12 +177,15 @@ def parse_arguments():
     parser.add_argument('--results_file', default='optimization_results.csv', help='Filename for optimization results (CSV format)')
     
     # Wandb options
-    parser.add_argument('--wandb_project', default='molecular-diffusion', help='Wandb project name')
-    parser.add_argument('--wandb_entity', default='dagraber', help='Wandb entity name')
+    parser.add_argument('--wandb_project', default='equivariant-diffusion', help='Wandb project name')
+    parser.add_argument('--wandb_entity', default='paertschi-eth', help='Wandb entity name')
     parser.add_argument('--no_wandb', action='store_true', help='Disable wandb logging')
     
     # Reproducibility options
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+
+    # Debugging
+    parser.add_argument('--use_warnings', action='store_true', help='Enable warnings for debugging')
     
     return parser.parse_args()
 
@@ -176,6 +200,9 @@ def update_config_from_args(config: Dict, args) -> Dict:
         config['eval_dataset_path'] = args.eval_dataset
     
     # Update model parameters if provided
+    # config['update_pocket_coords'] = args.update_pocket_coords or config['update_pocket_coords'] # replaces all falsy values, e.g. also zero
+    if args.freeze_pocket_coords is not None: # just replaces if not None
+        config['update_pocket_coords'] = args.freeze_pocket_coords # is stored as false if flag is present
     if args.joint_nf is not None:
         config['joint_nf'] = args.joint_nf
     if args.hidden_nf is not None:
@@ -232,14 +259,14 @@ def create_batches_from_dataset(dataset_path: str, config: Dict) -> List[Dict]:
         }
         data.append(batch)
 
-    print(f"✅ Created {len(data)} batches from PDBbind dataset")
+    log(f"✅ Created {len(data)} batches from PDBbind dataset")
     return data
     
 
 def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
     """Create molecular model following the GenCFD setup"""
     
-    print("Creating molecular diffusion model...")
+    log("Creating molecular diffusion model...")
     
     # Set random seeds for reproducibility
     if 'seed' in config:
@@ -272,7 +299,7 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
     )
     noise_weighting = edm_weighting(data_std=1.0)
     
-    # Create model
+    # Create model (joint if config['update_pocket_coords'] is enabled else conditional)
     model = MolecularDenoisingModel(
         atom_nf=config['atom_nf'],
         residue_nf=config['residue_nf'],
@@ -282,8 +309,18 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         n_layers=config['n_layers'],
         edge_embedding_dim=config['edge_embedding_dim'],
         update_pocket_coords=config['update_pocket_coords'],
-        geometric_regularization=config['geometric_regularization'],
-        geom_loss_weight=config['geom_loss_weight'],
+        scheme=scheme,
+        noise_sampling=noise_sampling,
+        noise_weighting=noise_weighting
+    ) if config['update_pocket_coords'] else ConditionalMolecularDenoisingModel(
+        atom_nf=config['atom_nf'],
+        residue_nf=config['residue_nf'],
+        n_dims=config['n_dims'],
+        joint_nf=config['joint_nf'],
+        hidden_nf=config['hidden_nf'],
+        n_layers=config['n_layers'],
+        edge_embedding_dim=config['edge_embedding_dim'],
+        update_pocket_coords=config['update_pocket_coords'],
         scheme=scheme,
         noise_sampling=noise_sampling,
         noise_weighting=noise_weighting
@@ -297,9 +334,9 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                 eval_data: List[Dict], config: Dict):
     """Train the molecular diffusion model"""
     
-    print(f"\n{'='*60}")
-    print("TRAINING MOLECULAR DIFFUSION MODEL")
-    print(f"{'='*60}")
+    log(f"\n{'='*60}")
+    log("TRAINING MOLECULAR DIFFUSION MODEL")
+    log(f"{'='*60}")
     
     # Set random seeds for reproducibility
     if 'seed' in config:
@@ -310,6 +347,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
         np.random.seed(seed)
         random.seed(seed)
     
+    log(config['wandb']['project'], config['wandb']['entity'])
     # Initialize wandb
     wandb.init(
         project=config['wandb']['project'],
@@ -366,6 +404,9 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
         }
         
         for batch_idx, batch in enumerate(train_data):
+
+            start = time.perf_counter()
+
             optimizer.zero_grad()
             
             # Forward pass 
@@ -386,7 +427,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             
             # Logging 
             if (batch_idx + 1) % config['log_interval'] == 0:
-                print(f"Epoch {epoch+1:3d}/{config['num_epochs']}, "
+                log(f"Epoch {epoch+1:3d}/{config['num_epochs']}, "
                       f"Batch {batch_idx+1:3d}/{len(train_data)}, "
                       f"Loss: {loss.item():.4f}, "
                       f"Coord: {metrics['coord_loss']:.4f} "
@@ -395,6 +436,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                       f"(L:{metrics['categorical_loss_ligand']:.4f}, P:{metrics['categorical_loss_pocket']:.4f}), "
                       f"σ: {metrics['avg_sigma']:.3f}, "
                       f"Geom: {metrics['geometric_loss_total']:.4f}"
+                      f"Time: {time.perf_counter() - start}"
                       )
                 
                 # Log batch metrics to wandb
@@ -436,10 +478,12 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             'epoch': epoch + 1
         }
         wandb.log(epoch_metrics)
+
+
         
         # Evaluation 
         if (epoch + 1) % config['eval_interval'] == 0 or epoch == 0:
-            print(f"\n--- Evaluation at epoch {epoch+1} ---")
+            log(f"\n--- Evaluation at epoch {epoch+1} ---")
             eval_losses = evaluate_model(model, eval_data)
 
             # Sampling-based losses
@@ -479,8 +523,8 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             }
 
             eval_losses.update(integrity_losses)
-            print("Eval losses:")
-            for key, value in eval_losses.items(): print(f'{key}: {value}')
+            log("Eval losses:")
+            for key, value in eval_losses.items(): log(f'{key}: {value}')
             
             # Log evaluation metrics
             eval_log = {f'eval/{key}': value for key, value in eval_losses.items()}
@@ -501,19 +545,19 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                 # Save all metrics for this best epoch (eval_losses and epoch_metrics)
                 best_epoch_metrics = {**eval_losses, **epoch_metrics}
                 best_epoch_idx = epoch
-                print("[Early Stopping] Early Stopping Patience Reset. Model improved on metrics:")
+                log("[Early Stopping] Early Stopping Patience Reset. Model improved on metrics:")
                 for k in early_stop_metrics:
-                    print(f"    {k}: {best_metrics[k]}")
+                    log(f"    {k}: {best_metrics[k]}")
             else:
                 patience_counter += 1
-                print(f"[Early Stopping] Patience Counter: {patience_counter}")
+                log(f"[Early Stopping] Patience Counter: {patience_counter}")
 
             if patience_counter >= 10:
-                print(f"\n[EARLY STOPPING] No improvement in {early_stop_metrics} for two evaluation intervals ({config['eval_interval']} epochs). Stopping at epoch {epoch+1}.")
+                log(f"\n[EARLY STOPPING] No improvement in {early_stop_metrics} for two evaluation intervals ({config['eval_interval']} epochs). Stopping at epoch {epoch+1}.")
                 early_stopped = True
                 break
         
-        print(f"Epoch {epoch+1:3d} - Average Loss: {avg_epoch_loss:.4f}", flush=True)
+        log(f"Epoch {epoch+1:3d} - Average Loss: {avg_epoch_loss:.4f}", flush=True)
     
     # Save model to wandb if configured
     if config['wandb']['log_model']:
@@ -581,25 +625,25 @@ def save_checkpoint(model: MolecularDenoisingModel, config: Dict, save_path: Non
     }
     if save_path is None:
         torch.save(checkpoint, config['checkpoint_path'])
-        print(f"✅ Checkpoint saved to {config['checkpoint_path']}")
+        log(f"✅ Checkpoint saved to {config['checkpoint_path']}")
     else:
         torch.save(checkpoint, save_path)
-        print(f"✅ Checkpoint saved to {save_path}")
+        log(f"✅ Checkpoint saved to {save_path}")
 
 
 def analyze_samples(samples: Dict, config: Dict):
     """Analyze the generated molecular samples"""
     
-    print(f"\n{'='*60}")
-    print("SAMPLE ANALYSIS")
-    print(f"{'='*60}")
+    log(f"\n{'='*60}")
+    log("SAMPLE ANALYSIS")
+    log(f"{'='*60}")
     
     # Basic statistics 
-    print("Coordinate Statistics:")
-    print(f"  Ligand coords - Mean: {samples['ligand_coords'].mean(dim=0)}")
-    print(f"  Ligand coords - Std:  {samples['ligand_coords'].std(dim=0)}")
-    print(f"  Pocket coords - Mean: {samples['pocket_coords'].mean(dim=0)}")
-    print(f"  Pocket coords - Std:  {samples['pocket_coords'].std(dim=0)}")
+    log("Coordinate Statistics:")
+    log(f"  Ligand coords - Mean: {samples['ligand_coords'].mean(dim=0)}")
+    log(f"  Ligand coords - Std:  {samples['ligand_coords'].std(dim=0)}")
+    log(f"  Pocket coords - Mean: {samples['pocket_coords'].mean(dim=0)}")
+    log(f"  Pocket coords - Std:  {samples['pocket_coords'].std(dim=0)}")
     
     # Check center of mass (should be near zero)
     total_coords = torch.cat([samples['ligand_coords'], samples['pocket_coords']], dim=0)
@@ -610,10 +654,10 @@ def analyze_samples(samples: Dict, config: Dict):
     for i in range(batch_size):
         mol_coords = total_coords[total_mask == i]
         com = mol_coords.mean(dim=0)
-        print(f"  Molecule {i} center of mass: {com}")
+        log(f"  Molecule {i} center of mass: {com}")
     
     # Check molecular geometry reasonableness
-    print(f"\nMolecular Geometry Analysis:")
+    log(f"\nMolecular Geometry Analysis:")
     for i in range(batch_size):
         lig_coords = samples['ligand_coords'][samples['ligand_mask'] == i]
         pocket_coords = samples['pocket_coords'][samples['pocket_mask'] == i]
@@ -622,19 +666,19 @@ def analyze_samples(samples: Dict, config: Dict):
             lig_distances = torch.cdist(lig_coords, lig_coords)
             lig_distances = lig_distances[lig_distances > 0]  # Remove self-distances
             if len(lig_distances) > 0:  # Only calculate stats if we have distances
-                print(f"  Molecule {i} ligand bond lengths - Mean: {lig_distances.mean():.3f}, Min: {lig_distances.min():.3f}")
+                log(f"  Molecule {i} ligand bond lengths - Mean: {lig_distances.mean():.3f}, Min: {lig_distances.min():.3f}")
             else:
-                print(f"  Molecule {i} ligand bond lengths - No valid distances found")
+                log(f"  Molecule {i} ligand bond lengths - No valid distances found")
         
         if len(pocket_coords) > 1:
             pocket_distances = torch.cdist(pocket_coords, pocket_coords)
             pocket_distances = pocket_distances[pocket_distances > 0]
             if len(pocket_distances) > 0:  # Only calculate stats if we have distances
-                print(f"  Molecule {i} pocket distances - Mean: {pocket_distances.mean():.3f}, Min: {pocket_distances.min():.3f}")
+                log(f"  Molecule {i} pocket distances - Mean: {pocket_distances.mean():.3f}, Min: {pocket_distances.min():.3f}")
             else:
-                print(f"  Molecule {i} pocket distances - No valid distances found")
+                log(f"  Molecule {i} pocket distances - No valid distances found")
     
-    print(f"\n✅ Sample analysis completed!")
+    log(f"\n✅ Sample analysis completed!")
 
 
 def generate_grid_search_configs(param_spaces: Dict, max_combinations: int = 100) -> List[Dict]:
@@ -647,7 +691,7 @@ def generate_grid_search_configs(param_spaces: Dict, max_combinations: int = 100
     
     # Limit number of combinations if too many
     if len(all_combinations) > max_combinations:
-        print(f"Warning: {len(all_combinations)} combinations found, limiting to {max_combinations}")
+        log(f"Warning: {len(all_combinations)} combinations found, limiting to {max_combinations}")
         all_combinations = random.sample(all_combinations, max_combinations)
     
     configs = []
@@ -677,7 +721,7 @@ def run_optimization_configs(configs: List[Dict], train_data: List[Dict], eval_d
                              csv_path: str, json_path: str, optimization_id: str, optimization_metrics: List[str]):
 
     for i, config in enumerate(configs):
-        print(f"\n\n\n--- Configuration {i+1}/{len(configs)} ---")
+        log(f"\n\n\n--- Configuration {i+1}/{len(configs)} ---")
 
         # Create name for the individual training run
         run_id = f"{optimization_id}_{i}"
@@ -687,21 +731,21 @@ def run_optimization_configs(configs: List[Dict], train_data: List[Dict], eval_d
             os.makedirs(config['run_dir'])
         config['checkpoint_path'] = f'{config["run_dir"]}/checkpoint.pt'
         
-        print("Main Hyperparameters:")
-        print(f"N-Layers: {config['n_layers']}")
-        print(f"Joint NF: {config['joint_nf']}")
-        print(f"Hidden NF: {config['hidden_nf']}")
-        print(f"Edge Embedding Dim: {config['edge_embedding_dim']}")
-        print(f"Learning Rate: {config['learning_rate']}")
-        print(f"Batch Size: {config['batch_size']}")
-        print(f"Num Sampling Steps: {config['num_sampling_steps']}")
+        log("Main Hyperparameters:")
+        log(f"N-Layers: {config['n_layers']}")
+        log(f"Joint NF: {config['joint_nf']}")
+        log(f"Hidden NF: {config['hidden_nf']}")
+        log(f"Edge Embedding Dim: {config['edge_embedding_dim']}")
+        log(f"Learning Rate: {config['learning_rate']}")
+        log(f"Batch Size: {config['batch_size']}")
+        log(f"Num Sampling Steps: {config['num_sampling_steps']}")
 
         try:
             model = create_molecular_model(config)
             best_metrics, early_stopped = train_model(model, train_data, eval_data, config)
         
         except Exception as e:
-            print(f"Configuration failed: {e}")
+            log(f"Configuration failed: {e}")
             for key in optimization_metrics:
                 config.update({key: float('inf')})
             if csv_path: save_result_to_csv(csv_path, config, run_id, 'failed')
@@ -716,7 +760,7 @@ def run_optimization_configs(configs: List[Dict], train_data: List[Dict], eval_d
         if csv_path: save_result_to_csv(csv_path, config, run_id, status)
         if json_path: save_result_to_json(json_path, config, run_id, status)
 
-        print(f"Configuration {i+1}/{len(configs)} completed")
+        log(f"Configuration {i+1}/{len(configs)} completed")
 
 
 def objective_function(trial, param_spaces: Dict, train_data: List[Dict], eval_data: List[Dict],
@@ -734,8 +778,8 @@ def objective_function(trial, param_spaces: Dict, train_data: List[Dict], eval_d
         os.makedirs(config['run_dir'])
     config['checkpoint_path'] = f'{config["run_dir"]}/checkpoint.pt'
 
-    print(f"\n\n\n[Optuna] Starting trial {trial_number} (run_id: {run_id})")
-    print("[Optuna] Suggesting hyperparameters:")
+    log(f"\n\n\n[Optuna] Starting trial {trial_number} (run_id: {run_id})")
+    log("[Optuna] Suggesting hyperparameters:")
     
     # HYPERPARAMETER SUGGESTIONS
     for param_name, param_values in param_spaces.items():
@@ -743,7 +787,7 @@ def objective_function(trial, param_spaces: Dict, train_data: List[Dict], eval_d
             config[param_name] = trial.suggest_categorical(param_name, param_values)
         elif isinstance(param_values[0], float):
             config[param_name] = trial.suggest_categorical(param_name, param_values)
-        print(f"    {param_name}: {config[param_name]}")
+        log(f"    {param_name}: {config[param_name]}")
     
     try:
         # Create and train model
@@ -756,7 +800,7 @@ def objective_function(trial, param_spaces: Dict, train_data: List[Dict], eval_d
                       best_metrics.get('ring_size_dist_js_divergence', float('inf')))
         
     except Exception as e:
-        print(f"[Optuna] Trial {trial_number} failed with error: {e}")
+        log(f"[Optuna] Trial {trial_number} failed with error: {e}")
         for key in optimization_metrics:
                 config.update({key: float('inf')})
         if csv_path: save_result_to_csv(csv_path, config, run_id, 'failed')
@@ -770,7 +814,7 @@ def objective_function(trial, param_spaces: Dict, train_data: List[Dict], eval_d
     if csv_path: save_result_to_csv(csv_path, config, run_id, status)
     if json_path: save_result_to_json(json_path, config, run_id, status)
 
-    print(f"[Optuna] Trial {trial_number} completed. Final loss: {final_loss}")
+    log(f"[Optuna] Trial {trial_number} completed. Final loss: {final_loss}")
     return final_loss
 
 
@@ -786,7 +830,7 @@ def run_bayesian_optimization(param_spaces: Dict, train_data: List[Dict],
 
     optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))
 
-    print(f"\n[Optuna] Starting Bayesian optimization with {num_trials} trials...")
+    log(f"\n[Optuna] Starting Bayesian optimization with {num_trials} trials...")
     trial_counter = 0
     
     def objective(trial):
@@ -800,20 +844,20 @@ def run_bayesian_optimization(param_spaces: Dict, train_data: List[Dict],
         study_name = optimization_id or f"optuna_study_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     if storage is None:
         storage = f"sqlite:///{study_name}.db"
-    print(f"[Optuna] Using study_name: {study_name}")
-    print(f"[Optuna] Using storage: {storage}")
+    log(f"[Optuna] Using study_name: {study_name}")
+    log(f"[Optuna] Using storage: {storage}")
 
     try:
         study = optuna.load_study(study_name=study_name, storage=storage)
-        print(f"[Optuna] Loaded existing study '{study_name}' from storage.")
+        log(f"[Optuna] Loaded existing study '{study_name}' from storage.")
     except Exception:
         study = optuna.create_study(direction='minimize', study_name=study_name, storage=storage)
-        print(f"[Optuna] Created new study '{study_name}' with storage.")
+        log(f"[Optuna] Created new study '{study_name}' with storage.")
 
     study.optimize(objective, n_trials=num_trials)
-    print(f"[Optuna] Optimization completed. Best trial:")
-    print(f"    Value: {study.best_value}")
-    print(f"    Params: {study.best_params}")
+    log(f"[Optuna] Optimization completed. Best trial:")
+    log(f"    Value: {study.best_value}")
+    log(f"    Params: {study.best_params}")
     
     best_config = CONFIG.copy()
     for param_name in param_spaces.keys():
@@ -828,7 +872,7 @@ def run_hyperparameter_optimization(optimization_type: str, param_spaces: Dict,
                                   train_data: List[Dict], eval_data: List[Dict], 
                                   **kwargs) -> List[Tuple[Dict, float]]:
     
-    print(f"\n{'='*20}" + f"HYPERPARAMETER OPTIMIZATION: {optimization_type.upper()}" + f"{'='*20}\n")
+    log(f"\n{'='*20}" + f"HYPERPARAMETER OPTIMIZATION: {optimization_type.upper()}" + f"{'='*20}\n")
 
     optimization_metrics = [
         # Training losses
@@ -899,19 +943,19 @@ def run_hyperparameter_optimization(optimization_type: str, param_spaces: Dict,
     
     if optimization_type == 'grid':
         configs = generate_grid_search_configs(param_spaces, kwargs.get('max_combinations', 100))
-        print(f"Running grid search with {len(configs)} configurations...")
+        log(f"Running grid search with {len(configs)} configurations...")
         run_optimization_configs(configs, train_data, eval_data, csv_path, json_path, optimization_id, optimization_metrics)
 
     elif optimization_type == 'random':
         configs = generate_random_search_configs(param_spaces, kwargs.get('num_trials', 20))
-        print(f"Running random search with {len(configs)} trials...")
+        log(f"Running random search with {len(configs)} trials...")
         run_optimization_configs(configs, train_data, eval_data, csv_path, json_path, optimization_id, optimization_metrics)
     
     elif optimization_type == 'bayesian':
         num_trials = kwargs.get('num_trials', 20)
         study_name = kwargs.get('study_name', None)
         storage = kwargs.get('storage', None)
-        print(f"Running Bayesian optimization with {num_trials} trials...")
+        log(f"Running Bayesian optimization with {num_trials} trials...")
         
         best_config, best_loss = run_bayesian_optimization(
             param_spaces, 
@@ -936,107 +980,111 @@ def run_hyperparameter_optimization(optimization_type: str, param_spaces: Dict,
     
     # SUMMARY
     results.sort(key=lambda x: x[1]) # Sort results by loss
-    print(f"\n{'='*60}")
-    print("OPTIMIZATION RESULTS SUMMARY")
-    print(f"{'='*60}")
+    log(f"\n{'='*60}")
+    log("OPTIMIZATION RESULTS SUMMARY")
+    log(f"{'='*60}")
     for i, (config, loss) in enumerate(results[:5]):  # Top 5 results
-        print(f"Rank {i+1}: Loss = {loss:.4f}")
-        print(f"  Parameters: {', '.join([f'{k}={v}' for k, v in config.items() if k in param_spaces])}")
+        log(f"Rank {i+1}: Loss = {loss:.4f}")
+        log(f"  Parameters: {', '.join([f'{k}={v}' for k, v in config.items() if k in param_spaces])}")
     
     return results
 
 
 
 def main():
-    """Main pipeline demonstrating the complete molecular diffusion workflow"""
-    
-    # Parse command line arguments
+    """Main pipeline demonstrating the complete molecular diffusion workflow with timing"""
+
     args = parse_arguments()
-    
-    # Update config with command line arguments
+
+    # Add toggle to CONFIG for convenience
+    use_warnings = getattr(args, "use_warnings", False)
+
     global CONFIG
     CONFIG = update_config_from_args(CONFIG, args)
 
-    print(f"🧬 MOLECULAR DIFFUSION PIPELINE")
-    print(f"Mode: {args.mode}")
-    print(f"Device: {CONFIG['device']}")
+    log("🧬 MOLECULAR DIFFUSION PIPELINE", use_warnings)
+    log(f"Mode: {args.mode}", use_warnings)
+    log(f"Device: {CONFIG['device']}", use_warnings)
 
-    # Create output directory for optimization results
     if args.mode != 'single':
         os.makedirs(args.output_dir, exist_ok=True)
-    
+
     try:
         # 1. Generate training and evaluation data
-        print(f"\n{'='*60}")
-        print("GENERATING TRAINING DATA")
-        print(f"{'='*60}")
+        log("="*60 + "\nGENERATING TRAINING DATA\n" + "="*60, use_warnings)
 
+        t0 = time.perf_counter()
         train_data = create_batches_from_dataset(CONFIG['train_dataset_path'], CONFIG)
         eval_data = create_batches_from_dataset(CONFIG['eval_dataset_path'], CONFIG)
-        
-        # Show example batch 
+        t1 = time.perf_counter()
+        log_time("Training/Eval data creation", t0, t1, use_warnings)
+
         example_batch = train_data[0]
-        print(f"\nExample batch:")
-        print(f"  Ligand atoms: {example_batch['ligand_coords'].shape[0]}")
-        print(f"  Pocket residues: {example_batch['pocket_coords'].shape[0]}")
-    
+        log(f"Example batch: Ligand atoms={example_batch['ligand_coords'].shape[0]}, "
+            f"Pocket residues={example_batch['pocket_coords'].shape[0]}",
+            use_warnings)
+
     except Exception as e:
-        print(f"Error generating training data: {e}")
+        log(f"Error generating training data: {e}", use_warnings)
         return
-    
 
     try:
         if args.mode == 'single':
 
-            print(f"\n{'='*60}")
-            print("SINGLE TRAINING RUN")
-            print(f"{'='*60}")
-            
-            # Create run directory and update config
-            run_id = f"{datetime.now().strftime('%m%d_%H%M%S')}_{CONFIG['train_dataset_path'].split('.')[0]}"
+            log("="*60 + "\nSINGLE TRAINING RUN\n" + "="*60, use_warnings)
+
+            # --- Setup ---
+            t_setup_start = time.perf_counter()
+            if isinstance(CONFIG['train_dataset_path'], str):
+                run_id = f"{datetime.now().strftime('%m%d_%H%M%S')}_{CONFIG['train_dataset_path'].split('.')[0]}"
+            elif isinstance(CONFIG['train_dataset_path'], Path): 
+                run_id = f"{datetime.now().strftime('%m%d_%H%M%S')}_{CONFIG['train_dataset_path'].stem}"
+            else:
+                raise TypeError("Unknown train_dataset_path type")
+
             CONFIG['wandb']['name'] = run_id
             CONFIG['run_dir'] = f'training_runs/{run_id}'
-            if not os.path.exists(CONFIG['run_dir']):
-                os.makedirs(CONFIG['run_dir'])
+            os.makedirs(CONFIG['run_dir'], exist_ok=True)
             CONFIG['checkpoint_path'] = f'{CONFIG["run_dir"]}/checkpoint.pt'
+            t_setup_end = time.perf_counter()
+            log_time("Setup", t_setup_start, t_setup_end, use_warnings)
 
-            print(f"Configuration: {CONFIG}")
-
-            print("Main Hyperparameters:")
-            print(f"N-Layers: {CONFIG['n_layers']}")
-            print(f"Joint NF: {CONFIG['joint_nf']}")
-            print(f"Hidden NF: {CONFIG['hidden_nf']}")
-            print(f"Edge Embedding Dim: {CONFIG['edge_embedding_dim']}")
-            print(f"Learning Rate: {CONFIG['learning_rate']}")
-            print(f"Batch Size: {CONFIG['batch_size']}")
-            print(f"Num Sampling Steps: {CONFIG['num_sampling_steps']}")
-            
-            # 2. Create and initialize model
-            print(f"\n{'='*60}")
-            print("CREATING MODEL")
-            print(f"{'='*60}")
-            
+            # --- Model creation ---
+            log("="*60 + "\nCREATING MODEL\n" + "="*60, use_warnings)
+            t_model_start = time.perf_counter()
             model = create_molecular_model(CONFIG)
-            
-            # 3. Train the model
+            t_model_end = time.perf_counter()
+            log_time("Model creation", t_model_start, t_model_end, use_warnings)
+
+            # --- Training ---
+            t_train_start = time.perf_counter()
             best_metrics, early_stopped = train_model(model, train_data, eval_data, CONFIG)
-            
-            # 4. Save checkpoint
+            t_train_end = time.perf_counter()
+            log_time("Training", t_train_start, t_train_end, use_warnings)
+
+            # --- Save checkpoint ---
+            t_ckpt_start = time.perf_counter()
             save_checkpoint(model, CONFIG, save_path=CONFIG['checkpoint_path'].replace(".pt", "_final.pt"))
-            
-            # 5. Load checkpoint to demonstrate persistence
-            print(f"\n{'='*60}")
-            print("LOADING MODEL FROM CHECKPOINT")
-            print(f"{'='*60}")
-            
+            t_ckpt_end = time.perf_counter()
+            log_time("Checkpoint saving", t_ckpt_start, t_ckpt_end, use_warnings)
+
+            # --- Load checkpoint ---
+            log("="*60 + "\nLOADING MODEL FROM CHECKPOINT\n" + "="*60, use_warnings)
+            t_load_start = time.perf_counter()
             loaded_model = load_checkpoint(CONFIG['checkpoint_path'])
-            
-            # 6. Sample new molecules
-            samples = sample_molecules(loaded_model,
-                                        num_steps=CONFIG['num_sampling_steps'],
-                                        schedule_type=CONFIG['schedule_type'],
-                                        num_samples=CONFIG['num_eval_samples']
-                                        )
+            t_load_end = time.perf_counter()
+            log_time("Model loading", t_load_start, t_load_end, use_warnings)
+
+            # --- Sampling ---
+            t_sample_start = time.perf_counter()
+            samples = sample_molecules(
+                loaded_model,
+                num_steps=CONFIG['num_sampling_steps'],
+                schedule_type=CONFIG['schedule_type'],
+                num_samples=CONFIG['num_eval_samples']
+            )
+            t_sample_end = time.perf_counter()
+            log_time("Sampling", t_sample_start, t_sample_end, use_warnings)
 
             for s in range(CONFIG['num_eval_samples']):
                 graph = Data(
@@ -1046,48 +1094,44 @@ def main():
                     pocket_features=samples['pocket_features'][samples['pocket_mask']==s].cpu()
                 )
                 torch.save(graph, CONFIG['run_dir'] + f"/sample_{s}.pt")
-        
-            # 7. Analyze samples
+
+            # --- Analysis ---
+            t_analysis_start = time.perf_counter()
             analyze_samples(samples, CONFIG)
-            
-            print(f"\n🎉 PIPELINE COMPLETED SUCCESSFULLY!")
-            print(f"Checkpoint saved at: {CONFIG['checkpoint_path']}")
-            print(f"Used {torch.cuda.get_device_name()} for computation")
-            
+            t_analysis_end = time.perf_counter()
+            log_time("Analysis", t_analysis_start, t_analysis_end, use_warnings)
+
+            log("🎉 PIPELINE COMPLETED SUCCESSFULLY!", use_warnings)
+            log(f"Checkpoint saved at: {CONFIG['checkpoint_path']}", use_warnings)
+            log(f"Used {torch.cuda.get_device_name()} for computation", use_warnings)
 
         else:
+            log("="*60 + "\nHYPERPARAMETER OPTIMIZATION\n" + "="*60, use_warnings)
+            t_opt_start = time.perf_counter()
 
-            print(f"\n{'='*60}")
-            print("HYPERPARAMETER OPTIMIZATION")
-            
-            # Define parameter spaces for optimization
             param_spaces = {}
             for param_name in ['num_sampling_steps', 'joint_nf', 'hidden_nf', 'n_layers', 
-                             'edge_embedding_dim', 'learning_rate', 'batch_size']:
+                               'edge_embedding_dim', 'learning_rate', 'batch_size']:
                 if hasattr(args, param_name) and getattr(args, param_name) is None:
-                    # Only include parameters that weren't explicitly set via command line
                     param_spaces[param_name] = HYPERPARAM_SPACES[param_name]
-            if not param_spaces:
-                print("No parameters to optimize (all parameters specified via command line)")
-                return
-            print(f"Optimizing parameters: {list(param_spaces.keys())}")
-            
 
-            # Run optimization
-            # --------------------------------------------------------------------------------------
-            optimization_kwargs = {
-                'max_combinations': args.max_combinations,
-                'num_trials': args.num_trials,
-                'study_name': args.study_name,
-                'storage': args.storage,
-            }
-            results = run_hyperparameter_optimization(args.mode, param_spaces, train_data, eval_data, 
-                                                    **optimization_kwargs)
-            # --------------------------------------------------------------------------------------
-            
-        
+            if not param_spaces:
+                log("No parameters to optimize (all specified via CLI)", use_warnings)
+                return
+
+            log(f"Optimizing parameters: {list(param_spaces.keys())}", use_warnings)
+
+            results = run_hyperparameter_optimization(
+                args.mode, param_spaces, train_data, eval_data,
+                max_combinations=args.max_combinations,
+                num_trials=args.num_trials,
+                study_name=args.study_name,
+                storage=args.storage,
+            )
+            t_opt_end = time.perf_counter()
+            log_time("Hyperparameter optimization", t_opt_start, t_opt_end, use_warnings)
+
     except Exception as e:
-        # Log error to wandb if it's initialized
         if wandb.run is not None:
             wandb.run.finish(exit_code=1)
         raise e
@@ -1111,7 +1155,7 @@ def initialize_csv_results(csv_path: str, config_template: Dict, add_columns_sta
         writer = csv.writer(f)
         writer.writerow(columns)
     
-    print(f"CSV results file initialized: {csv_path}")
+    log(f"CSV results file initialized: {csv_path}")
 
 
 
@@ -1135,7 +1179,7 @@ def save_result_to_csv(csv_path: str, config: Dict, run_id: str, status: str = '
         writer = csv.writer(f)
         writer.writerow(row_data)
     
-    print(f"Result saved to CSV: {run_id} - Status: {status}")
+    log(f"Result saved to CSV: {run_id} - Status: {status}")
 
 
 def save_result_to_json(output_path: str, config: Dict, run_id: str, status: str = 'completed'):
@@ -1164,7 +1208,7 @@ def save_result_to_json(output_path: str, config: Dict, run_id: str, status: str
         with open(output_path, 'w') as f:
             json.dump({run_id: serializable_config}, f, indent=2)
     
-    print(f"Configuration results saved to {output_path}")
+    log(f"Configuration results saved to {output_path}")
 
 
 
