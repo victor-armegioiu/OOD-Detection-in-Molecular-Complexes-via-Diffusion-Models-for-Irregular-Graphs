@@ -9,6 +9,7 @@ dataset*.pt
 
 optimization_runs/
 optimization_results/
+GEMS_errors/
 training_runs/
 diffsbdd_stuff/
 lkhd_results*/
