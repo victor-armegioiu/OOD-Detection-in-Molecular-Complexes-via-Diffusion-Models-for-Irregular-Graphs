@@ -53,6 +53,9 @@ class PDBbind_Dataset(Dataset):
         
         super().__init__(root)
 
+        self._indices = None
+        self.transform = None
+
         # Initialize the dataset
         self.filepaths = self._get_file_paths()
         self.logger.info(f"Number of graphs loaded: {len(self.filepaths)}")
@@ -123,12 +126,33 @@ class PDBbind_Dataset(Dataset):
         return processed_data
 
 
+    def __len__(self) -> int:
+        return len(self.input_data)
+
     def len(self) -> int:
         return len(self.input_data)
 
-
     def get(self, idx: int) -> Data:
         return self.input_data[idx]
+
+    @classmethod
+    def create_sliced_dataset(cls, input_data: Dict[int, Data]) -> 'PDBbind_Dataset':
+        """Create a sliced dataset from input_data dictionary."""
+        # Create new instance without calling __init__
+        instance = cls.__new__(cls)
+        
+        # Initialize PyTorch Geometric attributes
+        instance._indices = None
+        instance.transform = None
+        instance.input_data = input_data
+        
+        # Set minimal required attributes
+        instance.data_dir = ""
+        instance.data_split = None
+        instance.dataset = None
+        instance.logger = logging.getLogger(__name__)
+        
+        return instance
 
 
 

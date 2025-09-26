@@ -553,7 +553,7 @@ if __name__ == '__main__':
     for key, value in evaluate_mols(molecules).items():
         print(f'{key}: {value}')
 
-    utils.write_sdf_file(sdf_path='0704_134322_samples.sdf', molecules=molecules)
+    utils.write_sdf_file(sdf_path='samples/0730_110059_bayesian_trial_1_epoch_599.sdf', molecules=molecules)
     
     save_samples_to_graphs(samples, args.n_samples, args.model_path)
 

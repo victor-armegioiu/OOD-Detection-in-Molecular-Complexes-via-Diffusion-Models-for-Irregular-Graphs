@@ -59,19 +59,18 @@ except ImportError:
 DATA_PATH = Path("datasets")
 
 
-# Configuration following framework patterns
 CONFIG = {
     'train_dataset_path': DATA_PATH / 'dataset_cleansplit_train.pt',
     'eval_dataset_path': DATA_PATH / 'dataset_cleansplit_validation.pt',
 
     # Model parameters
-    'atom_nf': 10,            # Number of atom types
-    'residue_nf': 21,         # Number of residue types  
-    'n_dims': 3,              # 3D coordinates
-    'n_layers': 4,            # Number of EGNN layers
-    'joint_nf': 256,          # Even richer shared space
-    'hidden_nf': 128,         # More EGNN capacity
-    'edge_embedding_dim': 32, # Edge embeddings
+    'atom_nf': 10,           
+    'residue_nf': 21,         
+    'n_dims': 3,             
+    'n_layers': 4,           
+    'joint_nf': 256,          
+    'hidden_nf': 128,         
+    'edge_embedding_dim': 32, 
     
     # Training parameters
     'num_epochs': 1000,
@@ -79,7 +78,8 @@ CONFIG = {
     'batch_size': 16,
     'log_interval': 20,
     'eval_interval': 10,
-    'num_eval_samples': 100,
+    'num_eval_samples': 50,
+    'early_stopping_patience': 5,
     
     # Diffusion parameters
     'sigma_max': 100.0,      # Maximum noise level
@@ -92,15 +92,14 @@ CONFIG = {
     'num_sampling_steps': 16,
     'schedule_type': "exponential",
     
-    # Random data generation parameters
-    # 'num_train_batches': 100,
-    # 'num_eval_batches': 20,
-    # 'ligand_size_range': (4, 12),     # Min/max ligand atoms
-    # 'pocket_size_range': (15, 30),   # Min/max pocket residues
-    
     # I/O
     'device': torch.device("cuda"), # if torch.cuda.is_available() else "cpu"),
     
+    # Scheduler, scaler, and seed
+    'use_scheduler': False,
+    'use_amp': False,  # Automatic Mixed Precision training
+    'seed': 42,  # Random seed for reproducibility
+
     # Weights & Biases configuration
     'wandb': {
         'project': 'equivariant-diffusion',
@@ -112,17 +111,25 @@ CONFIG = {
     }
 }
 
-
 # Hyperparameter search spaces
 HYPERPARAM_SPACES = {
     'num_sampling_steps': [50, 100, 200, 300, 400],
     'joint_nf': [32, 64, 128, 256],
     'hidden_nf': [64, 128, 256],
-    'n_layers': [2, 4, 6, 8],
+    'n_layers': [4, 6, 8],
     'edge_embedding_dim': [8, 16, 32, 64],
     'learning_rate': [5e-5, 1e-4, 5e-4, 1e-3, 5e-3],
     'batch_size': [16, 32, 64, 128]
 }
+
+def set_random_seeds(seed: int):
+    """Set random seeds for all random number generators for reproducibility"""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    print(f"✅ Random seeds set to {seed}")
 
 # helpers to measure time and potentially log as warning if using flag --use_warnings from bash
 def log(msg: str, use_warnings: bool = False, flush: bool = True):
@@ -145,7 +152,6 @@ def parse_arguments():
     parser.add_argument('--mode', choices=['single', 'grid', 'random', 'bayesian'], default='single',
         help='Run mode: single training run or hyperparameter optimization')
     
-    
     # Dataset options
     parser.add_argument('--train_dataset', default=DATA_PATH / 'dataset_cleansplit_train.pt', help='Path to training dataset')
     parser.add_argument('--eval_dataset', default=DATA_PATH / 'dataset_cleansplit_validation.pt', help='Path to evaluation dataset')
@@ -162,6 +168,8 @@ def parse_arguments():
     parser.add_argument('--batch_size', type=int, help='Batch size')
     parser.add_argument('--num_epochs', type=int, help='Number of training epochs')
     parser.add_argument('--eval_interval', type=int, help='Interval for evaluation')
+    parser.add_argument('--early_stopping_patience', type=int, help='Patience for early stopping')
+    parser.add_argument('--use_scheduler', action='store_true', help='If the predefined learning rate scheduler should be used')
     
     # Sampling parameters
     parser.add_argument('--num_sampling_steps', type=int, help='Number of sampling steps')
@@ -183,6 +191,10 @@ def parse_arguments():
     
     # Reproducibility options
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    
+    # Checkpoint options
+    parser.add_argument('--resume_checkpoint_path', type=str, default=None, help='Path to checkpoint file to resume training from')
+    parser.add_argument('--resume_epoch', type=int, default=None, help='Epoch to resume training from (if not specified, will be inferred from checkpoint)')
 
     # Debugging
     parser.add_argument('--use_warnings', action='store_true', help='Enable warnings for debugging')
@@ -221,6 +233,10 @@ def update_config_from_args(config: Dict, args) -> Dict:
         config['num_epochs'] = args.num_epochs
     if args.eval_interval is not None:
         config['eval_interval'] = args.eval_interval
+    if args.early_stopping_patience is not None:
+        config['early_stopping_patience'] = args.early_stopping_patience
+    if args.use_scheduler is not None:
+        config['use_scheduler'] = args.use_scheduler
     
     # Update sampling parameters
     if args.num_sampling_steps is not None:
@@ -236,15 +252,24 @@ def update_config_from_args(config: Dict, args) -> Dict:
     if args.seed is not None:
         config['seed'] = args.seed
     
+    # Add checkpoint options to config
+    if args.resume_checkpoint_path is not None:
+        config['resume_checkpoint_path'] = args.resume_checkpoint_path
+    if args.resume_epoch is not None:
+        config['resume_epoch'] = args.resume_epoch
+    
     return config
 
 
 def create_batches_from_dataset(dataset_path: str, config: Dict) -> List[Dict]:
     """Create dataset from PDBbind dataset"""
     data = []
-
     dataset = torch.load(dataset_path)
-    dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, follow_batch=['lig_coords', 'prot_coords'])
+    dataloader = DataLoader(dataset, 
+                            batch_size=config['batch_size'], 
+                            shuffle=True, 
+                            follow_batch=['lig_coords', 'prot_coords']
+                            )
 
     for batch in dataloader:
         batch = {
@@ -266,16 +291,7 @@ def create_batches_from_dataset(dataset_path: str, config: Dict) -> List[Dict]:
 def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
     """Create molecular model following the GenCFD setup"""
     
-    log("Creating molecular diffusion model...")
-    
-    # Set random seeds for reproducibility
-    if 'seed' in config:
-        seed = config['seed']
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        np.random.seed(seed)
-        random.seed(seed)
+    print("Creating molecular diffusion model...")
     
     # Create noise schedule
     sigma_schedule = exponential_noise_schedule(
@@ -311,21 +327,7 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         update_pocket_coords=config['update_pocket_coords'],
         scheme=scheme,
         noise_sampling=noise_sampling,
-        noise_weighting=noise_weighting, 
-        device=config["device"]
-    ) if config['update_pocket_coords'] else ConditionalMolecularDenoisingModel(
-        atom_nf=config['atom_nf'],
-        residue_nf=config['residue_nf'],
-        n_dims=config['n_dims'],
-        joint_nf=config['joint_nf'],
-        hidden_nf=config['hidden_nf'],
-        n_layers=config['n_layers'],
-        edge_embedding_dim=config['edge_embedding_dim'],
-        update_pocket_coords=config['update_pocket_coords'],
-        scheme=scheme,
-        noise_sampling=noise_sampling,
-        noise_weighting=noise_weighting, 
-        device=config["device"]
+        log_weighting=noise_weighting
     )
     
     model.initialize()
@@ -340,15 +342,6 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
     log("TRAINING MOLECULAR DIFFUSION MODEL")
     log(f"{'='*60}")
     
-    # Set random seeds for reproducibility
-    if 'seed' in config:
-        seed = config['seed']
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        np.random.seed(seed)
-        random.seed(seed)
-    
     log(config['wandb']['project'], config['wandb']['entity'])
     # Initialize wandb
     wandb.init(
@@ -360,28 +353,76 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
         config=config
     )
     
-    # optimizer = optim.Adam(model.denoiser.parameters(), lr=config['learning_rate'])
+    # Setup optimizer
     optimizer = optim.AdamW(
         model.denoiser.parameters(),
-        lr=config['learning_rate'],
-    )
-    #scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.8)
+        lr=config['learning_rate'])
+
+    # Setup scheduler
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.8) if config.get('use_scheduler', False) else None
     
-    # Watch model gradients if configured
-    if config['wandb']['log_gradients']:
-        wandb.watch(model.denoiser, log='all', log_freq=config['log_interval'])
+    # Setup scaler for mixed precision training (optional)
+    scaler = torch.cuda.amp.GradScaler() if config.get('use_amp', False) else None
     
+
+    # Load from checkpoint if specified
+    # --------------------------------------------------------------------------------------
+    start_epoch = 0
+    best_metrics = None
+    if 'resume_checkpoint_path' in config and config['resume_checkpoint_path'] is not None:
+        model, checkpoint_config, optimizer_state, scheduler_state, scaler_state, checkpoint_epoch, checkpoint_best_metrics = load_checkpoint_for_resume(config['resume_checkpoint_path'], config)
+        
+        # Load optimizer state if available
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+            print("✅ Optimizer state loaded")
+        
+        # Load scheduler state if available
+        if scheduler_state is not None and scheduler is not None:
+            scheduler.load_state_dict(scheduler_state)
+            print("✅ Scheduler state loaded")
+        
+        # Load scaler state if available
+        if scaler_state is not None and scaler is not None:
+            scaler.load_state_dict(scaler_state)
+            print("✅ Scaler state loaded")
+
+        # Load best metrics if available
+        if checkpoint_best_metrics is not None:
+            best_metrics = checkpoint_best_metrics
+            print("✅ Best metrics loaded from checkpoint")
+
+        # Determine starting epoch
+        if 'resume_epoch' in config and config['resume_epoch'] is not None:
+            start_epoch = config['resume_epoch']
+            print(f"Resuming from specified epoch: {start_epoch}")
+        elif checkpoint_epoch is not None:
+            start_epoch = checkpoint_epoch + 1  # Resume from next epoch
+            print(f"Resuming from checkpoint epoch: {checkpoint_epoch}, starting at epoch: {start_epoch}")
+        else:
+            print("No epoch information found in checkpoint, starting from epoch 0")
+    # --------------------------------------------------------------------------------------
     
-    # Early stopping state
+
+    # Early stopping setup
+    # ----------------------------------------------------------------------------------------------
+    # Early stopping metrics (k) with worst possible value (w) and direction (d) of improvement
     early_stop_metrics = [
-        'percent_fragmented',
-        'mean_num_fragments',
-        # 'atoms_dist_js_divergence',
-        # 'aa_dist_js_divergence',
-        # 'ring_size_dist_js_divergence'
-    ]
-    best_metrics = {k: float('inf') for k in early_stop_metrics}
-    best_epoch = {k: -1 for k in early_stop_metrics}
+        ('percent_fragmented', 1.0, '-'),
+        ('mean_num_fragments', float('inf'), '-'),
+        ('mean_ring_size', 0.0, '+')
+        ]
+
+    # Initialize best metrics - use loaded metrics if available, otherwise use worst possible values
+    if best_metrics is None:
+        best_metrics = {k: w for k, w, _ in early_stop_metrics}
+    else:
+        # Merge loaded best metrics with early stopping metrics
+        for k, w, _ in early_stop_metrics:
+            if k not in best_metrics:
+                best_metrics[k] = w
+    
+    best_epoch = {k: -1 for k, _, _ in early_stop_metrics}
     patience_counter = 0
     early_stopped = False
     eval_history = []  # For debugging/logging
@@ -389,11 +430,17 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
 
     best_epoch_metrics = None
     best_epoch_idx = -1
+    # ----------------------------------------------------------------------------------------------
 
+    # Watch model gradients if configured
+    if config['wandb']['log_gradients']:
+        wandb.watch(model.denoiser, log='all', log_freq=config['log_interval'])
 
+    # ----------------------------------------------------------------------------------------------
     # Training loop
+    # ----------------------------------------------------------------------------------------------
     model.denoiser.train()
-    for epoch in range(config['num_epochs']):
+    for epoch in range(start_epoch, config['num_epochs']):
         epoch_losses = []
         epoch_metrics = {
             'coord_loss': [],
@@ -457,7 +504,8 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                     'batch': batch_idx + 1
                 })
         
-        # scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
         
         # Calculate epoch metrics
         avg_epoch_loss = np.mean(epoch_losses)
@@ -489,8 +537,8 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             eval_losses = evaluate_model(model, eval_data)
 
             # Sampling-based losses
-            save_path = config['checkpoint_path'].replace(".pt", f"_epoch_{epoch}.pt")
-            save_checkpoint(model, config, save_path)
+            save_path = config['checkpoint_path'].replace(".pt", f"_epoch_{epoch + 1}.pt")
+            save_checkpoint(model, config, save_path, optimizer=optimizer, scheduler=scheduler, scaler=scaler, epoch=epoch, best_metrics=best_metrics)
             loaded_model = load_checkpoint(save_path)
             samples = sample_molecules(loaded_model,
                                     num_steps=config['num_sampling_steps'],
@@ -533,18 +581,31 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             eval_log['eval_epoch'] = epoch + 1
             wandb.log(eval_log)
 
+
             # Early stopping logic
+            # ------------------------------------------------------------------------------------
+            print(f"\n ----- Epoch {epoch+1}: Early Stopping Logic: -----")
+            print(f"Early stopping metrics: {[k for k, _, _ in early_stop_metrics]}")
+            eval_history.append({k: eval_losses.get(k, w) for k, w, _ in early_stop_metrics})
+
             improved = False
-            for k in early_stop_metrics:
-                v = eval_losses.get(k, float('inf'))
-                if v < best_metrics[k]:
+            for k, w, d in early_stop_metrics:
+                v = eval_losses.get(k, w) # Fallback to worst possible value if metric not found
+                if v < best_metrics[k] and d == '-':
+                    print(f"    Improved {k} from {best_metrics[k]} to {v}")
                     best_metrics[k] = v
                     best_epoch[k] = epoch
                     improved = True
-            eval_history.append({k: eval_losses.get(k, float('inf')) for k in early_stop_metrics})
+                elif v > best_metrics[k] and d == '+':
+                    print(f"    Improved {k} from {best_metrics[k]} to {v}")
+                    best_metrics[k] = v
+                    best_epoch[k] = epoch
+                    improved = True
+                else:
+                    print(f"    No improvement in {k} from {best_metrics[k]} to {v}")
+
             if improved:
                 patience_counter = 0
-                # Save all metrics for this best epoch (eval_losses and epoch_metrics)
                 best_epoch_metrics = {**eval_losses, **epoch_metrics}
                 best_epoch_idx = epoch
                 log("[Early Stopping] Early Stopping Patience Reset. Model improved on metrics:")
@@ -558,6 +619,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                 log(f"\n[EARLY STOPPING] No improvement in {early_stop_metrics} for two evaluation intervals ({config['eval_interval']} epochs). Stopping at epoch {epoch+1}.")
                 early_stopped = True
                 break
+            # ------------------------------------------------------------------------------------
         
         epoch_times.append(time.perf_counter() - start)
         log(f"Epoch {epoch+1:3d} - Average Loss: {avg_epoch_loss:.4f} - Time: {epoch_times[-1]:.2f} seconds (At this speed, {3600 / epoch_times[-1]:.2f} epochs/hour)", flush=True)
@@ -577,11 +639,10 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
     print(60*"*")
     # Close wandb run
     wandb.finish()
-    return best_epoch_metrics, early_stopped
+    return best_epoch_metrics, early_stopped, optimizer, scheduler, scaler, epoch
 
 
 def evaluate_model(model: MolecularDenoisingModel, eval_data: List[Dict]) -> Dict:
-    """Evaluate the model following """
     
     model.denoiser.eval()
     all_eval_metrics = {}
@@ -604,8 +665,8 @@ def evaluate_model(model: MolecularDenoisingModel, eval_data: List[Dict]) -> Dic
     return averaged_metrics
 
 
-def save_checkpoint(model: MolecularDenoisingModel, config: Dict, save_path: None):
-    """Save model checkpoint"""
+def save_checkpoint(model: MolecularDenoisingModel, config: Dict, save_path: None, optimizer=None, scheduler=None, scaler=None, epoch=None, best_metrics=None):
+    """Save model checkpoint with full reproducibility state"""
     
     checkpoint = {
         'model_state_dict': model.denoiser.state_dict(),
@@ -619,7 +680,6 @@ def save_checkpoint(model: MolecularDenoisingModel, config: Dict, save_path: Non
             'n_layers': model.n_layers,
             'edge_embedding_dim': model.edge_embedding_dim,
             'update_pocket_coords': model.update_pocket_coords,
-            # Save scheme parameters instead of the scheme itself
             'scheme_params': {
                 'coord_norm': model.scheme.coord_norm,
                 'feature_norm': model.scheme.feature_norm,
@@ -629,12 +689,135 @@ def save_checkpoint(model: MolecularDenoisingModel, config: Dict, save_path: Non
             }
         }
     }
+    
+    # Add epoch information if provided
+    if epoch is not None:
+        checkpoint['epoch'] = epoch
+    
+    # Add optimizer state if provided
+    if optimizer is not None:
+        checkpoint['optimizer_state_dict'] = optimizer.state_dict()
+    
+    # Add scheduler state if provided
+    if scheduler is not None:
+        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+    
+    # Add scaler state if provided (for mixed precision training)
+    if scaler is not None:
+        checkpoint['scaler_state_dict'] = scaler.state_dict()
+    
+    # Add random number generator states for perfect reproducibility
+    checkpoint['torch_rng_state'] = torch.get_rng_state()
+    checkpoint['cuda_rng_state'] = torch.cuda.get_rng_state_all()
+    
+    # Add best metrics if provided
+    if best_metrics is not None:
+        checkpoint['best_metrics'] = best_metrics
+    
     if save_path is None:
         torch.save(checkpoint, config['checkpoint_path'])
         log(f"✅ Checkpoint saved to {config['checkpoint_path']}")
     else:
         torch.save(checkpoint, save_path)
         log(f"✅ Checkpoint saved to {save_path}")
+
+
+def load_checkpoint_for_resume(checkpoint_path: str, current_config: Dict) -> Tuple[MolecularDenoisingModel, Dict, Optional[Dict], Optional[Dict], Optional[Dict], Optional[Dict], Optional[int], Optional[Dict]]:
+    """Load checkpoint for resuming training with full reproducibility state"""
+    
+    print(f"\nLoading checkpoint for resume from {checkpoint_path}...")
+    checkpoint = torch.load(checkpoint_path, map_location='cuda')
+    
+    # Initialize model using current config, load model state dict from checkpoint,
+    model = create_molecular_model(current_config)
+    model.denoiser.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Get config from checkpoint (for reference, but we use current_config for the model)
+    checkpoint_config = checkpoint.get('config', {})
+    if checkpoint_config:
+        print("⚠️  Note: Model will use current configuration parameters, not checkpoint configuration")
+        print("    This ensures your command line arguments take precedence over saved checkpoint settings")
+    
+    # Get optimizer, scheduler, scaler, epoch, random number generator states, and best metrics if available
+    optimizer_state = checkpoint.get('optimizer_state_dict', None)
+    scheduler_state = checkpoint.get('scheduler_state_dict', None)
+    scaler_state = checkpoint.get('scaler_state_dict', None)
+    epoch = checkpoint.get('epoch', None)
+    torch_rng_state = checkpoint.get('torch_rng_state', None)
+    cuda_rng_state = checkpoint.get('cuda_rng_state', None)
+    best_metrics = checkpoint.get('best_metrics', None)
+    
+    if torch_rng_state is not None:
+        torch.set_rng_state(torch_rng_state.cpu())
+        print("   PyTorch RNG state restored")
+    
+    if cuda_rng_state is not None:
+        torch.cuda.set_rng_state_all([state.cpu() for state in cuda_rng_state])
+        print("   CUDA RNG state restored")
+    
+    if torch_rng_state is None and cuda_rng_state is None and 'seed' in current_config:
+        print("   No RNG states found in checkpoint, setting seeds from config")    
+
+    if optimizer_state is not None:
+        print(f"   Optimizer state found")
+    if scheduler_state is not None:
+        print(f"   Scheduler state found")
+    if scaler_state is not None:
+        print(f"   Scaler state found")
+    if best_metrics is not None:
+        print(f"   Best metrics found")
+    print(f"✅ Checkpoint loaded successfully\n", flush=True)
+
+    return model, checkpoint_config, optimizer_state, scheduler_state, scaler_state, epoch, best_metrics
+
+
+def load_checkpoint_for_resume(checkpoint_path: str, current_config: Dict) -> Tuple[MolecularDenoisingModel, Dict, Optional[Dict], Optional[Dict], Optional[Dict], Optional[Dict], Optional[int], Optional[Dict]]:
+    """Load checkpoint for resuming training with full reproducibility state"""
+    
+    print(f"\nLoading checkpoint for resume from {checkpoint_path}...")
+    checkpoint = torch.load(checkpoint_path, map_location='cuda')
+    
+    # Initialize model using current config, load model state dict from checkpoint,
+    model = create_molecular_model(current_config)
+    model.denoiser.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Get config from checkpoint (for reference, but we use current_config for the model)
+    checkpoint_config = checkpoint.get('config', {})
+    if checkpoint_config:
+        print("⚠️  Note: Model will use current configuration parameters, not checkpoint configuration")
+        print("    This ensures your command line arguments take precedence over saved checkpoint settings")
+    
+    # Get optimizer, scheduler, scaler, epoch, random number generator states, and best metrics if available
+    optimizer_state = checkpoint.get('optimizer_state_dict', None)
+    scheduler_state = checkpoint.get('scheduler_state_dict', None)
+    scaler_state = checkpoint.get('scaler_state_dict', None)
+    epoch = checkpoint.get('epoch', None)
+    torch_rng_state = checkpoint.get('torch_rng_state', None)
+    cuda_rng_state = checkpoint.get('cuda_rng_state', None)
+    best_metrics = checkpoint.get('best_metrics', None)
+    
+    if torch_rng_state is not None:
+        torch.set_rng_state(torch_rng_state.cpu())
+        print("   PyTorch RNG state restored")
+    
+    if cuda_rng_state is not None:
+        torch.cuda.set_rng_state_all([state.cpu() for state in cuda_rng_state])
+        print("   CUDA RNG state restored")
+    
+    if torch_rng_state is None and cuda_rng_state is None and 'seed' in current_config:
+        print("   No RNG states found in checkpoint, setting seeds from config")    
+
+    if optimizer_state is not None:
+        print(f"   Optimizer state found")
+    if scheduler_state is not None:
+        print(f"   Scheduler state found")
+    if scaler_state is not None:
+        print(f"   Scaler state found")
+    if best_metrics is not None:
+        print(f"   Best metrics found")
+    print(f"✅ Checkpoint loaded successfully\n", flush=True)
+
+    return model, checkpoint_config, optimizer_state, scheduler_state, scaler_state, epoch, best_metrics
 
 
 def analyze_samples(samples: Dict, config: Dict):
@@ -748,7 +931,7 @@ def run_optimization_configs(configs: List[Dict], train_data: List[Dict], eval_d
 
         try:
             model = create_molecular_model(config)
-            best_metrics, early_stopped = train_model(model, train_data, eval_data, config)
+            best_metrics, early_stopped, _, _, _, _ = train_model(model, train_data, eval_data, config)
         
         except Exception as e:
             log(f"Configuration failed: {e}")
@@ -798,7 +981,7 @@ def objective_function(trial, param_spaces: Dict, train_data: List[Dict], eval_d
     try:
         # Create and train model
         model = create_molecular_model(config)
-        best_metrics, early_stopped = train_model(model, train_data, eval_data, config)
+        best_metrics, early_stopped, _, _, _, _ = train_model(model, train_data, eval_data, config)
         
         final_loss = (best_metrics.get('atoms_dist_js_divergence', float('inf')) +
                       best_metrics.get('aa_dist_js_divergence', float('inf')) +
@@ -872,8 +1055,6 @@ def run_bayesian_optimization(param_spaces: Dict, train_data: List[Dict],
     return best_config, study.best_value
             
 
-
-
 def run_hyperparameter_optimization(optimization_type: str, param_spaces: Dict, 
                                   train_data: List[Dict], eval_data: List[Dict], 
                                   **kwargs) -> List[Tuple[Dict, float]]:
@@ -925,7 +1106,6 @@ def run_hyperparameter_optimization(optimization_type: str, param_spaces: Dict,
         'ring_size_dist_js_divergence',
         'mean_num_fragments',
         'mean_num_valence_issues',
-
 
         # Distribution losses
         'atoms_dist_kl_divergence',
@@ -981,8 +1161,8 @@ def run_hyperparameter_optimization(optimization_type: str, param_spaces: Dict,
         with open(os.path.join(CONFIG['run_dir'], 'best_config.json'), 'w') as f:
             json.dump(best_config, f, indent=2)
     
-    else: raise ValueError(f"Unknown optimization type: {optimization_type}")
-    
+    else: 
+        raise ValueError(f"Unknown optimization type: {optimization_type}")
     
     # SUMMARY
     results.sort(key=lambda x: x[1]) # Sort results by loss
@@ -1015,9 +1195,16 @@ def main():
     if args.mode != 'single':
         os.makedirs(args.output_dir, exist_ok=True)
 
+    # Set random seed for reproducible data creation
+    if 'seed' in CONFIG:
+        set_random_seeds(CONFIG['seed'])
+
+    # 1. Generate training and evaluation data
+    # --------------------------------------------------------------------------------------
     try:
-        # 1. Generate training and evaluation data
-        log("="*60 + "\nGENERATING TRAINING DATA\n" + "="*60, use_warnings)
+        log(f"\n{'='*60}")
+        log("GENERATING TRAINING DATA")
+        log(f"{'='*60}")
 
         t0 = time.perf_counter()
         train_data = create_batches_from_dataset(CONFIG['train_dataset_path'], CONFIG)
@@ -1033,8 +1220,12 @@ def main():
     except Exception as e:
         log(f"Error generating training data: {e}", use_warnings)
         return
+    # --------------------------------------------------------------------------------------
+
 
     try:
+        # Single training run
+        # --------------------------------------------------------------------------------------
         if args.mode == 'single':
 
             log("="*60 + "\nSINGLE TRAINING RUN\n" + "="*60, use_warnings)
@@ -1051,7 +1242,8 @@ def main():
             CONFIG['wandb']['name'] = run_id
             CONFIG['run_dir'] = f'training_runs/{run_id}'
             os.makedirs(CONFIG['run_dir'], exist_ok=True)
-            CONFIG['checkpoint_path'] = f'{CONFIG["run_dir"]}/checkpoint.pt'
+            if "checkpoint_path" not in CONFIG:
+                CONFIG['checkpoint_path'] = f'{CONFIG["run_dir"]}/checkpoint.pt'
             t_setup_end = time.perf_counter()
             log_time("Setup", t_setup_start, t_setup_end, use_warnings)
 
@@ -1130,16 +1322,21 @@ def main():
 
             log(f"Optimizing parameters: {list(param_spaces.keys())}", use_warnings)
 
-            results = run_hyperparameter_optimization(
-                args.mode, param_spaces, train_data, eval_data,
-                max_combinations=args.max_combinations,
-                num_trials=args.num_trials,
-                study_name=args.study_name,
-                storage=args.storage,
-            )
+            # Run optimization
+            # --------------------------------------------------------------------------------------
+            optimization_kwargs = {
+                'max_combinations': args.max_combinations,
+                'num_trials': args.num_trials,
+                'study_name': args.study_name,
+                'storage': args.storage,
+            }
+            results = run_hyperparameter_optimization(args.mode, param_spaces, train_data, eval_data, 
+                                                    **optimization_kwargs)
+            
             t_opt_end = time.perf_counter()
             log_time("Hyperparameter optimization", t_opt_start, t_opt_end, use_warnings)
-
+            # --------------------------------------------------------------------------------------
+            
     except Exception as e:
         if wandb.run is not None:
             wandb.run.finish(exit_code=1)

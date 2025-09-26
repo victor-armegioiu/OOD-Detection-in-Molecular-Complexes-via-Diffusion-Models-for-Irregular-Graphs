@@ -4,6 +4,7 @@ wandb/
 *.err
 *.sh
 *.db
+*.txt
 dataset*.pt
 datasets/
 *.pdf
@@ -11,6 +12,9 @@ logs/
 
 optimization_runs/
 optimization_results/
+GEMS_errors/
 training_runs/
 diffsbdd_stuff/
+lkhd_results*/
+samples/
 combine_csvs.py
