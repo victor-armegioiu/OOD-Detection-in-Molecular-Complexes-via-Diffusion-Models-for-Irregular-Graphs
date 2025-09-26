@@ -99,7 +99,7 @@ CONFIG = {
     # 'pocket_size_range': (15, 30),   # Min/max pocket residues
     
     # I/O
-    'device': 'cuda',
+    'device': torch.device("cuda"), # if torch.cuda.is_available() else "cpu"),
     
     # Weights & Biases configuration
     'wandb': {
@@ -311,7 +311,8 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         update_pocket_coords=config['update_pocket_coords'],
         scheme=scheme,
         noise_sampling=noise_sampling,
-        noise_weighting=noise_weighting
+        noise_weighting=noise_weighting, 
+        device=config["device"]
     ) if config['update_pocket_coords'] else ConditionalMolecularDenoisingModel(
         atom_nf=config['atom_nf'],
         residue_nf=config['residue_nf'],
@@ -323,7 +324,8 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         update_pocket_coords=config['update_pocket_coords'],
         scheme=scheme,
         noise_sampling=noise_sampling,
-        noise_weighting=noise_weighting
+        noise_weighting=noise_weighting, 
+        device=config["device"]
     )
     
     model.initialize()
@@ -383,6 +385,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
     patience_counter = 0
     early_stopped = False
     eval_history = []  # For debugging/logging
+    epoch_times = []
 
     best_epoch_metrics = None
     best_epoch_idx = -1
@@ -402,10 +405,10 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             'geometric_loss_total': [],
             'avg_sigma': []
         }
-        
+        start = time.perf_counter()
         for batch_idx, batch in enumerate(train_data):
 
-            start = time.perf_counter()
+            
 
             optimizer.zero_grad()
             
@@ -436,7 +439,6 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                       f"(L:{metrics['categorical_loss_ligand']:.4f}, P:{metrics['categorical_loss_pocket']:.4f}), "
                       f"σ: {metrics['avg_sigma']:.3f}, "
                       f"Geom: {metrics['geometric_loss_total']:.4f}"
-                      f"Time: {time.perf_counter() - start}"
                       )
                 
                 # Log batch metrics to wandb
@@ -462,7 +464,7 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
         avg_epoch_metrics = {
             key: np.mean(values) for key, values in epoch_metrics.items()
         }
-        
+
         # Log epoch metrics
         epoch_metrics = {
             'epoch/loss': avg_epoch_loss,
@@ -557,8 +559,9 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                 early_stopped = True
                 break
         
-        log(f"Epoch {epoch+1:3d} - Average Loss: {avg_epoch_loss:.4f}", flush=True)
-    
+        epoch_times.append(time.perf_counter() - start)
+        log(f"Epoch {epoch+1:3d} - Average Loss: {avg_epoch_loss:.4f} - Time: {epoch_times[-1]:.2f} seconds (At this speed, {3600 / epoch_times[-1]:.2f} epochs/hour)", flush=True)
+
     # Save model to wandb if configured
     if config['wandb']['log_model']:
         model_artifact = wandb.Artifact(
@@ -569,6 +572,9 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
         model_artifact.add_file(config['checkpoint_path'])
         wandb.log_artifact(model_artifact)
     
+    print("\n" + 60*"*")
+    print(f" Avg Epoch Time: {np.mean(epoch_times):.2f} seconds (At this speed, {3600 / np.mean(epoch_times):.2f} epochs/hour)")
+    print(60*"*")
     # Close wandb run
     wandb.finish()
     return best_epoch_metrics, early_stopped
@@ -1055,6 +1061,8 @@ def main():
             model = create_molecular_model(CONFIG)
             t_model_end = time.perf_counter()
             log_time("Model creation", t_model_start, t_model_end, use_warnings)
+            log(f"-> Model is on {next(model.denoiser.parameters()).device}", use_warnings)
+            if next(model.denoiser.parameters()).device == "cpu": raise RuntimeWarning("Model is on CPU, training will be very slow!")
 
             # --- Training ---
             t_train_start = time.perf_counter()
@@ -1064,14 +1072,15 @@ def main():
 
             # --- Save checkpoint ---
             t_ckpt_start = time.perf_counter()
-            save_checkpoint(model, CONFIG, save_path=CONFIG['checkpoint_path'].replace(".pt", "_final.pt"))
+            ckpt_path = CONFIG['checkpoint_path'].replace(".pt", "_final.pt")
+            save_checkpoint(model, CONFIG, save_path=ckpt_path)
             t_ckpt_end = time.perf_counter()
             log_time("Checkpoint saving", t_ckpt_start, t_ckpt_end, use_warnings)
 
             # --- Load checkpoint ---
             log("="*60 + "\nLOADING MODEL FROM CHECKPOINT\n" + "="*60, use_warnings)
             t_load_start = time.perf_counter()
-            loaded_model = load_checkpoint(CONFIG['checkpoint_path'])
+            loaded_model = load_checkpoint(ckpt_path)
             t_load_end = time.perf_counter()
             log_time("Model loading", t_load_start, t_load_end, use_warnings)
 

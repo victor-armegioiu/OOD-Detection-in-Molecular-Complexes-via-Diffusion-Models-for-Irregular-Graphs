@@ -15,6 +15,7 @@ Tensor = torch.Tensor
 Numeric = float | int | Tensor
 ScheduleFn = Callable[[Numeric], Numeric]
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 EPS = 1e-4
 MIN_DIFFUSION_TIME = EPS
 MAX_DIFFUSION_TIME = 1.0 - EPS
@@ -37,7 +38,7 @@ class InvertibleSchedule:
 
     forward: ScheduleFn
     inverse: ScheduleFn
-    device: str = "cpu"
+    device: str = DEVICE
 
     def __call__(self, t: Numeric) -> Tensor:
         result = self.forward(t)
@@ -46,7 +47,7 @@ class InvertibleSchedule:
         return result.to(self.device)
 
 
-def _linear_rescale(in_min: float, in_max: float, out_min: float, out_max: float, device: str = "cpu") -> InvertibleSchedule:
+def _linear_rescale(in_min: float, in_max: float, out_min: float, out_max: float, device: str = DEVICE) -> InvertibleSchedule:
     in_range = in_max - in_min
     out_range = out_max - out_min
     fwd = lambda x: out_min + (x - in_min) / in_range * out_range
@@ -54,7 +55,7 @@ def _linear_rescale(in_min: float, in_max: float, out_min: float, out_max: float
     return InvertibleSchedule(fwd, inv, device=device)
 
 
-def exponential_noise_schedule(clip_max: float = 100.0, base: float = np.e**0.5, start: float = 0.0, end: float = 5.0, device: str = "cpu") -> InvertibleSchedule:
+def exponential_noise_schedule(clip_max: float = 100.0, base: float = np.e**0.5, start: float = 0.0, end: float = 5.0, device: str = DEVICE) -> InvertibleSchedule:
 
     if not (start < end and base > 1.0):
         raise ValueError("Must have `base` > 1 and `start` < `end`.")
@@ -100,7 +101,7 @@ class MolecularDiffusion:
     feature_bias: float = 0.0
     categorical_temperature: float = 1.0
 
-    device: str = "cpu"
+    device: str = "cuda"
 
     @property
     def sigma_max(self) -> float:
@@ -163,7 +164,7 @@ class MolecularDiffusion:
 
     @classmethod
     def create_variance_exploding(  # the idea behind this class method is to create object, without having instantiated it before
-        cls, sigma: InvertibleSchedule, coord_norm: float = 1.0, feature_norm: float = 1.0, feature_bias: float = 0.0, categorical_temperature: float = 1.0, device: str = "cpu"
+        cls, sigma: InvertibleSchedule, coord_norm: float = 1.0, feature_norm: float = 1.0, feature_bias: float = 0.0, categorical_temperature: float = 1.0, device: str = DEVICE
     ) -> "MolecularDiffusion":
         """Create variance exploding scheme"""
         return cls(sigma=sigma, coord_norm=coord_norm, feature_norm=feature_norm, feature_bias=feature_bias, categorical_temperature=categorical_temperature, device=device)
@@ -270,7 +271,7 @@ class MolecularDenoisingModel:
     noise_weighting: NoiseLossWeighting = None
     geometric_regularization: bool = True
     geom_loss_weight: float = 0.1
-    device: str = "cpu"
+    device: str = DEVICE
 
     # # Whether to condition on pocket structure or train on complex jointly
     # pocket_conditioning: bool = False  # Whether to condition on pocket structure (always True for now)
@@ -479,7 +480,7 @@ class MolecularDenoisingModel:
             xh_pocket_clean = torch.cat([pocket_coords_centered, pocket_embeddings_clean], dim=1)
 
             # Create sigma tensor for this evaluation (broadcast to batch_size)
-            sigma_batch = torch.full((batch_size, ), sigma_val)
+            sigma_batch = torch.full((batch_size, ), sigma_val, device = self.device)
 
             xh_lig_noisy, xh_pocket_noisy = self._noise_clean_embeddings(
             xh_lig_clean, 

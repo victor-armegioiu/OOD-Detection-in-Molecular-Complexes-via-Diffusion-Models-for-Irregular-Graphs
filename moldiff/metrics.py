@@ -297,8 +297,11 @@ def process_molecule(rdmol, add_hydrogens=False, sanitize=True, relax_iter=0,
         RDKit molecule or None if it does not pass the filters
     """
 
-    # Create a copy
-    mol = Chem.Mol(rdmol)
+    # Create a copy (save way)
+    try: 
+        mol = Chem.Mol(rdmol)
+    except Exception as e:
+        raise ValueError(f"Could not copy molecule of type {type(rdmol)}: {e}")
 
     if sanitize:
         try:
@@ -395,13 +398,14 @@ def build_molecule(positions, atom_types, add_coords=False,
     Returns:
         RDKit molecule
     """
-    # if use_openbabel:
-    #     mol = make_mol_openbabel(positions, atom_types, atom_decoder)
-    # else:
-    #     mol = make_mol_edm(positions, atom_types, dataset_info, add_coords)
+    if use_openbabel:
+        mol = make_mol_openbabel(positions, atom_types, atom_decoder)
+    else:
+        # mol = make_mol_edm(positions, atom_types, dataset_info, add_coords)
+        raise NotImplementedError("Define make_mol_edm")
 
-    # return mol
-    return NotImplementedError
+    return mol
+    # return NotImplementedError
 
 
 
