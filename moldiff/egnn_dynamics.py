@@ -574,8 +574,9 @@ class EGNNDynamics(nn.Module):
                  condition_time=True, tanh=False,
                  norm_constant=0, inv_sublayers=2, sin_embedding=False,
                  normalization_factor=100, aggregation_method='sum',
-                 update_pocket_coords=True, edge_cutoff_ligand=None,
-                 edge_cutoff_pocket=None, edge_cutoff_interaction=None,
+                 update_pocket_coords=True, freeze_pocket_embeddings = False, 
+                 edge_cutoff_ligand=None, edge_cutoff_pocket=None, 
+                 edge_cutoff_interaction=None,
                  reflection_equivariant=True, edge_embedding_dim=None,
                  geometric_regularization=False, geom_loss_weight=0.1):
         super().__init__()
@@ -585,12 +586,13 @@ class EGNNDynamics(nn.Module):
         self.edge_nf = edge_embedding_dim
         self.geometric_regularization = geometric_regularization
         self.geom_loss_weight = geom_loss_weight
+        self.freeze_pocket_embeddings = freeze_pocket_embeddings
 
         self.atom_encoder = nn.Sequential(
             nn.Linear(atom_nf, 2 * atom_nf),
             act_fn,
             nn.Linear(2 * atom_nf, joint_nf)
-        )
+        ) 
 
         self.atom_decoder = nn.Sequential(
             nn.Linear(joint_nf, 2 * atom_nf),
@@ -598,17 +600,22 @@ class EGNNDynamics(nn.Module):
             nn.Linear(2 * atom_nf, atom_nf)
         )
 
-        self.residue_encoder = nn.Sequential(
-            nn.Linear(residue_nf, 2 * residue_nf),
-            act_fn,
-            nn.Linear(2 * residue_nf, joint_nf)
-        )
-
-        self.residue_decoder = nn.Sequential(
-            nn.Linear(joint_nf, 2 * residue_nf),
-            act_fn,
-            nn.Linear(2 * residue_nf, residue_nf)
-        )
+        # whether to learn pocket embeddings CDCD style
+        if not freeze_pocket_embeddings:
+            self.residue_encoder = nn.Sequential(
+                nn.Linear(residue_nf, 2 * residue_nf),
+                act_fn,
+                nn.Linear(2 * residue_nf, joint_nf)
+            )
+            self.residue_decoder = nn.Sequential(
+                nn.Linear(joint_nf, 2 * residue_nf),
+                act_fn,
+                nn.Linear(2 * residue_nf, residue_nf)
+            )
+        else: 
+            self.residue_encoder, self.residue_decoder = \
+                self.build_fixed_orthogonal_embeddings(residue_nf, joint_nf)  
+            raise Warning("Initialized EGNN Dynamics with frozen pocket embeddings")          
 
         self.edge_embedding = nn.Embedding(3, self.edge_nf) \
             if self.edge_nf is not None else None
@@ -765,6 +772,148 @@ class EGNNDynamics(nn.Module):
         edges = torch.stack(torch.where(adj), dim=0)
 
         return edges
+    
+    def null_residue_forward(self, xh_atoms, t, mask_atoms, target_atoms=None ) -> torch.Tensor:
+        """
+        Residue-independent forward pass of EGNN Dynamics for classifier-free guidance (CFG).
+
+        This variant is called when the conditioning pocket is set to "null".
+        In this case, only the ligand graph is passed to the network, and the
+        ligand denoising dynamics are learned unconditionally.
+
+        Args:
+            xh_atoms: Tensor [N_lig_atoms, n_dims + joint_nf]
+                Ligand atom coordinates concatenated with their embeddings.
+            xh_residues: Tensor [N_pocket_atoms, n_dims + residue_nf]
+                Pocket residue coordinates + embeddings (ignored in this null branch).
+            t: Tensor [batch_size, 1]
+                Normalized timestep values for the diffusion process.
+            mask_atoms: Tensor [N_lig_atoms]
+                Batch indices for ligand atoms (used to group graphs in the batch).
+            mask_residues: Tensor [N_pocket_atoms]
+                Batch indices for pocket residues (ignored here).
+            target_atoms: Tensor [N_lig_atoms, n_dims + joint_nf], optional
+                Target ligand coordinates and embeddings (for geometric loss).
+            target_residues: Tensor [N_pocket_atoms, n_dims + residue_nf], optional
+                Target pocket coordinates and embeddings (ignored here).
+
+        Returns:
+            Tensor [N_lig_atoms, n_dims + atom_nf]
+                Predicted ligand velocity (coords) and decoded atom features.
+        """
+        x = xh_atoms[:, :self.n_dims].clone()
+        h = xh_atoms[:, self.n_dims:].clone()
+        mask = mask_atoms.clone() # set ligand only batch index mask
+
+        # calculate edges:
+        adj = mask[:, None] == mask[None, :]
+
+        if self.edge_cutoff_l is not None:
+            adj = adj & (torch.cdist(x, x) <= self.edge_cutoff_l)
+
+        edges = torch.stack(torch.where(adj), dim=0)
+
+        # time conditining
+        if self.condition_time:
+            if np.prod(t.size()) == 1:
+                # t is the same for all elements in batch.
+                h_time = torch.empty_like(h[:, 0:1]).fill_(t.item())
+            else:
+                # t is different over the batch dimension.
+                h_time = t[mask]
+            h = torch.cat([h, h_time], dim=1)
+
+        assert torch.all(mask[edges[0]] == mask[edges[1]])
+
+        # Get edge types: we only deal with ligand here
+        if self.edge_nf > 0:
+            # 0: ligand-pocket, 1: ligand-ligand, 2: pocket-pocket
+            edge_types = torch.ones(edges.size(1), dtype=int, device=edges.device)
+
+            # Learnable embedding
+            edge_types = self.edge_embedding(edge_types)
+        else:
+            edge_types = None
+        
+        h_final, x_final = self.egnn(h, x, edges,
+                                     update_coords_mask=None, # update all coords we get which is the ligand coords here
+                                     batch_mask=mask, edge_attr=edge_types)
+        vel = (x_final - x)
+
+        # Geometric regularization loss (computed on predicted coordinates)
+        if self.geometric_regularization and target_atoms is not None and self.training:
+            # Extract predicted and target coordinates for ligands only
+            pred_ligand_coords = x_final[:len(mask_atoms)]
+            target_ligand_coords = target_atoms[:, :self.n_dims]
+            
+            # Compute geometric loss
+            geom_loss = self.geometric_regularizer.comprehensive_geometric_loss(
+                pred_ligand_coords, target_ligand_coords, mask_atoms
+            )
+            self.last_geometric_loss = geom_loss * self.geom_loss_weight
+        else:
+            self.last_geometric_loss = torch.tensor(0.0, device=self.device)
+
+        if self.condition_time:
+            # Slice off last dimension which represented time.
+            h_final = h_final[:, :-1]
+
+        # decode atom and residue features
+        h_final_atoms = self.atom_decoder(h_final[:len(mask_atoms)])
+        # h_final_residues = self.residue_decoder(h_final[len(mask_atoms):])
+
+        if torch.any(torch.isnan(vel)):
+            if self.training:
+                vel[torch.isnan(vel)] = 0.0
+            else:
+                raise ValueError("NaN detected in EGNN output")
+
+        # if self.update_pocket_coords:
+        # we always remove the COM because the ligand is without reference frame
+        vel = remove_mean_batch(vel, mask)
+
+        return torch.cat([vel[:len(mask_atoms)], h_final_atoms], dim=-1)
+    
+def build_fixed_orthogonal_embeddings(self, num_classes=21, joint_nf=21) -> tuple[nn.Module, nn.Module]:
+    """
+    Create a fixed encoder/decoder pair with orthogonal vectors for residue classes.
+    
+    Args:
+        num_classes: number of residue classes (default 21).
+        joint_nf: embedding dimension. Must be >= num_classes for strict orthogonality.
+    
+    Returns:
+        (encoder, decoder): two nn.Linear modules with requires_grad=False
+    """
+    if joint_nf < num_classes:
+        raise ValueError(
+            f"joint_nf={joint_nf} must be >= num_classes={num_classes} "
+            "to allow strict orthogonality."
+        )
+
+    # Start with identity (perfect one-hot orthogonality if joint_nf == num_classes)
+    weight = torch.zeros(num_classes, joint_nf)
+    weight[:, :num_classes] = torch.eye(num_classes)
+
+    # Optionally apply QR decomposition to make columns orthogonal if joint_nf > num_classes
+    if joint_nf > num_classes:
+        # Random matrix -> orthogonal basis
+        rand_mat = torch.randn(joint_nf, joint_nf)
+        q, _ = torch.linalg.qr(rand_mat)  # Q is orthogonal
+        weight = q[:num_classes, :joint_nf]
+
+    # Build frozen linear embedding and its transpose decoder
+    encoder = nn.Linear(num_classes, joint_nf, bias=False)
+    decoder = nn.Linear(joint_nf, num_classes, bias=False)
+
+    encoder.weight.data = weight.to(self.device)
+    decoder.weight.data = weight.T.to(self.device)
+
+    encoder.weight.requires_grad = False
+    decoder.weight.requires_grad = False
+
+    return encoder, decoder
+
 
 
 class PreconditionedEGNNDynamics(nn.Module):
@@ -779,12 +928,17 @@ class PreconditionedEGNNDynamics(nn.Module):
         super().__init__()
         self.egnn_dynamics = egnn_dynamics
         self.sigma_data = sigma_data
+    
+    @property
+    def freeze_pocket_embeddings(self):
+        return self.egnn_dynamics.freeze_pocket_embeddings
 
     def atom_encoder(self, atom_features):
         return self.egnn_dynamics.atom_encoder(atom_features)
 
     def residue_encoder(self, residue_features):
         return self.egnn_dynamics.residue_encoder(residue_features)
+    
         
     def forward(self, xh_atoms, xh_residues, sigma, mask_atoms, mask_residues,
                 target_atoms=None, target_residues=None):
@@ -907,6 +1061,77 @@ def test_egnn_dynamics():
     # Create target data (same structure as inputs for testing)
     target_atoms = torch.randn(total_lig_atoms, n_dims + joint_nf, device=device)
     target_residues = torch.randn(total_pocket_atoms, n_dims + joint_nf, device=device)
+    
+    mask_atoms = torch.cat([torch.zeros(4), torch.ones(4)]).long().to(device)
+    mask_residues = torch.cat([torch.zeros(12), torch.ones(8)]).long().to(device)
+    
+    t = torch.tensor([0.3, 0.7], dtype=torch.float32, device=device)
+    print(f"Time tensor shape: {t.shape}")
+    
+    # Create model with geometric regularization
+    model = EGNNDynamics(
+        atom_nf=atom_nf,
+        residue_nf=residue_nf,
+        n_dims=n_dims,
+        joint_nf=joint_nf,
+        hidden_nf=32,
+        device=device,
+        n_layers=2,
+        condition_time=True,
+        update_pocket_coords=True,
+        edge_embedding_dim=4,
+        sin_embedding=True,
+        reflection_equivariant=True,
+        tanh=True,
+        attention=True,
+        geometric_regularization=True,
+        geom_loss_weight=0.1
+    )
+
+    model = PreconditionedEGNNDynamics(model)
+    
+    # Forward pass with geometric regularization
+    model.train()  # Set to training mode to enable geometric loss
+    ligand_out, pocket_out = model(
+        xh_atoms, xh_residues, t, mask_atoms, mask_residues,
+        target_atoms=target_atoms, target_residues=target_residues
+    )
+    
+    print(f"Input shapes: ligand {xh_atoms.shape}, pocket {xh_residues.shape}")
+    print(f"Output shapes: ligand {ligand_out.shape}, pocket {pocket_out.shape}")
+    print(f"Geometric loss: {model.last_geometric_loss.item():.6f}")
+    print(f"✅ Enhanced EGNNDynamics test passed!")
+    
+    # Test without targets (should have zero geometric loss)
+    model.eval()
+    ligand_out_eval, pocket_out_eval = model(xh_atoms, xh_residues, t, mask_atoms, mask_residues)
+    print(f"Geometric loss (eval mode): {model.last_geometric_loss.item():.6f}")
+    
+    return model
+
+def test_egnn_dynamics_null_residues():
+    """Test the enhanced EGNNDynamics implementation"""
+    
+    print("Testing Enhanced EGNNDynamics with Geometric Regularization...")
+    
+    # Configuration
+    batch_size = 2
+    atom_nf = 5
+    residue_nf = 7
+    n_dims = 3
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    joint_nf = 8
+    
+    # Create test data
+    total_lig_atoms = 8
+    total_pocket_atoms = 20
+    
+    xh_atoms = torch.randn(total_lig_atoms, n_dims + joint_nf, device=device)
+    xh_residues = torch.zeros_like(xh_atoms, device=device)
+    
+    # Create target data (same structure as inputs for testing)
+    target_atoms = None
+    target_residues = None
     
     mask_atoms = torch.cat([torch.zeros(4), torch.ones(4)]).long().to(device)
     mask_residues = torch.cat([torch.zeros(12), torch.ones(8)]).long().to(device)

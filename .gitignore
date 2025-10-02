@@ -9,6 +9,7 @@ dataset*.pt
 datasets/
 *.pdf
 logs/
+.vscode/
 
 optimization_runs/
 optimization_results/

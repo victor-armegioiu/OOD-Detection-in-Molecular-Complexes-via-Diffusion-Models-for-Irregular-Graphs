@@ -45,8 +45,6 @@ from moldiff.metrics import (
     evaluate_mols,
     build_mol_objects
 )
-from moldiff.egnn_dynamics import EGNNDynamics
-import torch.nn.functional as F
 
 # Try to import optuna for Bayesian optimization
 try:
@@ -85,6 +83,7 @@ CONFIG = {
     'sigma_max': 100.0,      # Maximum noise level
     'sigma_min': 1e-4,      # Minimum noise level
     'update_pocket_coords': True,  # Joint modeling
+    'freeze_pocket_embeddings': False, # No CE loss on residue classes
     'geometric_regularization': True,
     'geom_loss_weight': 0.0,
     
@@ -113,8 +112,8 @@ CONFIG = {
 
 # Hyperparameter search spaces
 HYPERPARAM_SPACES = {
-    'num_sampling_steps': [50, 100, 200, 300, 400],
-    'joint_nf': [32, 64, 128, 256],
+    'num_sampling_steps': [200, 400], # [50, 100, 200, 300, 400],
+    'joint_nf': [256, 512], #[32, 64, 128, 256],
     'hidden_nf': [64, 128, 256],
     'n_layers': [4, 6, 8],
     'edge_embedding_dim': [8, 16, 32, 64],
@@ -158,6 +157,7 @@ def parse_arguments():
     
     # Model parameters (for single mode or to override defaults)
     parser.add_argument('--freeze_pocket_coords', action='store_false', help='Enables conditional model')
+    parser.add_argument('--freeze_pocket_embeddings', action='store_true', help='Freezes pocket encoder weights')
     parser.add_argument('--joint_nf', type=int, help='Joint embedding dimension')
     parser.add_argument('--hidden_nf', type=int, help='Hidden layer size')
     parser.add_argument('--n_layers', type=int, help='Number of EGNN layers')
@@ -215,6 +215,8 @@ def update_config_from_args(config: Dict, args) -> Dict:
     # config['update_pocket_coords'] = args.update_pocket_coords or config['update_pocket_coords'] # replaces all falsy values, e.g. also zero
     if args.freeze_pocket_coords is not None: # just replaces if not None
         config['update_pocket_coords'] = args.freeze_pocket_coords # is stored as false if flag is present
+    if args.freeze_pocket_embeddings is not None:
+        config['freeze_pocket_embeddings'] = args.freeze_pocket_embeddings
     if args.joint_nf is not None:
         config['joint_nf'] = args.joint_nf
     if args.hidden_nf is not None:
@@ -327,7 +329,21 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         update_pocket_coords=config['update_pocket_coords'],
         scheme=scheme,
         noise_sampling=noise_sampling,
-        log_weighting=noise_weighting
+        noise_weighting=noise_weighting, 
+        device=config["device"]
+    ) if config['update_pocket_coords'] else ConditionalMolecularDenoisingModel(
+        atom_nf=config['atom_nf'],
+        residue_nf=config['residue_nf'],
+        n_dims=config['n_dims'],
+        joint_nf=config['joint_nf'],
+        hidden_nf=config['hidden_nf'],
+        n_layers=config['n_layers'],
+        edge_embedding_dim=config['edge_embedding_dim'],
+        update_pocket_coords=config['update_pocket_coords'],
+        scheme=scheme,
+        noise_sampling=noise_sampling,
+        noise_weighting=noise_weighting, 
+        device=config["device"]
     )
     
     model.initialize()
@@ -608,9 +624,9 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
                 patience_counter = 0
                 best_epoch_metrics = {**eval_losses, **epoch_metrics}
                 best_epoch_idx = epoch
-                log("[Early Stopping] Early Stopping Patience Reset. Model improved on metrics:")
-                for k in early_stop_metrics:
-                    log(f"    {k}: {best_metrics[k]}")
+                # log("[Early Stopping] Early Stopping Patience Reset. Model improved on metrics:")
+                # for k in early_stop_metrics:
+                #     log(f"    {k}: {best_metrics[k]}")
             else:
                 patience_counter += 1
                 log(f"[Early Stopping] Patience Counter: {patience_counter}")
@@ -1258,7 +1274,7 @@ def main():
 
             # --- Training ---
             t_train_start = time.perf_counter()
-            best_metrics, early_stopped = train_model(model, train_data, eval_data, CONFIG)
+            best_metrics, early_stopped, _, _, _, _  = train_model(model, train_data, eval_data, CONFIG)
             t_train_end = time.perf_counter()
             log_time("Training", t_train_start, t_train_end, use_warnings)
 

@@ -260,6 +260,7 @@ class MolecularDenoisingModel:
     n_layers: int = 4
     edge_embedding_dim: Optional[int] = 8
     update_pocket_coords: bool = True
+    freeze_pocket_embeddings: bool = False
 
     # Loss weighting parameters
     coord_loss_weight: float = 1.0
@@ -306,6 +307,7 @@ class MolecularDenoisingModel:
             n_layers=self.n_layers,
             condition_time=True,
             update_pocket_coords=self.update_pocket_coords,
+            freeze_pocket_embeddings=self.freeze_pocket_embeddings,
             edge_embedding_dim=self.edge_embedding_dim,
             geometric_regularization=self.geometric_regularization,
             geom_loss_weight=self.geom_loss_weight,
@@ -687,7 +689,9 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
 
         # Categorical loss: Cross-entropy between logits and true atom types
         ce_loss_lig = F.cross_entropy(pred_logits_lig, true_atom_types, reduction="none")
-        ce_loss_pocket = F.cross_entropy(pred_logits_pocket, true_residue_types, reduction="none")
+        # Categorical Loss is zero is embeddings frozen
+        ce_loss_pocket = torch.zeros_like(ce_loss_lig) if self.freeze_pocket_embeddings \
+            else F.cross_entropy(pred_logits_pocket, true_residue_types, reduction="none")
 
         # Weight categorical loss by noise level (like coordinates)
         # categorical_loss_lig = torch.mean(weights[lig_mask] * ce_loss_lig)
