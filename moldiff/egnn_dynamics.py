@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
+from typing import NamedTuple
 from torch_scatter import scatter_mean
 
 
@@ -62,6 +63,11 @@ def remove_mean_batch(x, indices):
     """Remove center of mass for each molecule in batch"""
     mean = scatter_mean(x, indices, dim=0)
     return x - mean[indices]
+
+# for structured inheritance of function to conditional EGNN (leaves residues untouched)
+class LigandResidueTuple(NamedTuple):
+    ligand: torch.Tensor
+    residues: torch.Tensor
 
 
 class SinusoidsEmbeddingNew(nn.Module):
@@ -944,6 +950,10 @@ class PreconditionedEGNNDynamics(nn.Module):
                 target_atoms=None, target_residues=None):
         """
         Preconditioned forward pass with separate handling for coordinates and categorical features.
+
+        Note on shapes of the two returned tensors: 
+        * Input shape: (N_lig_atoms, coords (3) + joint embedding (joint_nf).
+        * Output shape: (N_pocket_residues, coords (3) + class logits (atom_nf or residue_nf).
         
         Args:
             xh_atoms: [total_lig_atoms, n_dims + joint_nf] - ligand coords + embeddings
@@ -971,18 +981,68 @@ class PreconditionedEGNNDynamics(nn.Module):
             )
             
         # Compute preconditioning coefficients
+        c_skip, c_out, c_in, c_noise = self._compute_preconditioning_coefs(sigma)
+
+        coords_lig, embeddings_lig, coords_pocket, embeddings_pocket = \
+            self._split_coordinates_and_embeddings(xh_atoms, xh_residues)
+
+        
+        # Apply c_in scaling to coordinates and recombine with embeddings
+        coords_lig_scaled , coords_pocket_scaled = self._apply_cin_scaling_to_coords(
+            c_in, coords_lig, coords_pocket, mask_atoms, mask_residues
+            )
+        
+        # Recombine scaled coordinates with original embeddings
+        xh_ligand_scaled = torch.cat([coords_lig_scaled, embeddings_lig], dim=1)
+        xh_residues_scaled = torch.cat([coords_pocket_scaled, embeddings_pocket], dim=1)
+        
+        # Convert sigma to normalized time for the base model
+        t = c_noise.unsqueeze(1)  # [batch_size, 1]
+        
+        # Forward through base EGNN (pass through target data for geometric loss)
+        f_ligand, f_pocket = self.egnn_dynamics(
+            xh_ligand_scaled, xh_residues_scaled, t, mask_atoms, mask_residues,
+            target_atoms=target_atoms, target_residues=target_residues
+        )
+        
+        # Split EGNN output into coordinates and logits
+        coords_pred_lig, logits_pred_lig, coords_pred_pocket, logits_pred_pocket = \
+            self._split_coordinates_and_embeddings(f_ligand, f_pocket)
+        
+        # Apply preconditioning to coordinates only (skip connection + output scaling)
+        coords_out_lig, coords_out_pocket = self._apply_cskip_cout_scaling_to_coords(
+            c_skip, c_out, coords_lig, coords_pocket, mask_atoms, mask_residues, 
+            coords_pred_lig, coords_pred_pocket
+            )
+        
+        
+        # Combine preconditioned coordinates with raw logits (no preconditioning for classification)
+        ligand_out = torch.cat([coords_out_lig, logits_pred_lig], dim=1)
+        pocket_out = torch.cat([coords_out_pocket, logits_pred_pocket], dim=1)
+        
+        
+        return ligand_out, pocket_out
+    
+    def _compute_preconditioning_coefs(self, sigma):
+
+        # Compute preconditioning coefficients
         total_var = self.sigma_data**2 + sigma**2
         c_skip = self.sigma_data**2 / total_var
         c_out = sigma * self.sigma_data / torch.sqrt(total_var)
         c_in = 1 / torch.sqrt(total_var)
         c_noise = 0.25 * torch.log(sigma)
-        
-        # Split input into coordinates and embeddings
-        coords_lig = xh_atoms[:, :self.egnn_dynamics.n_dims]  # [N_lig, 3]
-        embeddings_lig = xh_atoms[:, self.egnn_dynamics.n_dims:]  # [N_lig, joint_nf]
-        coords_pocket = xh_residues[:, :self.egnn_dynamics.n_dims]  # [N_pocket, 3]
-        embeddings_pocket = xh_residues[:, self.egnn_dynamics.n_dims:]  # [N_pocket, joint_nf]
-        
+
+        return c_skip, c_out, c_in, c_noise
+
+    def _apply_cin_scaling_to_coords(
+            self, 
+            c_in, 
+            coords_lig, 
+            coords_pocket, 
+            mask_atoms, 
+            mask_residues
+           ):
+
         # Apply c_in scaling to coordinates only (per molecule)
         coords_lig_scaled = coords_lig.clone()
         coords_pocket_scaled = coords_pocket.clone()
@@ -995,25 +1055,30 @@ class PreconditionedEGNNDynamics(nn.Module):
             residue_mask = mask_residues == batch_idx  
             coords_pocket_scaled[residue_mask] = c_in[i] * coords_pocket[residue_mask]
         
-        # Recombine scaled coordinates with original embeddings
-        xh_atoms_scaled = torch.cat([coords_lig_scaled, embeddings_lig], dim=1)
-        xh_residues_scaled = torch.cat([coords_pocket_scaled, embeddings_pocket], dim=1)
-        
-        # Convert sigma to normalized time for the base model
-        t = c_noise.unsqueeze(1)  # [batch_size, 1]
-        
-        # Forward through base EGNN (pass through target data for geometric loss)
-        f_ligand, f_pocket = self.egnn_dynamics(
-            xh_atoms_scaled, xh_residues_scaled, t, mask_atoms, mask_residues,
-            target_atoms=target_atoms, target_residues=target_residues
-        )
-        
-        # Split EGNN output into coordinates and logits
-        coords_pred_lig = f_ligand[:, :self.egnn_dynamics.n_dims]  # [N_lig, 3]
-        logits_pred_lig = f_ligand[:, self.egnn_dynamics.n_dims:]  # [N_lig, atom_nf]
-        coords_pred_pocket = f_pocket[:, :self.egnn_dynamics.n_dims]  # [N_pocket, 3]
-        logits_pred_pocket = f_pocket[:, self.egnn_dynamics.n_dims:]  # [N_pocket, residue_nf]
-        
+
+        return coords_lig_scaled, coords_pocket_scaled
+    
+    def _split_coordinates_and_embeddings(self, ligand_tensor, residue_tensor):
+
+        # Split input into coordinates and embeddings
+        coords_lig = ligand_tensor[:, :self.egnn_dynamics.n_dims]  # [N_lig, 3]
+        embeddings_lig = ligand_tensor[:, self.egnn_dynamics.n_dims:]  # [N_lig, atom_nf]
+        coords_pocket = residue_tensor[:, :self.egnn_dynamics.n_dims]  # [N_pocket, 3]
+        embeddings_pocket = residue_tensor[:, self.egnn_dynamics.n_dims:]  # [N_pocket, residue_nf]
+
+        return coords_lig, embeddings_lig, coords_pocket, embeddings_pocket
+
+    def _apply_cskip_cout_scaling_to_coords(
+        self, 
+        c_skip, 
+        c_out, 
+        coords_lig, 
+        coords_pocket, 
+        mask_atoms, 
+        mask_residues,
+        coords_pred_lig, 
+        coords_pred_pocket
+        ):
         # Apply preconditioning to coordinates only (skip connection + output scaling)
         coords_out_lig = coords_lig.clone()
         coords_out_pocket = coords_pocket.clone()
@@ -1025,17 +1090,16 @@ class PreconditionedEGNNDynamics(nn.Module):
         for i, batch_idx in enumerate(torch.unique(mask_residues)):
             residue_mask = mask_residues == batch_idx
             coords_out_pocket[residue_mask] = c_skip[i] * coords_pocket[residue_mask] + c_out[i] * coords_pred_pocket[residue_mask]
-        
-        # Combine preconditioned coordinates with raw logits (no preconditioning for classification)
-        ligand_out = torch.cat([coords_out_lig, logits_pred_lig], dim=1)
-        pocket_out = torch.cat([coords_out_pocket, logits_pred_pocket], dim=1)
-        
-        return ligand_out, pocket_out
-
+            
+        return coords_out_lig, coords_out_pocket
+    
     @property
     def last_geometric_loss(self):
         """Access geometric loss from the underlying EGNN dynamics"""
         return self.egnn_dynamics.last_geometric_loss
+    
+
+
 
 
 def test_egnn_dynamics():
