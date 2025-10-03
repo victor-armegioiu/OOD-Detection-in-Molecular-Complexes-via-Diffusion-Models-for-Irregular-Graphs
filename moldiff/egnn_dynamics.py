@@ -753,7 +753,11 @@ class EGNNDynamics(nn.Module):
                 raise ValueError("NaN detected in EGNN output")
 
         if self.update_pocket_coords:
+            # joint: COM-free velocity on whole complex
             vel = remove_mean_batch(vel, mask)
+        else:
+            # conditioned: COM-free velocity on ligand only
+            vel[:len(mask_atoms)] = remove_mean_batch(vel[:len(mask_atoms)], mask_atoms)
 
         return torch.cat([vel[:len(mask_atoms)], h_final_atoms], dim=-1), \
                torch.cat([vel[len(mask_atoms):], h_final_residues], dim=-1)
@@ -999,20 +1003,20 @@ class PreconditionedEGNNDynamics(nn.Module):
         # Convert sigma to normalized time for the base model
         t = c_noise.unsqueeze(1)  # [batch_size, 1]
         
-        # Forward through base EGNN (pass through target data for geometric loss)
+        # Predict scaled denoised direction with EGNN (pass through target data for geometric loss)
         f_ligand, f_pocket = self.egnn_dynamics(
             xh_ligand_scaled, xh_residues_scaled, t, mask_atoms, mask_residues,
             target_atoms=target_atoms, target_residues=target_residues
         )
         
         # Split EGNN output into coordinates and logits
-        coords_pred_lig, logits_pred_lig, coords_pred_pocket, logits_pred_pocket = \
+        vel_pred_lig, logits_pred_lig, vel_pred_pocket, logits_pred_pocket = \
             self._split_coordinates_and_embeddings(f_ligand, f_pocket)
         
         # Apply preconditioning to coordinates only (skip connection + output scaling)
         coords_out_lig, coords_out_pocket = self._apply_cskip_cout_scaling_to_coords(
             c_skip, c_out, coords_lig, coords_pocket, mask_atoms, mask_residues, 
-            coords_pred_lig, coords_pred_pocket
+            vel_pred_lig, vel_pred_pocket
             )
     
         
@@ -1079,8 +1083,8 @@ class PreconditionedEGNNDynamics(nn.Module):
         coords_pocket, 
         mask_atoms, 
         mask_residues,
-        coords_pred_lig, 
-        coords_pred_pocket
+        vel_pred_lig, 
+        vel_pred_pocket
         ):
         # Apply preconditioning to coordinates only (skip connection + output scaling)
         coords_out_lig = coords_lig.clone()
@@ -1088,11 +1092,11 @@ class PreconditionedEGNNDynamics(nn.Module):
         
         for i, batch_idx in enumerate(torch.unique(mask_atoms)):
             atom_mask = mask_atoms == batch_idx
-            coords_out_lig[atom_mask] = c_skip[i] * coords_lig[atom_mask] + c_out[i] * coords_pred_lig[atom_mask]
+            coords_out_lig[atom_mask] = c_skip[i] * coords_lig[atom_mask] + c_out[i] * vel_pred_lig[atom_mask]
             
         for i, batch_idx in enumerate(torch.unique(mask_residues)):
             residue_mask = mask_residues == batch_idx
-            coords_out_pocket[residue_mask] = c_skip[i] * coords_pocket[residue_mask] + c_out[i] * coords_pred_pocket[residue_mask]
+            coords_out_pocket[residue_mask] = c_skip[i] * coords_pocket[residue_mask] + c_out[i] * vel_pred_pocket[residue_mask]
             
         return coords_out_lig, coords_out_pocket
     
@@ -1176,13 +1180,13 @@ class PreconditionedEGNNDynamicsConditional(PreconditionedEGNNDynamics):
         )
 
         # Split EGNN output into coordinates and logits
-        coords_pred_lig, logits_pred_lig, _, _ = \
+        vel_pred_lig, logits_pred_lig, _, _ = \
             self._split_coordinates_and_embeddings(f_ligand, dummy_residues)
         
         # Apply preconditioning to coordinates only (skip connection + output scaling)
         coords_out_lig, _ = self._apply_cskip_cout_scaling_to_coords(
             c_skip, c_out, coords_lig, dummy_residues, mask_atoms, dummy_residues, 
-            coords_pred_lig, dummy_residues
+            vel_pred_lig, dummy_residues
             )
     
         
@@ -1221,17 +1225,17 @@ class PreconditionedEGNNDynamicsConditional(PreconditionedEGNNDynamics):
         coords_pocket, 
         mask_atoms, 
         mask_residues,
-        coords_pred_lig, 
-        coords_pred_pocket
+        vel_pred_lig, 
+        vel_pred_pocket
         ):
         # Apply preconditioning to coordinates of ligand only (skip connection + output scaling)
         coords_out_lig = coords_lig.clone()
-        # NOTE: setting this here to = coords_pred_pocket would return zero vector from this function -> needed if we want to predict noise not clean coords
+        # NOTE: setting this here to = c_pred_pocket would return zero vector from this function -> needed if we want to predict noise not clean coords
         coords_out_pocket = coords_pocket.clone() 
         
         for i, batch_idx in enumerate(torch.unique(mask_atoms)):
             atom_mask = mask_atoms == batch_idx
-            coords_out_lig[atom_mask] = c_skip[i] * coords_lig[atom_mask] + c_out[i] * coords_pred_lig[atom_mask]
+            coords_out_lig[atom_mask] = c_skip[i] * coords_lig[atom_mask] + c_out[i] * vel_pred_lig[atom_mask]
         
             
         return coords_out_lig, coords_out_pocket
@@ -1477,6 +1481,6 @@ def test_egnn_dynamics_null_residues():
 
 
 if __name__ == "__main__":
-    # test_egnn_dynamics()
+    test_egnn_dynamics()
     test_egnn_dynamics_conditional()
-    # test_egnn_dynamics_null_residues()
+    test_egnn_dynamics_null_residues()
