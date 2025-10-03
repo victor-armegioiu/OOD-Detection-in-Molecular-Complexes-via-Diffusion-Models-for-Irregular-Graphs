@@ -1014,7 +1014,7 @@ class PreconditionedEGNNDynamics(nn.Module):
             c_skip, c_out, coords_lig, coords_pocket, mask_atoms, mask_residues, 
             coords_pred_lig, coords_pred_pocket
             )
-        
+    
         
         # Combine preconditioned coordinates with raw logits (no preconditioning for classification)
         ligand_out = torch.cat([coords_out_lig, logits_pred_lig], dim=1)
@@ -1063,10 +1063,13 @@ class PreconditionedEGNNDynamics(nn.Module):
         # Split input into coordinates and embeddings
         coords_lig = ligand_tensor[:, :self.egnn_dynamics.n_dims]  # [N_lig, 3]
         embeddings_lig = ligand_tensor[:, self.egnn_dynamics.n_dims:]  # [N_lig, atom_nf]
+
+
         coords_pocket = residue_tensor[:, :self.egnn_dynamics.n_dims]  # [N_pocket, 3]
         embeddings_pocket = residue_tensor[:, self.egnn_dynamics.n_dims:]  # [N_pocket, residue_nf]
 
         return coords_lig, embeddings_lig, coords_pocket, embeddings_pocket
+
 
     def _apply_cskip_cout_scaling_to_coords(
         self, 
@@ -1097,15 +1100,148 @@ class PreconditionedEGNNDynamics(nn.Module):
     def last_geometric_loss(self):
         """Access geometric loss from the underlying EGNN dynamics"""
         return self.egnn_dynamics.last_geometric_loss
-    
 
+
+class PreconditionedEGNNDynamicsConditional(PreconditionedEGNNDynamics):
+    """Preconditioned wrapper for EGNNDynamics following Karras et al. (2022).
+    For Conditional Ligand Sampling: preconditioning is applied to the state being diffused 
+    (coordinates + embeddings), while conditioning information enters unscaled ."""
+    
+    def __init__(self, egnn_dynamics: nn.Module, sigma_data: float = 1.0):
+        """
+        Args:
+            egnn_dynamics: The base EGNNDynamics model
+            sigma_data: Expected standard deviation of the data (default: 1.0)
+        """
+        
+        super().__init__(egnn_dynamics, sigma_data)
+    
+    def null_residue_forward(self, xh_atoms, sigma, mask_atoms, target_atoms=None):
+        """
+        Preconditioned forward pass with separate handling for coordinates and categorical features.
+
+        Note on shapes of the two returned tensors: 
+        * Input shape: (N_lig_atoms, coords (3) + joint embedding (joint_nf).
+        * Output shape: (N_pocket_residues, coords (3) + class logits (atom_nf or residue_nf).
+        
+        Args:
+            xh_atoms: [total_lig_atoms, n_dims + joint_nf] - ligand coords + embeddings
+            xh_residues: [total_pocket_atoms, n_dims + joint_nf] - pocket coords + embeddings  
+            sigma: [batch_size] or scalar - noise level (not normalized time!)
+            mask_atoms: [total_lig_atoms] - molecule indices for ligand atoms
+            mask_residues: [total_pocket_atoms] - molecule indices for pocket residues
+            target_atoms: [total_lig_atoms, n_dims + joint_nf] - target ligand coords (for geometric loss)
+            target_residues: [total_pocket_atoms, n_dims + residue_nf] - target pocket coords
+            
+        Returns:
+            Tuple of (ligand_output, pocket_output) with preconditioned coordinates + logits
+        """
+    
+        # Ensure sigma is 1D tensor with batch dimension
+        batch_size = len(torch.unique(mask_atoms))
+        if sigma.dim() < 1:
+            sigma = sigma.expand(batch_size)
+    
+        if sigma.dim() != 1 or batch_size != sigma.shape[0]:
+            print(sigma.shape, batch_size)
+
+            raise ValueError(
+                "sigma must be 1D and have the same leading (batch) dim as x"
+                f" ({batch_size})"
+            )
+        
+        # unused dummy tensor to pass through functions that must be compatible with conventional forward pass
+        dummy_residues = torch.zeros_like(xh_atoms)
+
+        # Compute preconditioning coefficients
+        c_skip, c_out, c_in, c_noise = self._compute_preconditioning_coefs(sigma)
+
+        coords_lig, embeddings_lig, _, _ = self._split_coordinates_and_embeddings(xh_atoms, dummy_residues)
+
+        
+        # Apply c_in scaling to ligand coordinates and recombine with embeddings
+        coords_lig_scaled , _ = self._apply_cin_scaling_to_coords(
+            c_in, coords_lig, dummy_residues, mask_atoms, dummy_residues
+            )
+        
+        # Recombine scaled coordinates with original ligand embeddings
+        xh_ligand_scaled = torch.cat([coords_lig_scaled, embeddings_lig], dim=1)
+        
+        # Convert sigma to normalized time for the base model
+        t = c_noise.unsqueeze(1)  # [batch_size, 1]
+        
+        # Null residue forward through base EGNN (ligand only pass and pass through target data for geometric loss)
+        f_ligand = self.egnn_dynamics.null_residue_forward(
+            xh_ligand_scaled,  t, mask_atoms, target_atoms=target_atoms
+        )
+
+        # Split EGNN output into coordinates and logits
+        coords_pred_lig, logits_pred_lig, _, _ = \
+            self._split_coordinates_and_embeddings(f_ligand, dummy_residues)
+        
+        # Apply preconditioning to coordinates only (skip connection + output scaling)
+        coords_out_lig, _ = self._apply_cskip_cout_scaling_to_coords(
+            c_skip, c_out, coords_lig, dummy_residues, mask_atoms, dummy_residues, 
+            coords_pred_lig, dummy_residues
+            )
+    
+        
+        # Combine preconditioned coordinates with raw logits (no preconditioning for classification)
+        ligand_out = torch.cat([coords_out_lig, logits_pred_lig], dim=1)
+        
+        
+        return ligand_out
+    
+     
+
+    def _apply_cin_scaling_to_coords(
+            self, 
+            c_in, 
+            coords_lig, 
+            coords_pocket, 
+            mask_atoms, 
+            mask_residues
+           ):
+
+        # Apply c_in scaling to coordinates of ligand only (per molecule)
+        coords_lig_scaled = coords_lig.clone()
+        coords_pocket_scaled = coords_pocket.clone()
+        
+        for i, batch_idx in enumerate(torch.unique(mask_atoms)):
+            atom_mask = mask_atoms == batch_idx
+            coords_lig_scaled[atom_mask] = c_in[i] * coords_lig[atom_mask]
+        
+        return coords_lig_scaled, coords_pocket_scaled
+    
+    def _apply_cskip_cout_scaling_to_coords(
+        self, 
+        c_skip, 
+        c_out, 
+        coords_lig, 
+        coords_pocket, 
+        mask_atoms, 
+        mask_residues,
+        coords_pred_lig, 
+        coords_pred_pocket
+        ):
+        # Apply preconditioning to coordinates of ligand only (skip connection + output scaling)
+        coords_out_lig = coords_lig.clone()
+        # NOTE: setting this here to = coords_pred_pocket would return zero vector from this function -> needed if we want to predict noise not clean coords
+        coords_out_pocket = coords_pocket.clone() 
+        
+        for i, batch_idx in enumerate(torch.unique(mask_atoms)):
+            atom_mask = mask_atoms == batch_idx
+            coords_out_lig[atom_mask] = c_skip[i] * coords_lig[atom_mask] + c_out[i] * coords_pred_lig[atom_mask]
+        
+            
+        return coords_out_lig, coords_out_pocket
 
 
 
 def test_egnn_dynamics():
     """Test the enhanced EGNNDynamics implementation"""
     
-    print("Testing Enhanced EGNNDynamics with Geometric Regularization...")
+    print(f"Testing Enhanced EGNNDynamics with Geometric Regularization...")
     
     # Configuration
     batch_size = 2
@@ -1161,10 +1297,17 @@ def test_egnn_dynamics():
         target_atoms=target_atoms, target_residues=target_residues
     )
     
-    print(f"Input shapes: ligand {xh_atoms.shape}, pocket {xh_residues.shape}")
-    print(f"Output shapes: ligand {ligand_out.shape}, pocket {pocket_out.shape}")
+    assert ligand_out.shape == (xh_atoms.shape[0], n_dims + atom_nf), (
+        f"Ligand shapes not as expected.\n"
+        f"Expected: {(xh_atoms.shape[0], n_dims + atom_nf)}, Got: {ligand_out.shape}"
+    )
+
+    assert pocket_out.shape == (xh_residues.shape[0], n_dims + residue_nf),  (
+        f"Pocket shapes not as expected.\n"
+        f"Expected: {(xh_residues.shape[0], n_dims + residue_nf)}, Got: {pocket_out.shape}"
+    )
     print(f"Geometric loss: {model.last_geometric_loss.item():.6f}")
-    print(f"✅ Enhanced EGNNDynamics test passed!")
+    print(f"✅ EGNN Dynamics forward pass successful")
     
     # Test without targets (should have zero geometric loss)
     model.eval()
@@ -1172,6 +1315,90 @@ def test_egnn_dynamics():
     print(f"Geometric loss (eval mode): {model.last_geometric_loss.item():.6f}")
     
     return model
+
+
+def test_egnn_dynamics_conditional():
+    """Test the enhanced EGNNDynamics implementation"""
+    
+    print(f"Testing Enhanced conditional EGNNDynamics with Geometric Regularization...")
+    
+    # Configuration
+    batch_size = 2
+    atom_nf = 5
+    residue_nf = 7
+    n_dims = 3
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    joint_nf = 8
+    
+    # Create test data
+    total_lig_atoms = 8
+    total_pocket_atoms = 20
+    
+    xh_atoms = torch.randn(total_lig_atoms, n_dims + joint_nf, device=device)
+    xh_residues = torch.randn(total_pocket_atoms, n_dims + joint_nf, device=device)
+    
+    # Create target data (same structure as inputs for testing)
+    target_atoms = torch.randn(total_lig_atoms, n_dims + joint_nf, device=device)
+    target_residues = torch.randn(total_pocket_atoms, n_dims + joint_nf, device=device)
+    
+    mask_atoms = torch.cat([torch.zeros(4), torch.ones(4)]).long().to(device)
+    mask_residues = torch.cat([torch.zeros(12), torch.ones(8)]).long().to(device)
+    
+    t = torch.tensor([0.3, 0.7], dtype=torch.float32, device=device)
+    print(f"Time tensor shape: {t.shape}")
+    
+    # Create model with geometric regularization
+    model = EGNNDynamics(
+        atom_nf=atom_nf,
+        residue_nf=residue_nf,
+        n_dims=n_dims,
+        joint_nf=joint_nf,
+        hidden_nf=32,
+        device=device,
+        n_layers=2,
+        condition_time=True,
+        update_pocket_coords=False,
+        edge_embedding_dim=4,
+        sin_embedding=True,
+        reflection_equivariant=True,
+        tanh=True,
+        attention=True,
+        geometric_regularization=True,
+        geom_loss_weight=0.1
+    )
+
+    model = PreconditionedEGNNDynamicsConditional(model)
+    
+    # Forward pass with geometric regularization
+    model.train()  # Set to training mode to enable geometric loss
+    ligand_out, pocket_out = model(
+        xh_atoms, xh_residues, t, mask_atoms, mask_residues,
+        target_atoms=target_atoms, target_residues=target_residues
+    )
+    
+    assert ligand_out.shape == (xh_atoms.shape[0], n_dims + atom_nf), (
+        f"Ligand shapes not as expected.\n"
+        f"Expected: {(xh_atoms.shape[0], n_dims + atom_nf)}, Got: {ligand_out.shape}"
+    )
+
+    assert pocket_out.shape == (xh_residues.shape[0], n_dims + residue_nf),  (
+        f"Pocket shapes not as expected.\n"
+        f"Expected: {(xh_residues.shape[0], n_dims + residue_nf)}, Got: {pocket_out.shape}"
+    )
+
+    assert torch.all(ligand_out[:, :n_dims] != xh_atoms[:, :n_dims]), "Ligand coordinates not changed"
+    assert torch.all(pocket_out[:, :n_dims] == xh_residues[:, :n_dims]), "Pocket coordinates changed"
+
+    print(f"Geometric loss: {model.last_geometric_loss.item():.6f}")
+    print(f"✅ EGNN Dynamics forward pass successful")
+    
+    # Test without targets (should have zero geometric loss)
+    model.eval()
+    ligand_out_eval, pocket_out_eval = model(xh_atoms, xh_residues, t, mask_atoms, mask_residues)
+    print(f"Geometric loss (eval mode): {model.last_geometric_loss.item():.6f}")
+    
+    return model
+
 
 def test_egnn_dynamics_null_residues():
     """Test the enhanced EGNNDynamics implementation"""
@@ -1223,27 +1450,33 @@ def test_egnn_dynamics_null_residues():
         geom_loss_weight=0.1
     )
 
-    model = PreconditionedEGNNDynamics(model)
+    model = PreconditionedEGNNDynamicsConditional(model)
     
     # Forward pass with geometric regularization
     model.train()  # Set to training mode to enable geometric loss
-    ligand_out, pocket_out = model(
-        xh_atoms, xh_residues, t, mask_atoms, mask_residues,
-        target_atoms=target_atoms, target_residues=target_residues
-    )
+    ligand_out = model.null_residue_forward(
+        xh_atoms, t, mask_atoms, target_atoms=target_atoms
+        )
     
-    print(f"Input shapes: ligand {xh_atoms.shape}, pocket {xh_residues.shape}")
-    print(f"Output shapes: ligand {ligand_out.shape}, pocket {pocket_out.shape}")
+    assert ligand_out.shape == (xh_atoms.shape[0], n_dims + atom_nf), (
+        f"Ligand shapes not as expected.\n"
+        f"Expected: {(xh_atoms.shape[0], n_dims + atom_nf)}, Got: {ligand_out.shape}"
+    )
+
     print(f"Geometric loss: {model.last_geometric_loss.item():.6f}")
-    print(f"✅ Enhanced EGNNDynamics test passed!")
+    print(f"✅ EGNN Dynamics Conditional forward pass successful")
     
     # Test without targets (should have zero geometric loss)
     model.eval()
-    ligand_out_eval, pocket_out_eval = model(xh_atoms, xh_residues, t, mask_atoms, mask_residues)
+    ligand_out = model.null_residue_forward(
+        xh_atoms, t, mask_atoms, target_atoms=target_atoms
+        )
     print(f"Geometric loss (eval mode): {model.last_geometric_loss.item():.6f}")
     
     return model
 
 
 if __name__ == "__main__":
-    test_egnn_dynamics()
+    # test_egnn_dynamics()
+    test_egnn_dynamics_conditional()
+    # test_egnn_dynamics_null_residues()
