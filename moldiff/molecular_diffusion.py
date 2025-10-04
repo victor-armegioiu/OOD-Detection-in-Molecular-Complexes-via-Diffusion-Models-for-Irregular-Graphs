@@ -485,13 +485,13 @@ class MolecularDenoisingModel:
             sigma_batch = torch.full((batch_size, ), sigma_val, device = self.device)
 
             xh_lig_noisy, xh_pocket_noisy = self._noise_clean_embeddings(
-            xh_lig_clean, 
-            xh_pocket_clean, 
-            combined_mask, 
-            lig_coords, 
-            sigma_batch, 
-            lig_mask, 
-            pocket_mask
+                xh_lig_clean, 
+                xh_pocket_clean, 
+                combined_mask, 
+                lig_coords, 
+                sigma_batch, 
+                lig_mask, 
+                pocket_mask
             )
 
 
@@ -633,23 +633,184 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         # # freeze pocket encoder to lookup embeddings if using pocket conditioning
         # for param in self.denoiser.residue_encoder.parameters():
         #         param.requires_grad = False
-        
-    def _noise_clean_embeddings(self, xh_lig_clean, xh_pocket_clean, combined_mask, lig_coords, sigma, lig_mask, pocket_mask) -> Tuple:
+    
+    def null_residue_loss_fn(self, batch: dict):
+        """
+        CDCD-style loss function for null residue class for CFG: noise embeddings, predict logits, use cross-entropy
+        """
 
+        # Extract molecular data
+        lig_coords = batch["ligand_coords"].to(self.device)
+        lig_features = batch["ligand_features"].to(self.device)  # One-hot features
+        lig_mask = batch["ligand_mask"].to(self.device)
+        batch_size = len(torch.unique(lig_mask))
+
+        # Get true atom/residue type indices for cross-entropy loss
+        true_atom_types = torch.argmax(lig_features, dim=-1)  # [N_lig] - indices
+
+        # Convert one-hot to embeddings using encoders (DIFFERENTIABLE!)
+        lig_embeddings_clean = self.denoiser.atom_encoder(lig_features.float())  # [N_lig, joint_nf]
+
+        # Normalize embeddings (CDCD style) and coordinates
+        lig_embeddings_clean = F.normalize(lig_embeddings_clean, dim=-1)
+        lig_coords_norm = lig_coords / self.scheme.coord_norm
+
+
+        # Remove center of mass for translation invariance
+        lig_coords_centered = remove_mean_batch(lig_coords_norm, lig_mask)
+
+        # Concatenate coordinates and embeddings (NOT one-hot!)
+        xh_lig_clean = torch.cat([lig_coords_centered, lig_embeddings_clean], dim=1)  # [N_lig, 3 + joint_nf]
+   
+        # Sample noise levels
+        sigma = self.noise_sampling(shape=(batch_size,))  # [batch_size]
+
+        xh_lig_noisy = self._noise_clean_embeddings_null_residue(xh_lig_clean, sigma, lig_mask)
+
+        # Forward pass through denoiser - outputs coordinates + logits
+        # print('In train:')
+        # print('Sigma shape:', sigma.shape)
+        # print('xh_lig_noisy shape:', xh_lig_noisy.shape)
+        # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
+        # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
+        # print('lig_mask', lig_mask.shape)
+        # print('pocket_mask', pocket_mask.shape)
+
+        pred_output_lig = self.denoiser.null_residue_forward(
+            xh_atoms = xh_lig_noisy.to(self.device), 
+            t = sigma.to(self.device) if hasattr(sigma, "to") else sigma, 
+            mask_atoms = lig_mask, 
+            target_atoms=lig_coords_centered
+        )
+
+        losses = self._calculate_loss_from_noisy_embeddings_null_residue(
+            pred_output_lig, 
+            sigma, 
+            lig_mask,
+            xh_lig_clean, 
+            true_atom_types
+        )
+
+        # Metrics
+        metrics = {
+            "loss": losses.total_loss.item(),
+            "coord_loss": losses.coord_loss.item(),
+            "categorical_loss": losses.categorical_loss.item(),
+            "coord_loss_ligand": losses.coord_loss_lig.item(),
+            "coord_loss_pocket": float("nan"),
+            "categorical_loss_ligand": losses.categorical_loss_lig.item(),
+            "categorical_loss_pocket": float("nan"),
+            "geometric_loss_total": losses.geometric_loss.item(),
+            "avg_sigma": sigma.mean().item(),
+            "max_sigma": sigma.max().item(),
+            "coord_pred_scale": losses.pred_coords_lig.abs().mean().item(),
+            "atom_accuracy": (torch.argmax(losses.pred_logits_lig, dim=-1) == true_atom_types).float().mean().item(),
+            "residue_accuracy": float("nan"),
+        }
+        return losses.total_loss, metrics
+
+    def null_residue_eval_fn(self, batch: dict) -> dict:
+        """Evaluate denoising at multiple noise levels with proper loss breakdown"""
+
+        # Extract molecular data
+        lig_coords = batch["ligand_coords"].to(self.device)
+        lig_features = batch["ligand_features"].to(self.device)  # One-hot features
+        lig_mask = batch["ligand_mask"].to(self.device)
+        batch_size = len(torch.unique(lig_mask))
+
+
+        # Get true categories for evaluation
+        true_atom_types = torch.argmax(lig_features, dim=-1)
+
+        # Cache training quantiles.
+        if not hasattr(self, "_cached_sigma_levels"):
+            training_sigmas = self.noise_sampling(shape=(10000,))
+            sigma_levels = torch.quantile(training_sigmas, torch.tensor([0.1, 0.3, 0.5, 0.7, 0.9], device=self.device))
+            object.__setattr__(self, "_cached_sigma_levels", sigma_levels)
+        else:
+            sigma_levels = self._cached_sigma_levels
+
+        eval_losses = {}
+
+        for i, sigma_val in enumerate(sigma_levels):
+            # Convert one-hot to embeddings (same as training)
+            lig_embeddings_clean = self.denoiser.atom_encoder(lig_features.float())
+
+            # Normalize embeddings (CDCD style) and coordinates
+            lig_embeddings_clean = F.normalize(lig_embeddings_clean, dim=-1)
+            lig_coords_norm = lig_coords / self.scheme.coord_norm
+            
+            # Remove center of mass
+            lig_coords_centered = remove_mean_batch(lig_coords_norm, lig_mask)
+
+            # Concatenate coordinates and embeddings (NOT one-hot!)
+            xh_lig_clean = torch.cat([lig_coords_centered, lig_embeddings_clean], dim=1)
+
+            # Create sigma tensor for this evaluation (broadcast to batch_size)
+            sigma_batch = torch.full((batch_size, ), sigma_val, device = self.device)
+
+            xh_lig_noisy, xh_pocket_noisy = self._noise_clean_embeddings_null_residue(
+                xh_lig_clean,
+                sigma_batch, 
+                lig_mask
+            )
+
+
+
+            # print('In eval:')
+            # print('Noise level:', i, sigma_val)
+            # print('Sigma shape:', sigma_batch.shape)
+            # print('xh_lig_noisy shape:', xh_lig_noisy.shape)
+            # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
+            # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
+            # print('lig_mask', lig_mask.shape)
+            # print('pocket_mask', pocket_mask.shape)
+
+            # Denoise
+            with torch.no_grad():
+                pred_output_lig = self.denoiser.null_residue_forward(xh_lig_noisy, sigma_batch, lig_mask)
+
+            losses = self._calculate_loss_from_noisy_embeddings_null_residue(
+                pred_output_lig, 
+                sigma_val, 
+                lig_mask,
+                xh_lig_clean, 
+                true_atom_types
+            )
+
+            # Accuracy metrics
+            atom_accuracy = (torch.argmax(losses.pred_logits_lig, dim=-1) == true_atom_types).float().mean()
+
+
+            eval_losses[f"coord_loss_lvl{i}"] = losses.coord_loss.item()
+            eval_losses[f"categorical_loss_lvl{i}"] = losses.categorical_loss.item()
+            eval_losses[f"total_loss_lvl{i}"] = losses.coord_loss.item() + losses.categorical_loss.item()
+            eval_losses[f"atom_accuracy_lvl{i}"] = atom_accuracy.item()
+            eval_losses[f"residue_accuracy_lvl{i}"] =  torch.full_like(atom_accuracy[:, :1], float('nan'))
+
+        return eval_losses
+    
+    # NOTE use this old function for ablation study on how importnat is is to noise embeddings:
+    # Otherwise the scaling noise law is asymmetric: ligand noised and pocket embeddings are perfect oracle -> noise them too
+
+    def _noise_clean_embeddings(self, xh_lig_clean, xh_pocket_clean, combined_mask, lig_coords, sigma, lig_mask, pocket_mask) -> Tuple:
+    
         # Generate Gaussian noise for the entire state
         noise_lig = torch.randn_like(xh_lig_clean, device=self.device)
-        # noise_pocket = torch.randn_like(xh_pocket_clean, device=self.device)
+        embedding_noise_pocket = torch.randn_like(xh_pocket_clean[:, self.n_dims:], device=self.device)
 
-        # Make coordinate noise COM-free (but not embedding noise)
+        # Make coordinate noise for ligands COM-free (but not embedding noise))
         noise_lig[:, :self.n_dims] = remove_mean_batch(noise_lig[:, :self.n_dims], lig_mask)
 
         # Add noise
         sigma_expanded_lig = sigma[lig_mask].unsqueeze(1)  # [N_lig, 1]
+        sigma_expanded_pocket = sigma[pocket_mask].unsqueeze(1)  # [N_pocket, 1]
 
         xh_lig_noisy = xh_lig_clean + sigma_expanded_lig * noise_lig
+        xh_pocket_noisy = xh_pocket_clean.clone() # in pocket conditioning only embeddings are noised
+        xh_pocket_noisy[:, self.n_dims:] = xh_pocket_clean[:, self.n_dims:] + sigma_expanded_pocket * embedding_noise_pocket
 
-        # return noisy lidand but clean ligand
-        return xh_lig_noisy, xh_pocket_clean
+        return xh_lig_noisy, xh_pocket_noisy
     
     def _calculate_loss_from_noisy_embeddings(
             self, 
@@ -690,8 +851,8 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         # Categorical loss: Cross-entropy between logits and true atom types
         ce_loss_lig = F.cross_entropy(pred_logits_lig, true_atom_types, reduction="none")
         # Categorical Loss is zero is embeddings frozen
-        ce_loss_pocket = torch.zeros_like(ce_loss_lig) if self.freeze_pocket_embeddings \
-            else F.cross_entropy(pred_logits_pocket, true_residue_types, reduction="none")
+        ce_loss_pocket = F.cross_entropy(pred_logits_pocket, true_residue_types, reduction="none") if not self.freeze_pocket_embeddings \
+            else  torch.zeros_like(ce_loss_lig) 
 
         # Weight categorical loss by noise level (like coordinates)
         # categorical_loss_lig = torch.mean(weights[lig_mask] * ce_loss_lig)
@@ -721,7 +882,78 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             pred_logits_pocket,
         )
 
+    
+    def _noise_clean_embeddings_null_residue(self, xh_lig_clean, sigma, lig_mask) -> Tuple:
+    
+        # Generate Gaussian noise for the entire state
+        noise_lig = torch.randn_like(xh_lig_clean, device=self.device)
+
+        # Make coordinate noise for ligands COM-free (but not embedding noise))
+        noise_lig[:, :self.n_dims] = remove_mean_batch(noise_lig[:, :self.n_dims], lig_mask)
+
+        # Add noise
+        sigma_expanded_lig = sigma[lig_mask].unsqueeze(1)  # [N_lig, 1]
+
+        xh_lig_noisy = xh_lig_clean + sigma_expanded_lig * noise_lig
+
+        return xh_lig_noisy
             
+    def _calculate_loss_from_noisy_embeddings_null_residue(
+            self, 
+            pred_output_lig, 
+            sigma, 
+            lig_mask, 
+            xh_lig_clean, 
+            true_atom_types
+
+    ) -> MolecularLossResults:
+
+        # Split predictions: coordinates + logits
+        pred_coords_lig = pred_output_lig[:, :self.n_dims]  # [N_lig, 3]
+        pred_logits_lig = pred_output_lig[:, self.n_dims :]  # [N_lig, atom_nf] - LOGITS
+
+        # Loss weighting
+        weights = self.noise_weighting(sigma)  # [batch_size]
+        weights_lig = weights[lig_mask].unsqueeze(1)  # [N_lig, 1]
+
+        # Coordinate loss for ligand only: L2 between predicted and clean coordinates
+        clean_coords_lig = xh_lig_clean[:, : self.n_dims]
+
+        coord_loss_lig = torch.mean(weights_lig * (pred_coords_lig - clean_coords_lig) ** 2)
+        coord_loss = coord_loss_lig.clone() # for consistency
+
+        # Categorical loss: Cross-entropy between logits and true atom types
+        ce_loss_lig = F.cross_entropy(pred_logits_lig, true_atom_types, reduction="none")
+
+        # Weight categorical loss by noise level (like coordinates)
+        # categorical_loss_lig = torch.mean(weights[lig_mask] * ce_loss_lig)
+        # categorical_loss_pocket = torch.mean(weights[pocket_mask] * ce_loss_pocket)
+        # categorical_loss = categorical_loss_lig + categorical_loss_pocket
+
+        categorical_loss_lig = ce_loss_lig.mean()
+        categorical_loss = categorical_loss_lig.clone() # for consistency 
+        geometric_loss = self.denoiser.last_geometric_loss
+
+        # Combine losses
+        total_loss = self.coord_loss_weight * coord_loss + self.categorical_loss_weight * categorical_loss + geometric_loss
+
+        nan_tensor = torch.full_like(pred_coords_lig[:, :1], float("nan")) # nan tensor of random shape to fullfill typing
+
+        return MolecularLossResults(
+            total_loss,
+            coord_loss,
+            categorical_loss,
+            coord_loss_lig,
+            nan_tensor,
+            categorical_loss_lig,
+            nan_tensor,
+            geometric_loss,
+            pred_coords_lig,
+            nan_tensor,
+            pred_logits_lig,
+            nan_tensor
+        )
+
 
 
 def test_molecular_diffusion():

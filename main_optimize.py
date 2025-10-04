@@ -78,6 +78,8 @@ CONFIG = {
     'eval_interval': 10,
     'num_eval_samples': 50,
     'early_stopping_patience': 5,
+    'cfg_training': False,
+    'cfg_p_uncond': 0.2,
     
     # Diffusion parameters
     'sigma_max': 100.0,      # Maximum noise level
@@ -88,7 +90,7 @@ CONFIG = {
     'geom_loss_weight': 0.0,
     
     # Sampling parameters
-    'num_sampling_steps': 16,
+    'num_sampling_steps': 300,
     'schedule_type': "exponential",
     
     # I/O
@@ -350,9 +352,14 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
     return model
 
 
-def train_model(model: MolecularDenoisingModel, train_data: List[Dict], 
+def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingModel, train_data: List[Dict], 
                 eval_data: List[Dict], config: Dict):
     """Train the molecular diffusion model"""
+
+    # check for CFG training in joint mode (not permitted)
+    if config["cfg_training"] and config["update_pocket_coords"]:
+        raise RuntimeError("Classifier-free guidance training not possible for joint ligand-pocket modelling: " \
+        "\n config.update_pocket_coords cannot be True if config.cfg_training is True")
     
     log(f"\n{'='*60}")
     log("TRAINING MOLECULAR DIFFUSION MODEL")
@@ -474,6 +481,12 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             
 
             optimizer.zero_grad()
+
+            if config["cfg_training"] and torch.rand(()) < config["cfg_p_uncond"]:
+                loss, metrics = model.null_residue_loss_fn(batch)
+            else:
+                loss, metrics = model.loss_fn(batch)
+
             
             # Forward pass 
             loss, metrics = model.loss_fn(batch)
@@ -665,6 +678,7 @@ def evaluate_model(model: MolecularDenoisingModel, eval_data: List[Dict]) -> Dic
     
     with torch.no_grad():
         for batch in eval_data[:5]:  # Evaluate on subset
+
             eval_metrics = model.eval_fn(batch)
             
             for key, value in eval_metrics.items():
