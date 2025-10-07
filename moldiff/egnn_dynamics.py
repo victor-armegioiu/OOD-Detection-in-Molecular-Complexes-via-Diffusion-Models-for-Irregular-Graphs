@@ -1004,6 +1004,7 @@ class PreconditionedEGNNDynamics(nn.Module):
         t = c_noise.unsqueeze(1)  # [batch_size, 1]
         
         # Predict scaled denoised direction with EGNN (pass through target data for geometric loss)
+        # Takes input of shape [N, joint_nf] and output of shape [N, logits] (logits are of len atom_nf or residue_nf, resp.)
         f_ligand, f_pocket = self.egnn_dynamics(
             xh_ligand_scaled, xh_residues_scaled, t, mask_atoms, mask_residues,
             target_atoms=target_atoms, target_residues=target_residues
@@ -1106,7 +1107,7 @@ class PreconditionedEGNNDynamics(nn.Module):
         return self.egnn_dynamics.last_geometric_loss
 
 
-class PreconditionedEGNNDynamicsConditional(PreconditionedEGNNDynamics):
+class ConditionalPreconditionedEGNNDynamics(PreconditionedEGNNDynamics):
     """Preconditioned wrapper for EGNNDynamics following Karras et al. (2022).
     For Conditional Ligand Sampling: preconditioning is applied to the state being diffused 
     (coordinates + embeddings), while conditioning information enters unscaled ."""
@@ -1371,7 +1372,7 @@ def test_egnn_dynamics_conditional():
         geom_loss_weight=0.1
     )
 
-    model = PreconditionedEGNNDynamicsConditional(model)
+    model = ConditionalPreconditionedEGNNDynamics(model)
     
     # Forward pass with geometric regularization
     model.train()  # Set to training mode to enable geometric loss
@@ -1454,7 +1455,7 @@ def test_egnn_dynamics_null_residues():
         geom_loss_weight=0.1
     )
 
-    model = PreconditionedEGNNDynamicsConditional(model)
+    model = ConditionalPreconditionedEGNNDynamics(model)
     
     # Forward pass with geometric regularization
     model.train()  # Set to training mode to enable geometric loss

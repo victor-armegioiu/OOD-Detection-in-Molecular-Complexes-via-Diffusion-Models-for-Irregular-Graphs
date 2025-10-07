@@ -276,6 +276,10 @@ def create_batches_from_dataset(dataset_path: str, config: Dict) -> List[Dict]:
                             )
 
     for batch in dataloader:
+        # track COM for later addition in conditional sampling
+        com = batch.prot_coords.mean(dim=0, keepdim=True) # torch.cat([batch.lig_coords, batch.prot_coords], dim=0).mean(dim=0, keepdim=True)
+        assert len(com) == config["batch_size"]
+
         batch = {
             'ligand_coords': batch.lig_coords,
             'ligand_features': batch.lig_features,
@@ -284,7 +288,10 @@ def create_batches_from_dataset(dataset_path: str, config: Dict) -> List[Dict]:
             'pocket_coords': batch.prot_coords,
             'pocket_features': batch.prot_features,
             'pocket_mask': batch.prot_coords_batch,
+
             'batch_size': config['batch_size'],
+            # track COM for later addition in conditional sampling
+            'pocket_com': com #torch.cat([batch.lig_coords, batch.prot_coords], dim=0).mean(dim=0, keepdim=True)
         }
         data.append(batch)
 

@@ -9,7 +9,7 @@ import numpy as np
 from typing import Callable, Tuple, Optional, Protocol, NamedTuple
 from torch_scatter import scatter_mean
 
-from moldiff.egnn_dynamics import EGNNDynamics, PreconditionedEGNNDynamics
+from moldiff.egnn_dynamics import EGNNDynamics, PreconditionedEGNNDynamics, ConditionalPreconditionedEGNNDynamics
 
 Tensor = torch.Tensor
 Numeric = float | int | Tensor
@@ -312,6 +312,8 @@ class MolecularDenoisingModel:
             geometric_regularization=self.geometric_regularization,
             geom_loss_weight=self.geom_loss_weight,
         )
+        # to inherit to conditional class
+        if not self.update_pocket_coords: object.__setattr__(self, "egnn_dynamics_net", denoiser)
 
         denoiser = PreconditionedEGNNDynamics(denoiser)
 
@@ -320,6 +322,7 @@ class MolecularDenoisingModel:
         denoise = EMA(denoiser, update_after_step=100)
 
         object.__setattr__(self, "denoiser", denoiser)
+        
 
     def initialize(self):
         """Initialize model weights"""
@@ -427,6 +430,9 @@ class MolecularDenoisingModel:
             "coord_pred_scale": torch.cat([losses.pred_coords_lig, losses.pred_coords_pocket]).abs().mean().item(),
             "atom_accuracy": (torch.argmax(losses.pred_logits_lig, dim=-1) == true_atom_types).float().mean().item(),
             "residue_accuracy": (torch.argmax(losses.pred_logits_pocket, dim=-1) == true_residue_types).float().mean().item(),
+            # debugging:
+            "pred_residue_coords": pred_output_pocket[:, :self.n_dims], # to double check that coords stay constant
+            "input_residue_coords": xh_pocket_noisy[:, :self.n_dims],
         }
         return losses.total_loss, metrics
 
@@ -628,6 +634,14 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         """Initializes the noiser and denoiser components"""
         super().__post_init__()
 
+        assert not self.denoiser.egnn_dynamics.update_pocket_coords, \
+        "Conditional Denoiser cannot be used with EGNN.update_pocket_coords = True"
+
+
+        denoiser = ConditionalPreconditionedEGNNDynamics(self.egnn_dynamics_net)
+
+
+        object.__setattr__(self, "denoiser", denoiser)
         # TODO ask victor whether it even makes sense to freeze them (I would have to take from pretrained), 
         # or if I can still learn them even though I don't freeze at all
         # # freeze pocket encoder to lookup embeddings if using pocket conditioning
@@ -678,7 +692,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
 
         pred_output_lig = self.denoiser.null_residue_forward(
             xh_atoms = xh_lig_noisy.to(self.device), 
-            t = sigma.to(self.device) if hasattr(sigma, "to") else sigma, 
+            sigma = sigma.to(self.device) if hasattr(sigma, "to") else sigma, 
             mask_atoms = lig_mask, 
             target_atoms=lig_coords_centered
         )
@@ -708,87 +722,6 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             "residue_accuracy": float("nan"),
         }
         return losses.total_loss, metrics
-
-    def null_residue_eval_fn(self, batch: dict) -> dict:
-        """Evaluate denoising at multiple noise levels with proper loss breakdown"""
-
-        # Extract molecular data
-        lig_coords = batch["ligand_coords"].to(self.device)
-        lig_features = batch["ligand_features"].to(self.device)  # One-hot features
-        lig_mask = batch["ligand_mask"].to(self.device)
-        batch_size = len(torch.unique(lig_mask))
-
-
-        # Get true categories for evaluation
-        true_atom_types = torch.argmax(lig_features, dim=-1)
-
-        # Cache training quantiles.
-        if not hasattr(self, "_cached_sigma_levels"):
-            training_sigmas = self.noise_sampling(shape=(10000,))
-            sigma_levels = torch.quantile(training_sigmas, torch.tensor([0.1, 0.3, 0.5, 0.7, 0.9], device=self.device))
-            object.__setattr__(self, "_cached_sigma_levels", sigma_levels)
-        else:
-            sigma_levels = self._cached_sigma_levels
-
-        eval_losses = {}
-
-        for i, sigma_val in enumerate(sigma_levels):
-            # Convert one-hot to embeddings (same as training)
-            lig_embeddings_clean = self.denoiser.atom_encoder(lig_features.float())
-
-            # Normalize embeddings (CDCD style) and coordinates
-            lig_embeddings_clean = F.normalize(lig_embeddings_clean, dim=-1)
-            lig_coords_norm = lig_coords / self.scheme.coord_norm
-            
-            # Remove center of mass
-            lig_coords_centered = remove_mean_batch(lig_coords_norm, lig_mask)
-
-            # Concatenate coordinates and embeddings (NOT one-hot!)
-            xh_lig_clean = torch.cat([lig_coords_centered, lig_embeddings_clean], dim=1)
-
-            # Create sigma tensor for this evaluation (broadcast to batch_size)
-            sigma_batch = torch.full((batch_size, ), sigma_val, device = self.device)
-
-            xh_lig_noisy, xh_pocket_noisy = self._noise_clean_embeddings_null_residue(
-                xh_lig_clean,
-                sigma_batch, 
-                lig_mask
-            )
-
-
-
-            # print('In eval:')
-            # print('Noise level:', i, sigma_val)
-            # print('Sigma shape:', sigma_batch.shape)
-            # print('xh_lig_noisy shape:', xh_lig_noisy.shape)
-            # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
-            # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
-            # print('lig_mask', lig_mask.shape)
-            # print('pocket_mask', pocket_mask.shape)
-
-            # Denoise
-            with torch.no_grad():
-                pred_output_lig = self.denoiser.null_residue_forward(xh_lig_noisy, sigma_batch, lig_mask)
-
-            losses = self._calculate_loss_from_noisy_embeddings_null_residue(
-                pred_output_lig, 
-                sigma_val, 
-                lig_mask,
-                xh_lig_clean, 
-                true_atom_types
-            )
-
-            # Accuracy metrics
-            atom_accuracy = (torch.argmax(losses.pred_logits_lig, dim=-1) == true_atom_types).float().mean()
-
-
-            eval_losses[f"coord_loss_lvl{i}"] = losses.coord_loss.item()
-            eval_losses[f"categorical_loss_lvl{i}"] = losses.categorical_loss.item()
-            eval_losses[f"total_loss_lvl{i}"] = losses.coord_loss.item() + losses.categorical_loss.item()
-            eval_losses[f"atom_accuracy_lvl{i}"] = atom_accuracy.item()
-            eval_losses[f"residue_accuracy_lvl{i}"] =  torch.full_like(atom_accuracy[:, :1], float('nan'))
-
-        return eval_losses
     
     # NOTE use this old function for ablation study on how importnat is is to noise embeddings:
     # Otherwise the scaling noise law is asymmetric: ligand noised and pocket embeddings are perfect oracle -> noise them too
@@ -797,7 +730,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
     
         # Generate Gaussian noise for the entire state
         noise_lig = torch.randn_like(xh_lig_clean, device=self.device)
-        embedding_noise_pocket = torch.randn_like(xh_pocket_clean[:, self.n_dims:], device=self.device)
+        # embedding_noise_pocket = torch.randn_like(xh_pocket_clean[:, self.n_dims:], device=self.device)
 
         # Make coordinate noise for ligands COM-free (but not embedding noise))
         noise_lig[:, :self.n_dims] = remove_mean_batch(noise_lig[:, :self.n_dims], lig_mask)
@@ -808,7 +741,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
 
         xh_lig_noisy = xh_lig_clean + sigma_expanded_lig * noise_lig
         xh_pocket_noisy = xh_pocket_clean.clone() # in pocket conditioning only embeddings are noised
-        xh_pocket_noisy[:, self.n_dims:] = xh_pocket_clean[:, self.n_dims:] + sigma_expanded_pocket * embedding_noise_pocket
+        # xh_pocket_noisy[:, self.n_dims:] = xh_pocket_clean[:, self.n_dims:] + sigma_expanded_pocket * embedding_noise_pocket
 
         return xh_lig_noisy, xh_pocket_noisy
     
@@ -1003,6 +936,87 @@ def test_molecular_diffusion():
 
     return model
 
+def test_conditional_molecular_diffusion():
+    """Test the conditional molecular diffusion implementation"""
+
+    print("Testing GenCFD-Style Molecular Diffusion (CUDA)...")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Cuda is not available!")
+
+    # Create test batch (all on CUDA)
+    device = "cuda"
+    batch_size = 2
+    atom_nf = 5
+    residue_nf = 7
+
+    batch = {
+        "ligand_coords": torch.randn(8, 3, device=device),
+        "ligand_features": torch.nn.functional.one_hot(torch.randint(0, atom_nf, (8,), device=device), atom_nf).float(),
+        "pocket_coords": torch.randn(16, 3, device=device),
+        "pocket_features": torch.nn.functional.one_hot(torch.randint(0, residue_nf, (16,), device=device), residue_nf).float(),
+        "ligand_mask": torch.cat([torch.zeros(4), torch.ones(4)]).long().to(device),
+        "pocket_mask": torch.cat([torch.zeros(8), torch.ones(8)]).long().to(device),
+        "batch_size": 2,
+    }
+    combined_mask = torch.cat([batch["ligand_mask"], batch["pocket_mask"]], dim=0)
+    batch["com"] = scatter_mean(torch.cat([batch["ligand_coords"], batch["pocket_coords"]], dim=0), combined_mask, dim=0)
+    
+
+    # Create model
+    sigma_schedule = exponential_noise_schedule(clip_max=100.0)  # Smaller max
+    scheme = MolecularDiffusion.create_variance_exploding(sigma=sigma_schedule, categorical_temperature=1.0)
+
+    model = ConditionalMolecularDenoisingModel(
+        atom_nf=atom_nf, 
+        residue_nf=residue_nf, 
+        joint_nf=8, 
+        hidden_nf=32, 
+        n_layers=2,
+        scheme=scheme, 
+        update_pocket_coords = False,
+        coord_loss_weight=2.0, 
+        categorical_loss_weight=1.0)
+
+    model.initialize()
+
+    assert not model.denoiser.egnn_dynamics.update_pocket_coords, "Pocket coords are updated in denoiser"
+
+    print(f"--- Testing conditional loss with residues---")
+
+    # Test loss computation
+    loss, metrics = model.loss_fn(batch)
+    print(f"Total Loss: {loss.item():.4f}")
+    print(f"Coord Loss: {metrics['coord_loss']:.4f}")
+    print(f"Categorical Loss: {metrics['categorical_loss']:.4f}")
+    print(f"Sigma range: [{metrics['avg_sigma']:.3f}, {metrics['max_sigma']:.3f}]")
+    print(f"Coord prediction scale: {metrics['coord_pred_scale']:.3f}")
+    # assert stable pocket coords: input stable
+    assert torch.allclose(metrics["input_residue_coords"], batch["pocket_coords"] - batch["com"][batch['pocket_mask']]), \
+        f"Input coords to network don't match batch input: \n Input: {batch['pocket_coords'] - batch['com'][batch['pocket_mask']]} \n Output: {metrics['input_residue_coords']}"
+    # assert stable pocket coords: out stable
+    assert torch.allclose(metrics["pred_residue_coords"], batch["pocket_coords"] - batch["com"][batch['pocket_mask']]), \
+        f"Pocket coord drift by network:\n Input: {batch['pocket_coords'] - batch['com'][batch['pocket_mask']]} \n Output: {metrics['pred_residue_coords']}"
+
+    print(f"--- Testing null residue loss ---")
+    loss, metrics = model.null_residue_loss_fn(batch)
+    print(f"Total Loss: {loss.item():.4f}")
+    print(f"Coord Loss: {metrics['coord_loss']:.4f}")
+    print(f"Categorical Loss: {metrics['categorical_loss']:.4f}")
+    print(f"Sigma range: [{metrics['avg_sigma']:.3f}, {metrics['max_sigma']:.3f}]")
+    print(f"Coord prediction scale: {metrics['coord_pred_scale']:.3f}")
+
+
+
+    # Test evaluation
+    eval_metrics = model.eval_fn(batch)
+    print(f"Eval metrics: {eval_metrics}")
+
+    print("\n✅ GenCFD-style molecular diffusion test passed!")
+
+    return model
+
 
 if __name__ == "__main__":
-    test_molecular_diffusion()
+    # test_molecular_diffusion()
+    test_conditional_molecular_diffusion()
