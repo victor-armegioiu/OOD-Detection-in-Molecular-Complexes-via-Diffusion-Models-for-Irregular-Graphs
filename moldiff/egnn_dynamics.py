@@ -755,9 +755,9 @@ class EGNNDynamics(nn.Module):
         if self.update_pocket_coords:
             # joint: COM-free velocity on whole complex
             vel = remove_mean_batch(vel, mask)
-        else:
-            # conditioned: COM-free velocity on ligand only
-            vel[:len(mask_atoms)] = remove_mean_batch(vel[:len(mask_atoms)], mask_atoms)
+        # else:
+        #     # conditioned: COM-free velocity on ligand only
+        #     vel[:len(mask_atoms)] = remove_mean_batch(vel[:len(mask_atoms)], mask_atoms)
 
         return torch.cat([vel[:len(mask_atoms)], h_final_atoms], dim=-1), \
                torch.cat([vel[len(mask_atoms):], h_final_residues], dim=-1)
@@ -879,8 +879,8 @@ class EGNNDynamics(nn.Module):
                 raise ValueError("NaN detected in EGNN output")
 
         # if self.update_pocket_coords:
-        # we always remove the COM because the ligand is without reference frame
-        vel = remove_mean_batch(vel, mask)
+        # we do not remove the COM here, because at sampling the cond and uncond passes should both be in the same anchor frame
+        # vel = remove_mean_batch(vel, mask)
 
         return torch.cat([vel[:len(mask_atoms)], h_final_atoms], dim=-1)
     

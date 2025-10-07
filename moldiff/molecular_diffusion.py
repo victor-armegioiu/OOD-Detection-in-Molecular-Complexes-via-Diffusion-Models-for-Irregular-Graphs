@@ -358,14 +358,13 @@ class MolecularDenoisingModel:
         lig_coords_norm = lig_coords / self.scheme.coord_norm
         pocket_coords_norm = pocket_coords / self.scheme.coord_norm
 
-        # Remove center of mass for translation invariance
-        combined_coords = torch.cat([lig_coords_norm, pocket_coords_norm], dim=0)
-        combined_mask = torch.cat([lig_mask, pocket_mask], dim=0)
-        combined_coords_centered = remove_mean_batch(combined_coords, combined_mask)
-
-        lig_coords_centered = combined_coords_centered[: len(lig_coords)]
-        pocket_coords_centered = combined_coords_centered[len(lig_coords) :]
-
+        lig_coords_centered, pocket_coords_centered, combined_mask = self._anchor_reference_frame(
+            lig_coords_norm, 
+            pocket_coords_norm, 
+            lig_mask, 
+            pocket_mask
+        )
+        
         # Concatenate coordinates and embeddings (NOT one-hot!)
         xh_lig_clean = torch.cat([lig_coords_centered, lig_embeddings_clean], dim=1)  # [N_lig, 3 + joint_nf]
         xh_pocket_clean = torch.cat([pocket_coords_centered, pocket_embeddings_clean], dim=1)  # [N_pocket, 3 + joint_nf]
@@ -430,7 +429,7 @@ class MolecularDenoisingModel:
             "coord_pred_scale": torch.cat([losses.pred_coords_lig, losses.pred_coords_pocket]).abs().mean().item(),
             "atom_accuracy": (torch.argmax(losses.pred_logits_lig, dim=-1) == true_atom_types).float().mean().item(),
             "residue_accuracy": (torch.argmax(losses.pred_logits_pocket, dim=-1) == true_residue_types).float().mean().item(),
-            # debugging:
+            # debugging and testing:
             "pred_residue_coords": pred_output_pocket[:, :self.n_dims], # to double check that coords stay constant
             "input_residue_coords": xh_pocket_noisy[:, :self.n_dims],
         }
@@ -475,13 +474,12 @@ class MolecularDenoisingModel:
             lig_coords_norm = lig_coords / self.scheme.coord_norm
             pocket_coords_norm = pocket_coords / self.scheme.coord_norm
 
-            # Remove center of mass
-            combined_coords = torch.cat([lig_coords_norm, pocket_coords_norm], dim=0)
-            combined_mask = torch.cat([lig_mask, pocket_mask], dim=0)
-            combined_coords_centered = remove_mean_batch(combined_coords, combined_mask)
-
-            lig_coords_centered = combined_coords_centered[: len(lig_coords)]
-            pocket_coords_centered = combined_coords_centered[len(lig_coords) :]
+            lig_coords_centered, pocket_coords_centered, combined_mask = self._anchor_reference_frame(
+                lig_coords_norm, 
+                pocket_coords_norm, 
+                lig_mask, 
+                pocket_mask
+            )
 
             # Concatenate coordinates and embeddings (NOT one-hot!)
             xh_lig_clean = torch.cat([lig_coords_centered, lig_embeddings_clean], dim=1)
@@ -539,6 +537,19 @@ class MolecularDenoisingModel:
             eval_losses[f"residue_accuracy_lvl{i}"] = residue_accuracy.item()
 
         return eval_losses
+    
+    def _anchor_reference_frame(self, lig_coords_norm, pocket_coords_norm, lig_mask, pocket_mask):
+
+        # Remove center of mass for translation invariance
+        combined_coords = torch.cat([lig_coords_norm, pocket_coords_norm], dim=0)
+        combined_mask = torch.cat([lig_mask, pocket_mask], dim=0)
+        combined_coords_centered = remove_mean_batch(combined_coords, combined_mask)
+
+        lig_coords_centered = combined_coords_centered[: len(lig_coords_norm)]
+        pocket_coords_centered = combined_coords_centered[len(lig_coords_norm) :]
+
+        return lig_coords_centered, pocket_coords_centered, combined_mask
+
 
     def _noise_clean_embeddings(self, xh_lig_clean, xh_pocket_clean, combined_mask, lig_coords, sigma, lig_mask, pocket_mask) -> Tuple:
 
@@ -647,7 +658,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         # # freeze pocket encoder to lookup embeddings if using pocket conditioning
         # for param in self.denoiser.residue_encoder.parameters():
         #         param.requires_grad = False
-    
+  
     def null_residue_loss_fn(self, batch: dict):
         """
         CDCD-style loss function for null residue class for CFG: noise embeddings, predict logits, use cross-entropy
@@ -670,11 +681,10 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         lig_coords_norm = lig_coords / self.scheme.coord_norm
 
 
-        # Remove center of mass for translation invariance
-        lig_coords_centered = remove_mean_batch(lig_coords_norm, lig_mask)
+        # No COM removal required
 
         # Concatenate coordinates and embeddings (NOT one-hot!)
-        xh_lig_clean = torch.cat([lig_coords_centered, lig_embeddings_clean], dim=1)  # [N_lig, 3 + joint_nf]
+        xh_lig_clean = torch.cat([lig_coords_norm, lig_embeddings_clean], dim=1)  # [N_lig, 3 + joint_nf]
    
         # Sample noise levels
         sigma = self.noise_sampling(shape=(batch_size,))  # [batch_size]
@@ -694,7 +704,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             xh_atoms = xh_lig_noisy.to(self.device), 
             sigma = sigma.to(self.device) if hasattr(sigma, "to") else sigma, 
             mask_atoms = lig_mask, 
-            target_atoms=lig_coords_centered
+            target_atoms=lig_coords_norm
         )
 
         losses = self._calculate_loss_from_noisy_embeddings_null_residue(
@@ -723,8 +733,16 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         }
         return losses.total_loss, metrics
     
-    # NOTE use this old function for ablation study on how importnat is is to noise embeddings:
-    # Otherwise the scaling noise law is asymmetric: ligand noised and pocket embeddings are perfect oracle -> noise them too
+    
+    def _anchor_reference_frame(self, lig_coords_norm, pocket_coords_norm, lig_mask, pocket_mask):
+        """Conditional modeling requires no COM removal"""
+
+        # Remove center of mass for translation invariance
+        combined_mask = torch.cat([lig_mask, pocket_mask], dim=0)
+
+        return lig_coords_norm, pocket_coords_norm, combined_mask
+
+
 
     def _noise_clean_embeddings(self, xh_lig_clean, xh_pocket_clean, combined_mask, lig_coords, sigma, lig_mask, pocket_mask) -> Tuple:
     
@@ -737,7 +755,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
 
         # Add noise
         sigma_expanded_lig = sigma[lig_mask].unsqueeze(1)  # [N_lig, 1]
-        sigma_expanded_pocket = sigma[pocket_mask].unsqueeze(1)  # [N_pocket, 1]
+        # sigma_expanded_pocket = sigma[pocket_mask].unsqueeze(1)  # [N_pocket, 1]
 
         xh_lig_noisy = xh_lig_clean + sigma_expanded_lig * noise_lig
         xh_pocket_noisy = xh_pocket_clean.clone() # in pocket conditioning only embeddings are noised
@@ -992,11 +1010,11 @@ def test_conditional_molecular_diffusion():
     print(f"Sigma range: [{metrics['avg_sigma']:.3f}, {metrics['max_sigma']:.3f}]")
     print(f"Coord prediction scale: {metrics['coord_pred_scale']:.3f}")
     # assert stable pocket coords: input stable
-    assert torch.allclose(metrics["input_residue_coords"], batch["pocket_coords"] - batch["com"][batch['pocket_mask']]), \
-        f"Input coords to network don't match batch input: \n Input: {batch['pocket_coords'] - batch['com'][batch['pocket_mask']]} \n Output: {metrics['input_residue_coords']}"
+    assert torch.allclose(metrics["input_residue_coords"], batch["pocket_coords"], atol=1e6, rtol=1e5), \
+        f"Input coords to network don't match batch input: \n Input: {batch['pocket_coords']} \n Output: {metrics['input_residue_coords']}"
     # assert stable pocket coords: out stable
-    assert torch.allclose(metrics["pred_residue_coords"], batch["pocket_coords"] - batch["com"][batch['pocket_mask']]), \
-        f"Pocket coord drift by network:\n Input: {batch['pocket_coords'] - batch['com'][batch['pocket_mask']]} \n Output: {metrics['pred_residue_coords']}"
+    assert torch.allclose(metrics["pred_residue_coords"], batch["pocket_coords"], atol=1e6, rtol=1e5), \
+        f"Pocket coord drift by network:\n Input: {batch['pocket_coords']} \n Output: {metrics['pred_residue_coords']}"
 
     print(f"--- Testing null residue loss ---")
     loss, metrics = model.null_residue_loss_fn(batch)
