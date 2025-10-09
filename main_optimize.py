@@ -41,6 +41,7 @@ from moldiff.molecular_diffusion import (
 from moldiff.metrics import (
     load_checkpoint,
     sample_molecules, 
+    sample_molecules_conditionally,
     evaluate_atom_aa_distributions,
     evaluate_mols,
     build_mol_objects
@@ -80,6 +81,7 @@ CONFIG = {
     'early_stopping_patience': 5,
     'cfg_training': False,
     'cfg_p_uncond': 0.2,
+    'cfg_guidance_scale': 3,
     
     # Diffusion parameters
     'sigma_max': 100.0,      # Maximum noise level
@@ -172,6 +174,9 @@ def parse_arguments():
     parser.add_argument('--eval_interval', type=int, help='Interval for evaluation')
     parser.add_argument('--early_stopping_patience', type=int, help='Patience for early stopping')
     parser.add_argument('--use_scheduler', action='store_true', help='If the predefined learning rate scheduler should be used')
+    parser.add_argument('--cfg_training', action='store_true', help='Enables classifier-free training')
+    parser.add_argument('--cfg_p_uncond', type = float, help='Fraction of null residue training rounds')
+    parser.add_argument('--cfg_guidance_scale', type = float, help='Guidance scale in CFG sampling procedure')
     
     # Sampling parameters
     parser.add_argument('--num_sampling_steps', type=int, help='Number of sampling steps')
@@ -241,6 +246,12 @@ def update_config_from_args(config: Dict, args) -> Dict:
         config['early_stopping_patience'] = args.early_stopping_patience
     if args.use_scheduler is not None:
         config['use_scheduler'] = args.use_scheduler
+    if args.cfg_training is not None:
+        config['cfg_training'] = args.cfg_training
+    if args.cfg_p_uncond is not None:
+        config['cfg_p_uncond'] = args.cfg_p_uncond
+    if args.cfg_guidance_scale is not None:
+        config['cfg_guidance_scale'] = args.cfg_guidance_scale
     
     # Update sampling parameters
     if args.num_sampling_steps is not None:
@@ -277,8 +288,8 @@ def create_batches_from_dataset(dataset_path: str, config: Dict) -> List[Dict]:
 
     for batch in dataloader:
         # track COM for later addition in conditional sampling
-        com = batch.prot_coords.mean(dim=0, keepdim=True) # torch.cat([batch.lig_coords, batch.prot_coords], dim=0).mean(dim=0, keepdim=True)
-        assert len(com) == config["batch_size"]
+        # com = batch.prot_coords.mean(dim=0, keepdim=True) # torch.cat([batch.lig_coords, batch.prot_coords], dim=0).mean(dim=0, keepdim=True)
+        # assert len(com) == config["batch_size"]
 
         batch = {
             'ligand_coords': batch.lig_coords,
@@ -289,9 +300,9 @@ def create_batches_from_dataset(dataset_path: str, config: Dict) -> List[Dict]:
             'pocket_features': batch.prot_features,
             'pocket_mask': batch.prot_coords_batch,
 
-            'batch_size': config['batch_size'],
+            'batch_size': config['batch_size']
             # track COM for later addition in conditional sampling
-            'pocket_com': com #torch.cat([batch.lig_coords, batch.prot_coords], dim=0).mean(dim=0, keepdim=True)
+            # 'pocket_com': com #torch.cat([batch.lig_coords, batch.prot_coords], dim=0).mean(dim=0, keepdim=True)
         }
         data.append(batch)
 
@@ -485,19 +496,17 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
         start = time.perf_counter()
         for batch_idx, batch in enumerate(train_data):
 
-            
-
             optimizer.zero_grad()
 
+            # Forward pass
             if config["cfg_training"] and torch.rand(()) < config["cfg_p_uncond"]:
+                # unconditional loss
                 loss, metrics = model.null_residue_loss_fn(batch)
             else:
+                # conditional loss
                 loss, metrics = model.loss_fn(batch)
 
-            
-            # Forward pass 
-            loss, metrics = model.loss_fn(batch)
-            
+                    
             # Backward pass 
             loss.backward()
             
@@ -576,11 +585,24 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
             save_path = config['checkpoint_path'].replace(".pt", f"_epoch_{epoch + 1}.pt")
             save_checkpoint(model, config, save_path, optimizer=optimizer, scheduler=scheduler, scaler=scaler, epoch=epoch, best_metrics=best_metrics)
             loaded_model = load_checkpoint(save_path)
-            samples = sample_molecules(loaded_model,
-                                    num_steps=config['num_sampling_steps'],
-                                    schedule_type=config['schedule_type'],
-                                    num_samples=config['num_eval_samples']
-                                    )
+
+            if not config["update_pocket_coords"]:
+                sample_loader = eval_data[0] # TODO should be replaced by a test dataset
+                samples = sample_molecules_conditionally(
+                    loaded_model, 
+                    sample_loader,
+                    num_steps = config['num_sampling_steps'], 
+                    schedule_type=config['schedule_type'], 
+                    guidance_scale = config["cfg_guidance_scale"] # attach guidance scale
+                )
+                print("Conditional sampling used in training!")
+            else:
+                samples = sample_molecules(
+                    loaded_model,
+                    num_steps=config['num_sampling_steps'],
+                    schedule_type=config['schedule_type'],
+                    num_samples=config['num_eval_samples']
+                    )
             distribution_losses = evaluate_atom_aa_distributions(samples)
             eval_losses.update(distribution_losses)
 
@@ -1315,12 +1337,23 @@ def main():
 
             # --- Sampling ---
             t_sample_start = time.perf_counter()
-            samples = sample_molecules(
-                loaded_model,
-                num_steps=CONFIG['num_sampling_steps'],
-                schedule_type=CONFIG['schedule_type'],
-                num_samples=CONFIG['num_eval_samples']
-            )
+            if not CONFIG["update_pocket_coords"]:
+                sample_loader = create_batches_from_dataset(CONFIG['eval_dataset_path'], {"batch_size": CONFIG["num_eval_samples"]})[0] # TODO should be replaced by a test dataset
+                samples = sample_molecules_conditionally(
+                    loaded_model, 
+                    sample_loader,
+                    num_steps = CONFIG['num_sampling_steps'], 
+                    schedule_type=CONFIG['schedule_type'], 
+                    guidance_scale = CONFIG["cfg_guidance_scale"] # attach guidance scale
+                )
+                print("Conditional Sampling enabled!")
+            else:
+                samples = sample_molecules(
+                    loaded_model,
+                    num_steps=CONFIG['num_sampling_steps'],
+                    schedule_type=CONFIG['schedule_type'],
+                    num_samples=CONFIG['num_eval_samples']
+                    )
             t_sample_end = time.perf_counter()
             log_time("Sampling", t_sample_start, t_sample_end, use_warnings)
 

@@ -24,12 +24,14 @@ from moldiff.molecular_diffusion import (
 from moldiff.constants import (
     ligand_size_distribution, 
     ligand_to_pocket_size_mapping, 
+    pocket_to_ligand_size_mapping,
     atom_decoder, 
     aa_decoder3, 
     atom_freq_dist, 
     aa_freq_dist,
     ring_size_dist)
 
+from typing import Dict
 
 def load_checkpoint(checkpoint_path: str) -> MolecularDenoisingModel:
     """Load model from checkpoint"""
@@ -147,6 +149,43 @@ def sample_lig_pocket_sizes(N: int, lig_lower_bound: int = 10, lig_upper_bound: 
     
     return ligand_sizes, pocket_sizes
 
+def sample_lig_size_given_pocket_size(pocket_features: torch.LongTensor):
+
+    # TODO implement
+    ligand_size_min = 0
+    ligand_size_max = 224
+    ligand_size_range = np.arange(ligand_size_min, ligand_size_max + 1)
+
+    ligand_sizes = []
+    pocket_keys = list(pocket_to_ligand_size_mapping.keys())
+
+    for pocket in pocket_features:
+
+        if pocket not in pocket_keys:
+            closest_pocket_size = pocket_keys[np.searchsorted(pocket_keys, pocket)]
+            print(f"Pocket key {pocket} not found: replaced by closest key {closest_pocket_size}")
+        else:
+            closest_pocket_size = pocket.item()
+
+        assert isinstance(closest_pocket_size, int), f"Pocket isn't int but {type(closest_pocket_size)}:{closest_pocket_size}"
+
+        # sample lig_size given pocket_size
+        mapping = np.array(pocket_to_ligand_size_mapping[closest_pocket_size])
+        marginal_p = mapping / sum(mapping) # normalize to one
+
+        # assert np.close(marginal_p.sum() == 1, f"Marginal doesnt sum to one {marginal_p.sum()}"
+
+        ligand_sizes.append(np.random.choice(ligand_size_range, p = marginal_p))
+    
+
+
+
+    # for size in pocket_sizes: sample a ligand size according to some distribution (learned or not) 
+    # ligand_sizes = (torch.ones(pocket_features.shape[0]) * 15).long()
+    # assert
+    return torch.LongTensor(ligand_sizes)
+
+
 
 def save_samples_to_graphs(samples: list[Data], num_samples: int, save_path: str):
     '''Save samples individually as graphs for visualization'''
@@ -161,10 +200,11 @@ def save_samples_to_graphs(samples: list[Data], num_samples: int, save_path: str
         torch.save(graph, save_path.replace(".pt", f"_graph_{i}.pt"))
 
 
-def sample_molecules(model: MolecularDenoisingModel, 
-            num_steps: int = 50, 
-            schedule_type: str = "exponential", 
-            num_samples: int = 3
+def sample_molecules(
+        model: MolecularDenoisingModel, 
+        num_steps: int = 50, 
+        schedule_type: str = "exponential", 
+        num_samples: int = 3
             ):
 
     """Generate new molecules using the trained model"""
@@ -214,6 +254,76 @@ def sample_molecules(model: MolecularDenoisingModel,
     print(f"  Pocket residue type distribution: {torch.bincount(pocket_types)}")
     
     print(f"\n✅ Sampling completed successfully!")
+    
+    return samples
+
+def sample_molecules_conditionally(
+        model: ConditionalMolecularDenoisingModel, 
+        sample_batch: Dict,
+        num_steps: int = 50, 
+        schedule_type: str = "exponential",
+        guidance_scale: float = 3, 
+        
+            ):
+
+    """Generate new molecules using the trained model"""
+
+    assert isinstance(sample_batch, dict), "Sample loader has to be of type dict"
+    assert all(k in sample_batch for k in ["pocket_mask", "pocket_coords", "pocket_features"]), \
+        f"Missing keys: {[k for k in ['pocket_mask', 'pocket_coords', 'pocket_features'] if k not in sample_batch]}"
+    
+    print(f"\n{'='*60}")
+    print("SAMPLING NEW MOLECULES")
+    print(f"{'='*60}")
+
+    # count the pocket sizes
+    pocket_sizes = torch.unique(sample_batch["pocket_mask"], return_counts=True)[1] # get them from sample loader
+
+    # Create sampler
+    ligand_sizes = sample_lig_size_given_pocket_size(pocket_sizes)
+    print(f"Ligand sizes: {ligand_sizes}")
+    print(f"Pocket sizes: {pocket_sizes}")
+    
+    sampler = create_molecular_sampler_from_model(
+        model=model,
+        ligand_sizes=ligand_sizes,
+        pocket_sizes=pocket_sizes,
+        num_steps=num_steps,
+        schedule_type=schedule_type,
+        return_full_paths=False
+    )
+    
+    print("Sampling conditional molecules...")
+    print(f"Using {num_steps} sampling steps...")
+
+    conditioning_batch = sampler._create_initial_conditioning_dict(pocket_batch = sample_batch, guidance_scale = guidance_scale)
+    
+    # Generate samples
+    samples = sampler.generate(conditioning_batch)
+    
+    print(f"\nGenerated molecules:")
+    print(f"  Total ligand atoms: {samples['ligand_coords'].shape[0]}")
+    print(f"  Total pocket residues: {samples['pocket_coords'].shape[0]}")
+    print(f"  Ligand coordinate range: [{samples['ligand_coords'].min():.2f}, {samples['ligand_coords'].max():.2f}]")
+    print(f"  Pocket coordinate range: [{samples['pocket_coords'].min():.2f}, {samples['pocket_coords'].max():.2f}]")
+    
+    # Check that categorical features are properly discretized 
+    lig_feature_sums = samples['ligand_features'].sum(dim=1)
+    pocket_feature_sums = samples['pocket_features'].sum(dim=1)
+    
+    print(f"  Ligand features properly one-hot: {torch.allclose(lig_feature_sums, torch.ones_like(lig_feature_sums))}")
+    print(f"  Pocket features properly one-hot: {torch.allclose(pocket_feature_sums, torch.ones_like(pocket_feature_sums))}")
+    
+    # Show some statistics
+    ligand_types = torch.argmax(samples['ligand_features'], dim=1)
+    pocket_types = torch.argmax(samples['pocket_features'], dim=1)
+    
+    print(f"  Ligand atom type distribution: {torch.bincount(ligand_types)}")
+    print(f"  Pocket residue type distribution: {torch.bincount(pocket_types)}")
+    
+    print(f"\n✅ Sampling completed successfully!")
+
+    # TODO: return some metric to log to wanbd to overview sample quality
     
     return samples
 
@@ -539,23 +649,32 @@ def evaluate_mols(mols):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", required=True, type=str)
-    parser.add_argument("--num_steps", type=int, default=25)
-    parser.add_argument("--n_samples", type=int, default=3)
-    args = parser.parse_args()
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--model_path", required=True, type=str)
+    # parser.add_argument("--num_steps", type=int, default=25)
+    # parser.add_argument("--n_samples", type=int, default=3)
+    # args = parser.parse_args()
     
-    model = load_checkpoint(args.model_path)
-    samples = sample_molecules(model, num_steps=args.num_steps, num_samples=args.n_samples)
+    # model = load_checkpoint(args.model_path)
+    # samples = sample_molecules(model, num_steps=args.num_steps, num_samples=args.n_samples)
 
-    molecules = build_mol_objects(samples)
+    # molecules = build_mol_objects(samples)
 
-    for key, value in evaluate_mols(molecules).items():
-        print(f'{key}: {value}')
+    # for key, value in evaluate_mols(molecules).items():
+    #     print(f'{key}: {value}')
 
-    utils.write_sdf_file(sdf_path='samples/0730_110059_bayesian_trial_1_epoch_599.sdf', molecules=molecules)
+    # utils.write_sdf_file(sdf_path='samples/0730_110059_bayesian_trial_1_epoch_599.sdf', molecules=molecules)
     
-    save_samples_to_graphs(samples, args.n_samples, args.model_path)
+    # save_samples_to_graphs(samples, args.n_samples, args.model_path)
+
+    #  conditional sampling test
+    # test_sums = {key: sum(item) for key, item in pocket_to_ligand_size_mapping.items()}
+    # assert np.all(np.array(test_sums.items) == 1), f"Sums are unequal one {test_sums}"
+    pocket_sizes = torch.LongTensor([17, 20, 62])
+    ligand_sizes = sample_lig_size_given_pocket_size(pocket_sizes)
+    print(ligand_sizes)
+    assert ligand_sizes.dtype == torch.long
+
 
 
 # # Save the samples to a json file, making tensors serializable

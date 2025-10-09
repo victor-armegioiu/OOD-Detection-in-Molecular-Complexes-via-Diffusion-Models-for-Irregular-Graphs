@@ -74,8 +74,11 @@ def dsquare_dt(f: Callable[[Tensor], Tensor]) -> Callable[[Tensor], Tensor]:
 # ********************
 
 class MolecularEulerMaruyamaStep:    
-    def __init__(self, n_dims: int = 3):
+    def __init__(self, n_dims: int = 3, com_mode: str = "joint"):
         self.n_dims = n_dims
+        self.com_mode = com_mode
+
+        assert com_mode in ["joint", "cond"], "com_mode must be in [joint, cond]"
     
     def step(
         self,
@@ -100,14 +103,14 @@ class MolecularEulerMaruyamaStep:
         noise_lig = torch.randn_like(molecular_state.ligand)
         noise_pocket = torch.randn_like(molecular_state.pocket)
         
-        # Make coordinate noise COM-free (molecular-specific constraint)
-        if self.n_dims > 0:
+        # Make coordinate noise COM-free (molecular-specific constraint) if we model jointly
+        if self.n_dims > 0 and self.com_mode == "joint":
             noise_coords_combined = torch.cat([
                 noise_lig[:, :self.n_dims], 
                 noise_pocket[:, :self.n_dims]
             ], dim=0)
             combined_mask = torch.cat([molecular_state.ligand_mask, molecular_state.pocket_mask])
-            noise_coords_centered = remove_mean_batch(noise_coords_combined, combined_mask)
+            noise_coords_centered = self.remove_mean_batch(noise_coords_combined, combined_mask)
             
             noise_lig[:, :self.n_dims] = noise_coords_centered[:len(molecular_state.ligand)]
             noise_pocket[:, :self.n_dims] = noise_coords_centered[len(molecular_state.ligand):]
@@ -127,6 +130,9 @@ class MolecularEulerMaruyamaStep:
             + dt * drift_state.pocket
             + diffusion_state.pocket * noise_pocket * sqrt_dt
         )
+
+        # if com_mode == "cond": 
+        #     assert torch.allclose(new_pocket, molecular_state.pocket)
         
         return MolecularState(
             ligand=new_ligand,
@@ -135,12 +141,12 @@ class MolecularEulerMaruyamaStep:
             pocket_mask=molecular_state.pocket_mask,
             batch_size=molecular_state.batch_size
         )
-
+    
 
 class MolecularEulerMaruyama(MolecularEulerMaruyamaStep):
     
-    def __init__(self, time_axis_pos: int = 0, terminal_only: bool = False, n_dims: int = 3):
-        super().__init__(n_dims)
+    def __init__(self, time_axis_pos: int = 0, terminal_only: bool = False, n_dims: int = 3, com_mode: str = "joint"):
+        super().__init__(n_dims, com_mode)
         self.time_axis_pos = time_axis_pos
         self.terminal_only = terminal_only
     
@@ -172,14 +178,19 @@ class MolecularEulerMaruyama(MolecularEulerMaruyamaStep):
                 params=params,
             )
             
-            # Apply molecular translation invariance after each step
+            
+            # Apply molecular translation invariance after each step 
             combined_coords = torch.cat([
                 current_state.ligand[:, :self.n_dims],
                 current_state.pocket[:, :self.n_dims]
             ], dim=0)
-            combined_mask = torch.cat([current_state.ligand_mask, current_state.pocket_mask])
-            combined_coords_centered = remove_mean_batch(combined_coords, combined_mask)
-            
+            # only if modeling jointly
+            if self.com_mode == "joint":
+                combined_mask = torch.cat([current_state.ligand_mask, current_state.pocket_mask])
+                combined_coords_centered = remove_mean_batch(combined_coords, combined_mask)
+            else: 
+                combined_coords_centered = combined_coords.clone()
+                
             # Update state with centered coordinates
             new_ligand = torch.cat([
                 combined_coords_centered[:len(current_state.ligand)],
@@ -662,6 +673,12 @@ class ConditionalMolecularSdeSampler(MolecularSdeSampler):
         residue_nf: int = 20,
         joint_nf: int = 16
     ):
+        # initialize integrator that doesn't remove COM
+        integrator = integrator or MolecularEulerMaruyama(
+            terminal_only=not return_full_paths,
+            n_dims=n_dims, 
+            com_mode = "cond"
+        )
         super().__init__(
             ligand_sizes=ligand_sizes,
             pocket_sizes=pocket_sizes,
@@ -718,15 +735,24 @@ class ConditionalMolecularSdeSampler(MolecularSdeSampler):
 
         assert hasattr(self, "_model"), "Attach DenoiserModel to SdeSampler!"
 
+        pocket_coords = pocket_batch["pocket_coords"].to(self._model.device)
+        pocket_features = pocket_batch["pocket_features"].to(self._model.device)  # One-hot features
+        pocket_mask = pocket_batch["pocket_mask"].to(self._model.device)
+
+
+
         # encode pocket features
-        encoded_pocket_features = self._model.denoiser.residue_encoder(pocket_batch["pocket_features"])
-        # COM-less pocket coordinates
-        com_free_pocket_coords = remove_mean_batch(pocket_batch["pocket_coords"], pocket_batch["pocket_mask"])
+        encoded_pocket_features = self._model.denoiser.residue_encoder(pocket_features)
+
+        # concat for initial encoded pocket state
+        pocket_state = torch.cat([pocket_coords, encoded_pocket_features], dim=1)
+
+        assert pocket_state.shape[1] == self.n_dims + self.joint_nf, f"Feature dim mismatch in pocket conditioning init: got {pocket_state.shape[1]} but expected {self.n_dims + self.joint_nf}"
+
 
         return {
-            "pocket_state": torch.cat([com_free_pocket_coords,
-                                       encoded_pocket_features], dim=1), 
-            "pocket_mask": pocket_batch["pocket_mask"], 
+            "pocket_state": pocket_state, 
+            "pocket_mask": pocket_mask, 
             "guidance_scale":guidance_scale
             }
 
