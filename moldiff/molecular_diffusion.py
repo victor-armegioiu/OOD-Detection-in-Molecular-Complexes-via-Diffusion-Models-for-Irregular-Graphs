@@ -802,8 +802,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         # Categorical loss: Cross-entropy between logits and true atom types
         ce_loss_lig = F.cross_entropy(pred_logits_lig, true_atom_types, reduction="none")
         # Categorical Loss is zero is embeddings frozen
-        ce_loss_pocket = F.cross_entropy(pred_logits_pocket, true_residue_types, reduction="none") if not self.freeze_pocket_embeddings \
-            else  torch.zeros_like(ce_loss_lig) 
+        ce_loss_pocket = torch.zeros_like(ce_loss_lig) # F.cross_entropy(pred_logits_pocket, true_residue_types, reduction="none") if not self.freeze_pocket_embeddings else  torch.zeros_like(ce_loss_lig) 
 
         # Weight categorical loss by noise level (like coordinates)
         # categorical_loss_lig = torch.mean(weights[lig_mask] * ce_loss_lig)
