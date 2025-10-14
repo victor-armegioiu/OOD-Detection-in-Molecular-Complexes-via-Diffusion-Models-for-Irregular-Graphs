@@ -463,23 +463,25 @@ def make_mol_openbabel(positions, atom_types, atom_decoder):
     """
     atom_types = [atom_decoder[x] for x in atom_types]
 
-    with tempfile.NamedTemporaryFile() as tmp:
-        tmp_file = tmp.name
+    print(atom_types)
 
-        # Write xyz file
-        utils.write_xyz_file(positions, atom_types, tmp_file)
+    with tempfile.NamedTemporaryFile(suffix=".xyz") as xyz_tmp, tempfile.NamedTemporaryFile(suffix=".sdf") as sdf_tmp:
+        # Write xyz file with coordinates and atom types
+        utils.write_xyz_file(positions, atom_types, xyz_tmp.name)
 
-        # Convert to sdf file with openbabel
-        # openbabel will add bonds
+        utils.write_xyz_file(positions, atom_types, "debug.xyz")
+        print(open("debug.xyz").read())
+
+        # Convert xyz → sdf with OpenBabel (adds bonds)
         obConversion = openbabel.OBConversion()
         obConversion.SetInAndOutFormats("xyz", "sdf")
         ob_mol = openbabel.OBMol()
-        obConversion.ReadFile(ob_mol, tmp_file)
-
-        obConversion.WriteFile(ob_mol, tmp_file)
+        obConversion.ReadFile(ob_mol, xyz_tmp.name)
+        obConversion.WriteFile(ob_mol, sdf_tmp.name)
 
         # Read sdf file with RDKit
-        tmp_mol = Chem.SDMolSupplier(tmp_file, sanitize=False)[0]
+        tmp_mol = Chem.SDMolSupplier(sdf_tmp.name, sanitize=False)[0]
+
 
     # Build new molecule. This is a workaround to remove radicals.
     mol = Chem.RWMol()
@@ -527,6 +529,8 @@ def build_mol_objects(samples, sanitize=False, relax_iter=0, largest_frag=False)
     # x = xh_lig[:, :self.x_dims].detach().cpu()
     # atom_type = xh_lig[:, self.x_dims:].argmax(1).detach().cpu()
     #lig_mask = lig_mask.cpu()
+    print(samples["ligand_features"])
+    print(atom_type)
 
     molecules = []
     for mol_pc in zip(utils.batch_to_list(x, lig_mask),

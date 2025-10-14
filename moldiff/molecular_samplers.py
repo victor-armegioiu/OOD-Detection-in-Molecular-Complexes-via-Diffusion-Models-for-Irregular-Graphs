@@ -740,12 +740,13 @@ class ConditionalMolecularSdeSampler(MolecularSdeSampler):
         pocket_mask = pocket_batch["pocket_mask"].to(self._model.device)
 
 
-
+        # normalize pocket coordinates
+        normalized_pocket_coordinates = pocket_coords / self.scheme.coord_norm
         # encode pocket features
         encoded_pocket_features = self._model.denoiser.residue_encoder(pocket_features)
 
         # concat for initial encoded pocket state
-        pocket_state = torch.cat([pocket_coords, encoded_pocket_features], dim=1)
+        pocket_state = torch.cat([normalized_pocket_coordinates, encoded_pocket_features], dim=1)
 
         assert pocket_state.shape[1] == self.n_dims + self.joint_nf, f"Feature dim mismatch in pocket conditioning init: got {pocket_state.shape[1]} but expected {self.n_dims + self.joint_nf}"
 
@@ -911,7 +912,7 @@ def create_molecular_denoiser_wrapper(
 
         assert cond, "For Conditional sampling cond with keys \"pocket_state\", \"pocket_mask\" and \"guidance_scale\" must be given"
 
-        pocket_state = cond["pocket_state"] / scheme.coord_norm
+        pocket_state = cond["pocket_state"] 
         pocket_mask = cond["pocket_mask"]
         guidance_scale = cond["guidance_scale"]
 
@@ -946,9 +947,12 @@ def create_molecular_denoiser_wrapper(
             )
 
             # prediction guiding for ligand
-            pred_output_lig = uncond_pred_output_lig + guidance_scale * (cond_pred_output_lig - uncond_pred_output_lig)
+            pred_output_lig = cond_pred_output_lig + guidance_scale * (cond_pred_output_lig - uncond_pred_output_lig)
             # conditional "prediction" pocket: only embeddings needed
             pred_output_pocket = cond_pred_output_pocket.clone()
+
+            # TODO try once without CFG and see if it even makes a difference:
+            # pred_output_lig = cond_pred_output_lig.clone()
 
             
         

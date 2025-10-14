@@ -25,7 +25,8 @@ from torch_geometric.data import Data
 from datetime import datetime
 import logging
 import sys
-sys.stdout.reconfigure(line_buffering=True)
+
+# sys.stdout.reconfigure(line_buffering=True)
 
 from pathlib import Path
 
@@ -66,19 +67,19 @@ CONFIG = {
     'atom_nf': 10,           
     'residue_nf': 21,         
     'n_dims': 3,             
-    'n_layers': 4,           
+    'n_layers': 4, # 4           
     'joint_nf': 256,          
-    'hidden_nf': 128,         
-    'edge_embedding_dim': 32, 
+    'hidden_nf': 128, # 256         
+    'edge_embedding_dim': 32, # 64 
     
     # Training parameters
-    'num_epochs': 1000,
+    'num_epochs': 500,
     'learning_rate': 1e-4,
     'batch_size': 16,
     'log_interval': 20,
     'eval_interval': 10,
     'num_eval_samples': 50,
-    'early_stopping_patience': 5,
+    'early_stopping_patience': 50,
     'cfg_training': False,
     'cfg_p_uncond': 0.2,
     'cfg_guidance_scale': 3,
@@ -88,11 +89,11 @@ CONFIG = {
     'sigma_min': 1e-4,      # Minimum noise level
     'update_pocket_coords': True,  # Joint modeling
     'freeze_pocket_embeddings': False, # No CE loss on residue classes
-    'geometric_regularization': True,
+    'geometric_regularization': False,
     'geom_loss_weight': 0.0,
     
     # Sampling parameters
-    'num_sampling_steps': 300,
+    'num_sampling_steps': 400,
     'schedule_type': "exponential",
     
     # I/O
@@ -117,12 +118,12 @@ CONFIG = {
 # Hyperparameter search spaces
 HYPERPARAM_SPACES = {
     'num_sampling_steps': [200, 400], # [50, 100, 200, 300, 400],
-    'joint_nf': [256, 512], #[32, 64, 128, 256],
-    'hidden_nf': [64, 128, 256],
-    'n_layers': [4, 6, 8],
-    'edge_embedding_dim': [8, 16, 32, 64],
-    'learning_rate': [5e-5, 1e-4, 5e-4, 1e-3, 5e-3],
-    'batch_size': [16, 32, 64, 128]
+    'joint_nf': [128, 256], #[32, 64, 128, 256],
+    'hidden_nf': [64, 128], 
+    'n_layers': [4, 5],
+    'edge_embedding_dim': [32, 64],
+    'learning_rate': [1e-4, 5e-4],
+    'batch_size': [16, 32]
 }
 
 def set_random_seeds(seed: int):
@@ -347,6 +348,8 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         n_layers=config['n_layers'],
         edge_embedding_dim=config['edge_embedding_dim'],
         update_pocket_coords=config['update_pocket_coords'],
+        geometric_regularization=config['geometric_regularization'],
+        geom_loss_weight=config['geom_loss_weight'],
         scheme=scheme,
         noise_sampling=noise_sampling,
         noise_weighting=noise_weighting, 
@@ -360,6 +363,8 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         n_layers=config['n_layers'],
         edge_embedding_dim=config['edge_embedding_dim'],
         update_pocket_coords=config['update_pocket_coords'],
+        geometric_regularization=config['geometric_regularization'],
+        geom_loss_weight=config['geom_loss_weight'],
         scheme=scheme,
         noise_sampling=noise_sampling,
         noise_weighting=noise_weighting, 
@@ -503,7 +508,7 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
                 # unconditional loss
                 loss, metrics = model.null_residue_loss_fn(batch)
             else:
-                # conditional loss
+                # traditional loss
                 loss, metrics = model.loss_fn(batch)
 
                     

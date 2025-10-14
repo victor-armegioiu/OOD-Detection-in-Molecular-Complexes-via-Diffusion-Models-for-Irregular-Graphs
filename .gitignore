@@ -19,3 +19,4 @@ diffsbdd_stuff/
 lkhd_results*/
 samples/
 combine_csvs.py
+*.xyz
