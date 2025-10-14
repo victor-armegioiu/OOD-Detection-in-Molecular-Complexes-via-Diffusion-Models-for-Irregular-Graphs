@@ -23,11 +23,14 @@ from molecular_diffusion import (
 from constants import (
     ligand_size_distribution, 
     ligand_to_pocket_size_mapping, 
+    pocket_to_ligand_size_mapping,
     atom_decoder, 
     aa_decoder3, 
     atom_freq_dist, 
     aa_freq_dist,
     ring_size_dist)
+
+from typing import Dict
 
 
 def load_checkpoint(checkpoint_path: str) -> MolecularDenoisingModel:
@@ -134,6 +137,42 @@ def sample_lig_pocket_sizes(N: int, lig_lower_bound: int = 10, lig_upper_bound: 
     
     return ligand_sizes, pocket_sizes
 
+def sample_lig_size_given_pocket_size(pocket_features: torch.LongTensor):
+
+    # TODO implement
+    ligand_size_min = 0
+    ligand_size_max = 224
+    ligand_size_range = np.arange(ligand_size_min, ligand_size_max + 1)
+
+    ligand_sizes = []
+    pocket_keys = list(pocket_to_ligand_size_mapping.keys())
+
+    for pocket in pocket_features:
+
+        if pocket not in pocket_keys:
+            closest_pocket_size = pocket_keys[np.searchsorted(pocket_keys, pocket)]
+            print(f"Pocket key {pocket} not found: replaced by closest key {closest_pocket_size}")
+        else:
+            closest_pocket_size = pocket.item()
+
+        assert isinstance(closest_pocket_size, int), f"Pocket isn't int but {type(closest_pocket_size)}:{closest_pocket_size}"
+
+        # sample lig_size given pocket_size
+        mapping = np.array(pocket_to_ligand_size_mapping[closest_pocket_size])
+        marginal_p = mapping / sum(mapping) # normalize to one
+
+        # assert np.close(marginal_p.sum() == 1, f"Marginal doesnt sum to one {marginal_p.sum()}"
+
+        ligand_sizes.append(np.random.choice(ligand_size_range, p = marginal_p))
+    
+
+
+
+    # for size in pocket_sizes: sample a ligand size according to some distribution (learned or not) 
+    # ligand_sizes = (torch.ones(pocket_features.shape[0]) * 15).long()
+    # assert
+    return torch.LongTensor(ligand_sizes)
+
 
 def save_samples_to_graphs(samples: list[Data], num_samples: int, save_path: str):
     '''Save samples individually as graphs for visualization'''
@@ -149,19 +188,31 @@ def save_samples_to_graphs(samples: list[Data], num_samples: int, save_path: str
 
 
 def sample_molecules(model: MolecularDenoisingModel, 
+            sample_batch: Dict,
             num_steps: int = 50, 
             schedule_type: str = "exponential", 
-            num_samples: int = 3
+            num_samples: int = 3, 
             ):
 
     """Generate new molecules using the trained model"""
+
+    
+    assert isinstance(sample_batch, dict), "Sample loader has to be of type dict"
+    assert all(k in sample_batch for k in ["pocket_mask", "pocket_coords", "pocket_features"]), \
+        f"Missing keys: {[k for k in ['pocket_mask', 'pocket_coords', 'pocket_features'] if k not in sample_batch]}"
     
     print(f"\n{'='*60}")
     print("SAMPLING NEW MOLECULES")
     print(f"{'='*60}")
 
     # Create sampler
-    ligand_sizes, pocket_sizes = sample_lig_pocket_sizes(num_samples)
+    # ligand_sizes, pocket_sizes = sample_lig_pocket_sizes(num_samples)
+    
+    # count the pocket sizes
+    pocket_sizes = torch.unique(sample_batch["pocket_mask"], return_counts=True)[1] # get them from sample loader
+
+    # Create sampler
+    ligand_sizes = sample_lig_size_given_pocket_size(pocket_sizes)
     print(f"Ligand sizes: {ligand_sizes}")
     print(f"Pocket sizes: {pocket_sizes}")
     
@@ -174,11 +225,14 @@ def sample_molecules(model: MolecularDenoisingModel,
         return_full_paths=False
     )
     
-    print("Sampling unconditional molecules...")
+    print("Sampling conditional molecules...")
     print(f"Using {num_steps} sampling steps...")
     
+    
+    conditioning_batch = sampler._create_initial_conditioning_dict(pocket_batch = sample_batch, guidance_scale = 0)
+
     # Generate samples
-    samples = sampler.generate()
+    samples = sampler.generate(conditioning_batch)
     
     print(f"\nGenerated molecules:")
     print(f"  Total ligand atoms: {samples['ligand_coords'].shape[0]}")

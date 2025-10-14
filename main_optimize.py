@@ -76,7 +76,7 @@ CONFIG = {
     'sigma_max': 100.0,      # Maximum noise level
     'sigma_min': 1e-4,      # Minimum noise level
     'update_pocket_coords': True,  # Joint modeling
-    'geometric_regularization': True,
+    'geometric_regularization': False, # WIP
     'geom_loss_weight': 0.0,
     
     # Sampling parameters
@@ -136,6 +136,7 @@ def parse_arguments():
     parser.add_argument('--eval_dataset', default='dataset_pdbbind_validation.pt', help='Path to evaluation dataset')
     
     # Model parameters (for single mode or to override defaults)
+    parser.add_argument('--freeze_pocket_coords', action='store_false', help='Enables conditional model')
     parser.add_argument('--joint_nf', type=int, help='Joint embedding dimension')
     parser.add_argument('--hidden_nf', type=int, help='Hidden layer size')
     parser.add_argument('--n_layers', type=int, help='Number of EGNN layers')
@@ -163,8 +164,8 @@ def parse_arguments():
     parser.add_argument('--results_file', default='optimization_results.csv', help='Filename for optimization results (CSV format)')
     
     # Wandb options
-    parser.add_argument('--wandb_project', default='molecular-diffusion', help='Wandb project name')
-    parser.add_argument('--wandb_entity', default='dagraber', help='Wandb entity name')
+    parser.add_argument('--wandb_project', default='equivariant-diffusion', help='Wandb project name')
+    parser.add_argument('--wandb_entity', default='paertschi-eth', help='Wandb entity name')
     parser.add_argument('--no_wandb', action='store_true', help='Disable wandb logging')
     
     # Reproducibility options
@@ -187,6 +188,9 @@ def update_config_from_args(config: Dict, args) -> Dict:
         config['eval_dataset_path'] = args.eval_dataset
     
     # Update model parameters if provided
+        # config['update_pocket_coords'] = args.update_pocket_coords or config['update_pocket_coords'] # replaces all falsy values, e.g. also zero
+    if args.freeze_pocket_coords is not None: # just replaces if not None
+        config['update_pocket_coords'] = args.freeze_pocket_coords # is stored as false if flag is present
     if args.joint_nf is not None:
         config['joint_nf'] = args.joint_nf
     if args.hidden_nf is not None:
@@ -509,10 +513,12 @@ def train_model(model: MolecularDenoisingModel, train_data: List[Dict],
             save_path = config['checkpoint_path'].replace(".pt", f"_epoch_{epoch + 1}.pt")
             save_checkpoint(model, config, save_path, optimizer=optimizer, scheduler=scheduler, scaler=scaler, epoch=epoch, best_metrics=best_metrics)
             loaded_model = load_checkpoint(save_path)
+            sample_batch = eval_data[0]
             samples = sample_molecules(loaded_model,
-                                    num_steps=config['num_sampling_steps'],
-                                    schedule_type=config['schedule_type'],
-                                    num_samples=config['num_eval_samples']
+                                       sample_batch, 
+                                        num_steps=config['num_sampling_steps'],
+                                        schedule_type=config['schedule_type'],
+                                        num_samples=config['num_eval_samples']
                                     )
             distribution_losses = evaluate_atom_aa_distributions(samples)
             eval_losses.update(distribution_losses)
@@ -1186,7 +1192,9 @@ def main():
             loaded_model = load_checkpoint(CONFIG['checkpoint_path'].replace(".pt", "_final.pt"))
             
             # 6. Sample new molecules
+            sample_batch = create_batches_from_dataset(CONFIG['eval_dataset_path'], {"batch_size": CONFIG["num_eval_samples"]})[0]
             samples = sample_molecules(loaded_model,
+                                        sample_batch,
                                         num_steps=CONFIG['num_sampling_steps'],
                                         schedule_type=CONFIG['schedule_type'],
                                         num_samples=CONFIG['num_eval_samples']

@@ -837,9 +837,7 @@ class PreconditionedEGNNDynamics(nn.Module):
             atom_mask = mask_atoms == batch_idx
             coords_lig_scaled[atom_mask] = c_in[i] * coords_lig[atom_mask]
             
-        for i, batch_idx in enumerate(torch.unique(mask_residues)):
-            residue_mask = mask_residues == batch_idx  
-            coords_pocket_scaled[residue_mask] = c_in[i] * coords_pocket[residue_mask]
+        # delete pocket scaling
         
         # Recombine scaled coordinates with original embeddings
         xh_atoms_scaled = torch.cat([coords_lig_scaled, embeddings_lig], dim=1)
@@ -862,21 +860,16 @@ class PreconditionedEGNNDynamics(nn.Module):
         
         # Apply preconditioning to coordinates only (skip connection + output scaling)
         coords_out_lig = coords_lig.clone()
-        coords_out_pocket = coords_pocket.clone()
         
         for i, batch_idx in enumerate(torch.unique(mask_atoms)):
             atom_mask = mask_atoms == batch_idx
             coords_out_lig[atom_mask] = c_skip[i] * coords_lig[atom_mask] + c_out[i] * coords_pred_lig[atom_mask]
             
-        for i, batch_idx in enumerate(torch.unique(mask_residues)):
-            residue_mask = mask_residues == batch_idx
-            coords_out_pocket[residue_mask] = c_skip[i] * coords_pocket[residue_mask] + c_out[i] * coords_pred_pocket[residue_mask]
-        
         # Combine preconditioned coordinates with raw logits (no preconditioning for classification)
         ligand_out = torch.cat([coords_out_lig, logits_pred_lig], dim=1)
-        pocket_out = torch.cat([coords_out_pocket, logits_pred_pocket], dim=1)
         
-        return ligand_out, pocket_out
+        
+        return ligand_out, xh_residues.clone() # return input
 
     @property
     def last_geometric_loss(self):
