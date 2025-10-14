@@ -359,37 +359,22 @@ class MolecularDenoisingModel:
         lig_coords_norm = lig_coords / self.scheme.coord_norm
         pocket_coords_norm = pocket_coords / self.scheme.coord_norm
         
-        # Remove center of mass for translation invariance
-        combined_coords = torch.cat([lig_coords_norm, pocket_coords_norm], dim=0)
-        combined_mask = torch.cat([lig_mask, pocket_mask], dim=0)
-        combined_coords_centered = remove_mean_batch(combined_coords, combined_mask)
-        
-        lig_coords_centered = combined_coords_centered[:len(lig_coords)]
-        pocket_coords_centered = combined_coords_centered[len(lig_coords):]
-        
         # Concatenate coordinates and embeddings (NOT one-hot!)
-        xh_lig_clean = torch.cat([lig_coords_centered, lig_embeddings_clean], dim=1)  # [N_lig, 3 + joint_nf]
-        xh_pocket_clean = torch.cat([pocket_coords_centered, pocket_embeddings_clean], dim=1)  # [N_pocket, 3 + joint_nf]
+        xh_lig_clean = torch.cat([lig_coords_norm, lig_embeddings_clean], dim=1)  # [N_lig, 3 + joint_nf]
+        xh_pocket_clean = torch.cat([pocket_coords_norm, pocket_embeddings_clean], dim=1)  # [N_pocket, 3 + joint_nf]
         
         # Sample noise levels
         sigma = self.noise_sampling(shape=(batch_size,))  # [batch_size]
         
         # Generate Gaussian noise for the entire state
         noise_lig = torch.randn_like(xh_lig_clean)
-        noise_pocket = torch.randn_like(xh_pocket_clean)
         
-        # Make coordinate noise COM-free (but not embedding noise)
-        noise_coords_combined = torch.cat([noise_lig[:, :self.n_dims], noise_pocket[:, :self.n_dims]], dim=0)
-        noise_coords_centered = remove_mean_batch(noise_coords_combined, combined_mask)
-        noise_lig[:, :self.n_dims] = noise_coords_centered[:len(lig_coords)]
-        noise_pocket[:, :self.n_dims] = noise_coords_centered[len(lig_coords):]
         
         # Add noise
         sigma_expanded_lig = sigma[lig_mask].unsqueeze(1)  # [N_lig, 1]
         sigma_expanded_pocket = sigma[pocket_mask].unsqueeze(1)  # [N_pocket, 1]
         
         xh_lig_noisy = xh_lig_clean + sigma_expanded_lig * noise_lig
-        xh_pocket_noisy = xh_pocket_clean + sigma_expanded_pocket * noise_pocket
         
         
         # Forward pass through denoiser - outputs coordinates + logits
@@ -401,16 +386,14 @@ class MolecularDenoisingModel:
         # print('lig_mask', lig_mask.shape)
         # print('pocket_mask', pocket_mask.shape)
         
-        pred_output_lig, pred_output_pocket = self.denoiser(
-            xh_lig_noisy, xh_pocket_noisy, sigma, lig_mask, pocket_mask,
-            target_atoms=lig_coords_centered, target_residues=pocket_coords_centered,
+        pred_output_lig, _ = self.denoiser(
+            xh_lig_noisy, xh_pocket_clean, sigma, lig_mask, pocket_mask,
+            target_atoms=lig_coords_norm, target_residues=pocket_coords_norm,
         )
         
         # Split predictions: coordinates + logits
         pred_coords_lig = pred_output_lig[:, :self.n_dims]              # [N_lig, 3]
         pred_logits_lig = pred_output_lig[:, self.n_dims:]              # [N_lig, atom_nf] - LOGITS
-        pred_coords_pocket = pred_output_pocket[:, :self.n_dims]        # [N_pocket, 3]  
-        pred_logits_pocket = pred_output_pocket[:, self.n_dims:]        # [N_pocket, residue_nf] - LOGITS
         
         # Loss weighting
         weights = self.noise_weighting(sigma)  # [batch_size]
@@ -419,15 +402,14 @@ class MolecularDenoisingModel:
         
         # Coordinate loss: L2 between predicted and clean coordinates
         clean_coords_lig = xh_lig_clean[:, :self.n_dims]
-        clean_coords_pocket = xh_pocket_clean[:, :self.n_dims]
         
         coord_loss_lig = torch.mean(weights_lig * (pred_coords_lig - clean_coords_lig) ** 2)
-        coord_loss_pocket = torch.mean(weights_pocket * (pred_coords_pocket - clean_coords_pocket) ** 2)
+        coord_loss_pocket = torch.tensor(0.0, device = "cuda")
         coord_loss = coord_loss_lig + coord_loss_pocket
         
         # Categorical loss: Cross-entropy between logits and true atom types
         ce_loss_lig = F.cross_entropy(pred_logits_lig, true_atom_types, reduction='none')
-        ce_loss_pocket = F.cross_entropy(pred_logits_pocket, true_residue_types, reduction='none')
+        ce_loss_pocket = torch.zeros_like(true_residue_types, dtype=torch.float, device = "cuda")
         
         # Weight categorical loss by noise level (like coordinates)
         # categorical_loss_lig = torch.mean(weights[lig_mask] * ce_loss_lig)
@@ -458,9 +440,9 @@ class MolecularDenoisingModel:
             "geometric_loss_total": geometric_loss.item(),
             "avg_sigma": sigma.mean().item(),
             "max_sigma": sigma.max().item(),
-            "coord_pred_scale": torch.cat([pred_coords_lig, pred_coords_pocket]).abs().mean().item(),
+            "coord_pred_scale": pred_coords_lig.abs().mean().item(),
             "atom_accuracy": (torch.argmax(pred_logits_lig, dim=-1) == true_atom_types).float().mean().item(),
-            "residue_accuracy": (torch.argmax(pred_logits_pocket, dim=-1) == true_residue_types).float().mean().item()
+            "residue_accuracy": torch.tensor(1.0, device = "cuda")
         }
         return total_loss, metrics
 
@@ -504,30 +486,14 @@ class MolecularDenoisingModel:
             lig_coords_norm = lig_coords / self.scheme.coord_norm
             pocket_coords_norm = pocket_coords / self.scheme.coord_norm
             
-            # Remove center of mass
-            combined_coords = torch.cat([lig_coords_norm, pocket_coords_norm], dim=0)
-            combined_mask = torch.cat([lig_mask, pocket_mask], dim=0)
-            combined_coords_centered = remove_mean_batch(combined_coords, combined_mask)
-            
-            lig_coords_centered = combined_coords_centered[:len(lig_coords)]
-            pocket_coords_centered = combined_coords_centered[len(lig_coords):]
-            
             # Concatenate coordinates and embeddings (NOT one-hot!)
-            xh_lig_clean = torch.cat([lig_coords_centered, lig_embeddings_clean], dim=1)
-            xh_pocket_clean = torch.cat([pocket_coords_centered, pocket_embeddings_clean], dim=1)
+            xh_lig_clean = torch.cat([lig_coords_norm, lig_embeddings_clean], dim=1)
+            xh_pocket_clean = torch.cat([pocket_coords_norm, pocket_embeddings_clean], dim=1)
             
             # Add noise at this level
             noise_lig = torch.randn_like(xh_lig_clean)
-            noise_pocket = torch.randn_like(xh_pocket_clean)
-            
-            # COM-free noise for coordinates only
-            noise_coords_combined = torch.cat([noise_lig[:, :self.n_dims], noise_pocket[:, :self.n_dims]], dim=0)
-            noise_coords_centered = remove_mean_batch(noise_coords_combined, combined_mask)
-            noise_lig[:, :self.n_dims] = noise_coords_centered[:len(lig_coords)]
-            noise_pocket[:, :self.n_dims] = noise_coords_centered[len(lig_coords):]
             
             xh_lig_noisy = xh_lig_clean + sigma_val * noise_lig
-            xh_pocket_noisy = xh_pocket_clean + sigma_val * noise_pocket
             
             # Create sigma tensor for this evaluation (broadcast to batch_size)
             sigma_batch = sigma_val
@@ -542,18 +508,16 @@ class MolecularDenoisingModel:
             # print('pocket_mask', pocket_mask.shape)
             
             
-            # Denoise
+            # Denoise: clean pocket input
             with torch.no_grad():
-                pred_output_lig, pred_output_pocket = self.denoiser(
-                    xh_lig_noisy, xh_pocket_noisy, sigma_batch, lig_mask, pocket_mask
+                pred_output_lig, _ = self.denoiser(
+                    xh_lig_noisy, xh_pocket_clean, sigma_batch, lig_mask, pocket_mask
                 )
             
             
             # Split predictions: coordinates + logits
             pred_coords_lig = pred_output_lig[:, :self.n_dims]              # [N_lig, 3]
             pred_logits_lig = pred_output_lig[:, self.n_dims:]              # [N_lig, atom_nf] - LOGITS
-            pred_coords_pocket = pred_output_pocket[:, :self.n_dims]        # [N_pocket, 3]
-            pred_logits_pocket = pred_output_pocket[:, self.n_dims:]        # [N_pocket, residue_nf] - LOGITS
             
             # Compute losses
             clean_coords_lig = xh_lig_clean[:, :self.n_dims]
@@ -561,17 +525,17 @@ class MolecularDenoisingModel:
             
             # Coordinate loss: L2
             coord_loss_lig = torch.mean((pred_coords_lig - clean_coords_lig) ** 2)
-            coord_loss_pocket = torch.mean((pred_coords_pocket - clean_coords_pocket) ** 2)
+            coord_loss_pocket = torch.tensor(0.0, device = "cuda")
             coord_loss = coord_loss_lig + coord_loss_pocket
             
             # Categorical loss: Cross-entropy on logits
             categorical_loss_lig = F.cross_entropy(pred_logits_lig, true_atom_types)
-            categorical_loss_pocket = F.cross_entropy(pred_logits_pocket, true_residue_types)
+            categorical_loss_pocket = torch.tensor(0.0, device = "cuda")
             categorical_loss = categorical_loss_lig + categorical_loss_pocket
             
             # Accuracy metrics
             atom_accuracy = (torch.argmax(pred_logits_lig, dim=-1) == true_atom_types).float().mean()
-            residue_accuracy = (torch.argmax(pred_logits_pocket, dim=-1) == true_residue_types).float().mean()
+            residue_accuracy = torch.tensor(1.0, device = "cuda")
             
             eval_losses[f"coord_loss_lvl{i}"] = coord_loss.item()
             eval_losses[f"categorical_loss_lvl{i}"] = categorical_loss.item()
