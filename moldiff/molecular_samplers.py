@@ -716,11 +716,7 @@ class ConditionalMolecularSdeSampler(MolecularSdeSampler):
             torch.randn(total_lig_atoms, self.n_dims + self.joint_nf, device=self.tspan.device) 
             * initial_sigma * initial_scale
         )
-        
-        # Make noise COM-free
-        noise_coords_centered_lig = remove_mean_batch(ligand_noise[:, :self.n_dims], ligand_mask)
-        
-        ligand_noise[:, :self.n_dims] = noise_coords_centered_lig
+
         
         return MolecularState(
             ligand=ligand_noise / self.scheme.coord_norm,
