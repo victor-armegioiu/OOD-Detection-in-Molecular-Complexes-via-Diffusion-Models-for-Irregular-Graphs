@@ -26,6 +26,8 @@ from molecular_samplers import (
     create_molecular_denoiser_wrapper, edm_noise_decay, dlog_dt, dsquare_dt
 )
 
+from metrics import load_checkpoint
+from Dataset import PDBbind_Dataset
 
 Tensor = torch.Tensor
 TensorMapping = Mapping[str, Tensor]
@@ -901,5 +903,224 @@ def test_likelihood_evaluator_with_conditioning():
     print("="*70)
 
 
+def save_dict_to_json(data, output_path):
+    ''' Save dictionary to JSON file. Initialize new file if it doesn't exist. Append to existing file if it does.'''
+    if os.path.exists(output_path):
+        with open(output_path, 'r') as f:
+            existing_data = json.load(f)
+        existing_data.update(data)
+        with open(output_path, 'w') as f:
+            json.dump(existing_data, f, indent=4)
+    else:
+        with open(output_path, 'w') as f:
+            json.dump(data, f, indent=4)
+    print(f"Results saved to: {output_path}")
+
+
+def process_dataset(dataset, evaluator, device, dataset_name, output_path):
+    """Process a dataset and return likelihood statistics"""
+    print(f"\nProcessing {dataset_name}...", flush=True)
+    
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, follow_batch=['lig_coords', 'prot_coords'])
+    
+    # If JSON output_path exists, load it, otherwise initialize empty dictionary
+    if os.path.exists(output_path):
+        with open(output_path, 'r') as f:
+            all_metrics = json.load(f)
+    else:
+        all_metrics = {}
+        
+    batch_count = 0
+    for batch in dataloader:
+        batch = batch.to(device)
+        print(f"\nStarting batch...{batch.id}")
+        print(batch)
+        
+        lig_features = batch.lig_features
+        pocket_features = batch.prot_features
+
+        # Convert one-hot features to embeddings
+        ligand_embeddings = evaluator._model.denoiser.atom_encoder(lig_features)  # [N_lig, joint_nf]
+        pocket_embeddings = evaluator._model.denoiser.residue_encoder(pocket_features)  # [N_pocket, joint_nf]
+
+        lig_coords = batch.lig_coords
+        pocket_coords = batch.prot_coords
+        ligand_mask = batch.lig_coords_batch
+        pocket_mask = batch.prot_coords_batch
+
+        # Concatenate coords and embeddings
+        ligand_data = torch.cat([lig_coords, ligand_embeddings], dim=1)
+        pocket_data = torch.cat([pocket_coords, pocket_embeddings], dim=1)
+
+        # Center-of-mass correction for this molecule
+        combined_coords = torch.cat([lig_coords, pocket_coords], dim=0)
+        combined_mask = torch.cat([ligand_mask, pocket_mask])
+        combined_coords_centered = remove_mean_batch(combined_coords, combined_mask)
+        ligand_data[:, :3] = combined_coords_centered[:lig_coords.shape[0]]
+        pocket_data[:, :3] = combined_coords_centered[lig_coords.shape[0]:]
+
+        # Separate the batch into individual graphs
+        print(torch.bincount(ligand_mask).tolist())
+        print(torch.bincount(pocket_mask).tolist())
+
+        ligand_data = torch.split(ligand_data, torch.bincount(ligand_mask).tolist())
+        pocket_data = torch.split(pocket_data, torch.bincount(pocket_mask).tolist())
+
+        for i in range(len(ligand_data)):
+
+            # If the molecule data already exists (with a log likelihood that is not NaN nor Infinity), skip it
+            exists = batch.id[i] in all_metrics
+            has_likelihood = exists and 'log_likelihood' in all_metrics[batch.id[i]]
+            is_nan = has_likelihood and np.isnan(all_metrics[batch.id[i]]['log_likelihood'])
+            is_inf = has_likelihood and np.isinf(all_metrics[batch.id[i]]['log_likelihood'])
+            if exists and has_likelihood and not is_nan and not is_inf:
+                print(f"Molecule {batch.id[i]} already processed, skipping...", flush=True)
+                continue
+
+            ligand_mask = torch.zeros(ligand_data[i].shape[0], dtype=torch.long, device=device)
+            pocket_mask = torch.zeros(pocket_data[i].shape[0], dtype=torch.long, device=device)
+
+            # Create molecular state
+            state = MolecularState(
+                ligand=ligand_data[i],
+                pocket=pocket_data[i],
+                ligand_mask=ligand_mask,
+                pocket_mask=pocket_mask,
+                batch_size=1
+            )
+
+            # To do: 
+            # - Extract initial state from batch
+            # - Normalize with model.scheme.coord_norm?
+            # - Remove COM with remove_mean_batch()
+
+            cond = {
+                'cond_coords_ligand': cond_coords_lig,
+                'cond_coords_pocket': cond_coords_poc
+                }
+
+            # Evaluate likelihood for this molecule
+            try:
+                log_likelihood, trajectory_stats = evaluator.evaluate_likelihood_with_stats(state, cond=cond)
+            except Exception as e:
+                print(f"Error evaluating likelihood for molecule {batch.id[i]}: {e}")
+                continue
+
+            all_metrics[batch.id[i]] = {'log_likelihood': float(log_likelihood.item())}
+            if trajectory_stats:
+                trajectory_stats = {k: float(v) for k, v in trajectory_stats[0].items()}
+                all_metrics[batch.id[i]].update(trajectory_stats)
+        
+        # Intermediate save if batch_count is a multiple of 10
+        if batch_count == 0 or batch_count % 10 == 0:
+            save_dict_to_json(all_metrics, output_path)
+        batch_count += 1
+
+    save_dict_to_json(all_metrics, output_path)
+    return all_metrics
+
+
+def main(dataset_path, checkpoint_path, results_folder, num_steps, num_hutchinson_samples, start_idx=None, stop_idx=None):
+    
+    # Configuration
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    print(f"Device: {device}")
+    print(f"Dataset path: {dataset_path}")
+    print(f"Checkpoint path: {checkpoint_path}")
+    print(f"Results folder: {results_folder}")
+    print(f"Number of integration steps: {num_steps}")
+    print(f"Number of Hutchinson samples: {num_hutchinson_samples}")
+    if start_idx is not None and stop_idx is not None:
+        print(f"Processing dataset slice: indices {start_idx} to {stop_idx-1}")
+    print()
+    
+    # Check checkpoint existence
+    for path in [dataset_path, checkpoint_path]:
+        name = os.path.basename(path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"{name} not found at {path}")
+        print(f"Found {name}: {path}")
+    
+    # Load datasets and model
+    print("\nLoading dataset and model...", flush=True)
+    full_dataset = torch.load(dataset_path)
+    name = os.path.basename(dataset_path)
+    
+    # Apply slicing if specified
+    if start_idx is not None and stop_idx is not None:
+        print(f"Slicing dataset: using indices {start_idx} to {stop_idx-1}")
+        
+        if hasattr(full_dataset, 'input_data') and hasattr(full_dataset, '__len__'):
+            # This is a PDBbind_Dataset with input_data dictionary
+            total_size = len(full_dataset)
+            print(f"Total dataset length: {total_size}")
+            
+            # Clamp indices to valid range
+            start_idx = max(0, start_idx)
+            stop_idx = min(total_size, stop_idx)
+            
+            if start_idx >= stop_idx:
+                raise ValueError(f"Invalid slice range: start_idx ({start_idx}) >= stop_idx ({stop_idx})")
+            
+            # Create sliced input_data dictionary
+            sliced_input_data = {}
+            slice_idx = 0
+            for original_idx in range(start_idx, stop_idx):
+                if original_idx in full_dataset.input_data:
+                    sliced_input_data[slice_idx] = full_dataset.input_data[original_idx]
+                    slice_idx += 1
+            
+            # Create a new dataset instance with sliced input_data
+            dataset = PDBbind_Dataset.create_sliced_dataset(sliced_input_data)
+            
+            print(f"Sliced dataset length: {len(dataset)}")
+            del full_dataset
+        
+        else:
+            raise ValueError("Dataset does not support length operation for slicing")
+    else:
+        dataset = full_dataset
+        print(f"Using full dataset, size: {len(dataset) if hasattr(dataset, '__len__') else 'unknown'}")
+
+
+    model = load_checkpoint(checkpoint_path)
+    
+    # Create likelihood evaluator
+    print("\nCreating likelihood evaluator...", flush=True)
+    evaluator = create_molecular_likelihood_evaluator_from_model(
+        model,
+        num_steps=num_steps,
+        num_hutchinson_samples=num_hutchinson_samples,
+    )
+    
+    output_filename = f'{name.replace(".pt", "")}_metrics.json'
+    output_path = os.path.join(results_folder, output_filename)
+
+    # -----------------------------------------------------------
+    metrics = process_dataset(dataset, evaluator, device, name, output_path)
+    # -----------------------------------------------------------
+    
+    print(f"Done! Processed {len(metrics)} graphs.")
+
+
 if __name__ == '__main__':
-    test_likelihood_evaluator_with_conditioning()
+    # test_likelihood_evaluator_with_conditioning()
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset_path', default='dataset_cleansplit_train.pt', type=str)
+    parser.add_argument('--checkpoint_path', default='training_runs/0725_115513_dataset_cleansplit_train/checkpoint_epoch_579.pt', type=str)
+    parser.add_argument('--results_folder', default='likelihood_results', type=str)
+    parser.add_argument('--num_steps', type=int, default=10)
+    parser.add_argument('--num_hutchinson_samples', type=int, default=20)
+    parser.add_argument('--start_idx', type=int, default=None, help='Start index for dataset slicing (inclusive)')
+    parser.add_argument('--stop_idx', type=int, default=None, help='Stop index for dataset slicing (exclusive)')
+    args = parser.parse_args()
+
+    main(args.dataset_path, 
+         args.checkpoint_path, 
+         args.results_folder, 
+         args.num_steps, 
+         args.num_hutchinson_samples, 
+         args.start_idx, 
+         args.stop_idx)
