@@ -979,8 +979,8 @@ def process_dataset(dataset, evaluator, device, dataset_name, output_path):
         ligand_embeddings = evaluator._model.denoiser.atom_encoder(lig_features)  # [N_lig, joint_nf]
         pocket_embeddings = evaluator._model.denoiser.residue_encoder(pocket_features)  # [N_pocket, joint_nf]
 
-        lig_coords = batch.lig_coords
-        pocket_coords = batch.prot_coords
+        lig_coords = batch.lig_coords / evaluator._model.scheme.coord_norm
+        pocket_coords = batch.prot_coords / evaluator._model.scheme.coord_norm
         ligand_mask = batch.lig_coords_batch
         pocket_mask = batch.prot_coords_batch
 
