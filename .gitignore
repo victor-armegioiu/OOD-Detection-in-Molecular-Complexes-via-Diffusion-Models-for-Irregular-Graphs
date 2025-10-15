@@ -7,6 +7,7 @@ wandb/
 *.txt
 dataset*.pt
 
+datasets/
 optimization_runs/
 optimization_results/
 GEMS_errors/

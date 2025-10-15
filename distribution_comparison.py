@@ -61,6 +61,8 @@ def parse_arguments():
                         help='Patterns to merge datasets (e.g., train validation will merge datasets containing these words)')
     parser.add_argument('--error_dict', type=str, default=None,
                         help='Path to the error distribution file mapping IDs to error values')
+    parser.add_argument('--plot_heatmaps', action='store_true',
+                        help='Create individual heatmap plots for each distribution')
 
     
     return parser.parse_args()
@@ -608,6 +610,117 @@ class DistributionComparator:
         plt.show()
 
 
+    def plot_metric_vs_error_scatter(self, save_path: Optional[str] = None, 
+                                     figsize: Tuple[int, int] = (16, 12)) -> None:
+        """
+        Create a scatter plot of the metric vs. error showing distributional positioning.
+        Uses the same outlier filtering as the contour version to focus on the main body.
+        Each distribution uses a distinct marker and color with transparency for overlap visibility.
+        """
+        if not self.error_values:
+            raise ValueError("No error distribution loaded. Call load_error_distribution() first.")
+        
+        if not self.distributions or not self.distributions_ids:
+            raise ValueError("No distributions loaded. Call load_distributions() first.")
+        
+        # Create the plot
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Colors and markers for different distributions
+        colors = plt.cm.Set3(np.linspace(0, 1, len(self.distributions)))
+        marker_cycle = ['o', 's', '^', 'D', 'v', 'P', 'X', '*', 'h', '8', '<', '>', 'H']
+        
+        def remove_outliers_2d(x: np.ndarray, y: np.ndarray, factor: float = 1.5) -> Tuple[np.ndarray, np.ndarray]:
+            """Remove outliers using IQR method for 2D data."""
+            q1_x, q3_x = np.percentile(x, [25, 75])
+            q1_y, q3_y = np.percentile(y, [25, 75])
+            iqr_x = q3_x - q1_x
+            iqr_y = q3_y - q1_y
+            lower_x = q1_x - factor * iqr_x
+            upper_x = q3_x + factor * iqr_x
+            lower_y = q1_y - factor * iqr_y
+            upper_y = q3_y + factor * iqr_y
+            mask = ((x >= lower_x) & (x <= upper_x) & (y >= lower_y) & (y <= upper_y))
+            return x[mask], y[mask]
+        
+        for (idx, ((name, metric_data), color)) in enumerate(zip(self.distributions.items(), colors)):
+            # Corresponding IDs and error values
+            ids = self.distributions_ids[name]
+            error_data = []
+            metric_data_filtered = []
+            
+            for i, id_val in enumerate(ids):
+                if id_val in self.error_values:
+                    # Mirror the contour version's absolute-error choice
+                    error_data.append(np.abs(self.error_values[id_val]))
+                    metric_data_filtered.append(metric_data[i])
+            
+            if not error_data:
+                print(f"Warning: No error values found for distribution {name}")
+                continue
+            
+            error_data = np.array(error_data)
+            metric_data_filtered = np.array(metric_data_filtered)
+            
+            # Focus on the main body by removing outliers in both dimensions
+            metric_clean, error_clean = remove_outliers_2d(metric_data_filtered, error_data)
+            
+            if len(metric_clean) == 0:
+                print(f"Warning: No points remain for {name} after outlier removal")
+                continue
+            
+            marker = marker_cycle[idx % len(marker_cycle)]
+            ax.scatter(
+                metric_clean,
+                error_clean,
+                s=36,
+                c=[color],
+                marker=marker,
+                alpha=0.6,
+                linewidths=0,
+                edgecolors='none',
+                label=name,
+            )
+        
+        # Labels and aesthetics
+        ax.set_xlabel(f'{self.metric}', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Error Value', fontsize=12, fontweight='bold')
+        ax.set_title(
+            f'Distribution of {self.metric} vs Error Values (Scatter)\n'
+            f'(Main body shown via IQR filtering)',
+            fontsize=14,
+            fontweight='bold',
+        )
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', title='Distribution')
+        ax.grid(True, alpha=0.3)
+        
+        # Overall title and preprocessing info
+        title_parts = [
+            f'Metric vs Error Scatter Analysis - {self.metric}\nDirectory: {self.directory_path}'
+        ]
+        preprocessing_info = []
+        if self.merge_patterns:
+            preprocessing_info.append(f"Merged: {', '.join(self.merge_patterns)}")
+        if self.normalize_outliers:
+            preprocessing_info.append("Outliers normalized")
+        if self.clip_percentiles is not None:
+            preprocessing_info.append(f"Clipped: {self.clip_percentiles[0]}-{self.clip_percentiles[1]}th percentile")
+        if self.normalize_range is not None:
+            preprocessing_info.append(f"Range: [{self.normalize_range[0]}, {self.normalize_range[1]}]")
+        if preprocessing_info:
+            title_parts.append(f"Preprocessing: {', '.join(preprocessing_info)}")
+        fig.suptitle('\n'.join(title_parts), fontsize=16, fontweight='bold', y=0.98)
+        
+        # Save plot if path provided
+        if save_path:
+            if self.normalize_range:
+                save_path = save_path.replace('.png', '_norm.png')
+            plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+            print(f"Metric vs Error scatter plot saved to: {save_path}")
+        
+        plt.tight_layout()
+        plt.show()
+
     def plot_metric_vs_error(self, save_path: Optional[str] = None, 
                                     figsize: Tuple[int, int] = (16, 12)) -> None:
         """
@@ -751,6 +864,162 @@ class DistributionComparator:
         plt.show()
 
 
+    def plot_heatmaps(self, save_path: Optional[str] = None, 
+                     figsize: Tuple[int, int] = (12, 8)) -> None:
+        """
+        Create individual heatmap plots for each distribution showing metric vs error density.
+        Uses the same outlier filtering strategy to focus on the main body of distributions.
+        Each distribution gets its own subplot with a 2D histogram heatmap.
+        """
+        if not self.error_values:
+            raise ValueError("No error distribution loaded. Call load_error_distribution() first.")
+        
+        if not self.distributions or not self.distributions_ids:
+            raise ValueError("No distributions loaded. Call load_distributions() first.")
+        
+        # Calculate grid layout for subplots
+        n_distributions = len(self.distributions)
+        n_cols = min(3, n_distributions)  # Max 3 columns
+        n_rows = (n_distributions + n_cols - 1) // n_cols  # Ceiling division
+        
+        # Create figure with subplots
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(figsize[0] * n_cols, figsize[1] * n_rows))
+        if n_distributions == 1:
+            axes = [axes]
+        elif n_rows == 1:
+            axes = axes if isinstance(axes, list) else [axes]
+        else:
+            axes = axes.flatten()
+        
+        def remove_outliers_2d(x: np.ndarray, y: np.ndarray, factor: float = 1.5) -> Tuple[np.ndarray, np.ndarray]:
+            # """Remove outliers using IQR method for 2D data."""
+            # q1_x, q3_x = np.percentile(x, [25, 75])
+            # q1_y, q3_y = np.percentile(y, [25, 75])
+            # iqr_x = q3_x - q1_x
+            # iqr_y = q3_y - q1_y
+            # lower_x = q1_x - factor * iqr_x
+            # upper_x = q3_x + factor * iqr_x
+            # lower_y = q1_y - factor * iqr_y
+            # upper_y = q3_y + factor * iqr_y
+            # mask = ((x >= lower_x) & (x <= upper_x) & (y >= lower_y) & (y <= upper_y))
+            # return x[mask], y[mask]
+            return x, y
+        
+        for idx, (name, metric_data) in enumerate(self.distributions.items()):
+            ax = axes[idx]
+            
+            print(f"\nCreating heatmap for {name}")
+
+            # Get corresponding IDs and error values
+            ids = self.distributions_ids[name]
+            for id_val in ids[:10]:
+                if id_val in self.error_values:
+                    print(f"    {id_val}: {self.error_values[id_val]}")
+            
+            error_data = []
+            metric_data_filtered = []
+            for i, id_val in enumerate(ids):
+                if id_val in self.error_values:
+                    # Use absolute error values like in other functions
+                    error_data.append(np.abs(self.error_values[id_val]))
+                    metric_data_filtered.append(metric_data[i])
+
+
+            
+            if not error_data:
+                ax.text(0.5, 0.5, f'No error values\nfound for {name}', 
+                       ha='center', va='center', transform=ax.transAxes, fontsize=12)
+                ax.set_title(f'{name} - No Data', fontweight='bold')
+                ax.set_xlim(0, 1)  # Fixed x-axis limits
+                ax.set_ylim(0, 6)  # Fixed y-axis limits
+                continue
+
+            # Calculate the RMSD of the error data
+            rmsd = np.sqrt(np.mean(np.square(error_data)))
+            print(f"  RMSD: {rmsd}")
+
+            error_data = np.array(error_data)
+            metric_data_filtered = np.array(metric_data_filtered)
+            
+            # Focus on the main body by removing outliers
+            metric_clean, error_clean = remove_outliers_2d(metric_data_filtered, error_data)
+            
+            if len(metric_clean) < 5:
+                ax.text(0.5, 0.5, f'Insufficient data\nfor {name}\n({len(metric_clean)} points)', 
+                       ha='center', va='center', transform=ax.transAxes, fontsize=10)
+                ax.set_title(f'{name} - Insufficient Data', fontweight='bold')
+                ax.set_xlim(0, 1)  # Fixed x-axis limits
+                ax.set_ylim(0, 6)  # Fixed y-axis limits
+                continue
+            
+            # Create 2D histogram for heatmap
+            try:
+                # Define fixed bins for all heatmaps to ensure comparability
+                n_bins = 30
+                x_bins = np.linspace(0, 1, n_bins + 1)  # Fixed x-range: 0 to 1
+                y_bins = np.linspace(0, 6, n_bins + 1)  # Fixed y-range: 0 to 6
+                
+                # Create 2D histogram with fixed bins
+                hist, x_edges, y_edges = np.histogram2d(metric_clean, error_clean, 
+                                                      bins=[x_bins, y_bins], density=True)
+                
+                # Create heatmap with fixed extent
+                im = ax.imshow(hist.T, origin='lower', aspect='auto', 
+                              extent=[0, 1, 0, 6],  # Fixed extent for all heatmaps
+                              cmap='viridis', interpolation='bilinear')
+                
+                # Add colorbar for this subplot
+                cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+                cbar.set_label('Density', fontsize=10)
+                
+                # Customize subplot
+                ax.set_xlabel(f'{self.metric}', fontsize=10, fontweight='bold')
+                ax.set_ylabel('Error Value', fontsize=10, fontweight='bold')
+                ax.set_title(f'{name}\n({len(metric_clean)} points)', fontsize=12, fontweight='bold')
+                ax.set_xlim(0, 1)  # Fixed x-axis limits
+                ax.set_ylim(0, 6)  # Fixed y-axis limits
+                ax.grid(True, alpha=0.3)
+                
+            except Exception as e:
+                ax.text(0.5, 0.5, f'Error creating\nheatmap for {name}:\n{str(e)[:50]}...', 
+                       ha='center', va='center', transform=ax.transAxes, fontsize=9)
+                ax.set_title(f'{name} - Error', fontweight='bold')
+                ax.set_xlim(0, 1)  # Fixed x-axis limits
+                ax.set_ylim(0, 6)  # Fixed y-axis limits
+        
+        # Hide unused subplots
+        for idx in range(n_distributions, len(axes)):
+            axes[idx].set_visible(False)
+        
+        # Overall title
+        title_parts = [f'Individual Distribution Heatmaps - {self.metric}\nDirectory: {self.directory_path}']
+        
+        # Add preprocessing information to title
+        preprocessing_info = []
+        if self.merge_patterns:
+            preprocessing_info.append(f"Merged: {', '.join(self.merge_patterns)}")
+        if self.normalize_outliers:
+            preprocessing_info.append("Outliers normalized")
+        if self.clip_percentiles is not None:
+            preprocessing_info.append(f"Clipped: {self.clip_percentiles[0]}-{self.clip_percentiles[1]}th percentile")
+        if self.normalize_range is not None:
+            preprocessing_info.append(f"Range: [{self.normalize_range[0]}, {self.normalize_range[1]}]")
+        if preprocessing_info:
+            title_parts.append(f"Preprocessing: {', '.join(preprocessing_info)}")
+        
+        fig.suptitle('\n'.join(title_parts), fontsize=16, fontweight='bold', y=0.95)
+        
+        # Save plot if path provided
+        if save_path:
+            if self.normalize_range:
+                save_path = save_path.replace('.png', '_norm.png')
+            plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+            print(f"Heatmap plots saved to: {save_path}")
+        
+        plt.tight_layout()
+        plt.show()
+
+
     def print_summary(self) -> None:
         """Print a summary of the analysis."""
         print("\n" + "="*80)
@@ -883,8 +1152,16 @@ def main():
             if args.error_dict:
                 print("Loading error distribution...")
                 comparator.load_error_distribution(args.error_dict)
-                comparator.plot_metric_vs_error(
+                comparator.plot_metric_vs_error_scatter(
                     save_path=os.path.join(args.directory, 'error_vs_' + args.save_plot),
+                )
+                
+                # Create heatmaps if requested
+                if args.plot_heatmaps:
+                    print("Creating individual heatmap plots...")
+                    comparator.plot_heatmaps(
+                        save_path=os.path.join(args.directory, 'heatmaps_' + args.save_plot),
+                        figsize=(12, 8)
                 )
         
         # Print summary
