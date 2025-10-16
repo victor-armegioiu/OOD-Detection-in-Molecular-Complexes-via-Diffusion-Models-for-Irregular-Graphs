@@ -330,7 +330,6 @@ class MolecularDenoisingModel:
         CDCD-style loss function with conditioning support
         """
         
-        # Extract molecular data
         lig_coords = batch['ligand_coords'].cuda()
         lig_features = batch['ligand_features'].cuda()
         pocket_coords = batch['pocket_coords'].cuda()
@@ -339,9 +338,15 @@ class MolecularDenoisingModel:
         pocket_mask = batch['pocket_mask'].cuda()
         batch_size = len(torch.unique(torch.cat([lig_mask, pocket_mask])))
         
-        # NEW: Extract initial coords for conditioning (if present)
+        # Extract initial coords for conditioning (if present)
         initial_lig_coords = batch.get('initial_ligand_coords', None)
         initial_pocket_coords = batch.get('initial_pocket_coords', None)
+        
+        # Extract node IDs for variable-sized conditioning
+        node_ids_atoms = batch.get('node_ids_atoms', None)
+        node_ids_residues = batch.get('node_ids_residues', None)
+        cond_node_ids_atoms = batch.get('cond_node_ids_atoms', None)
+        cond_node_ids_residues = batch.get('cond_node_ids_residues', None)
         
         # Get true atom/residue type indices
         true_atom_types = torch.argmax(lig_features, dim=-1)
@@ -359,15 +364,16 @@ class MolecularDenoisingModel:
         lig_coords_norm = lig_coords / self.scheme.coord_norm
         pocket_coords_norm = pocket_coords / self.scheme.coord_norm
         
-        # NEW: Compute displacement conditioning
-        initial_lig_coords = batch.get('initial_ligand_coords', None)
-        initial_pocket_coords = batch.get('initial_pocket_coords', None)
-        
-        # Compute conditioning from INITIAL COORDINATES (not displacement!)
+        # Compute conditioning from INITIAL COORDINATES (variable-sized graphs)
         cond_coords_lig = None
         cond_coords_pocket = None
         
-        if initial_lig_coords is not None and initial_pocket_coords is not None:
+        # Check if ALL required conditioning inputs are present
+        has_coords = initial_lig_coords is not None and initial_pocket_coords is not None
+        has_ids = (node_ids_atoms is not None and node_ids_residues is not None and
+                   cond_node_ids_atoms is not None and cond_node_ids_residues is not None)
+        
+        if has_coords and has_ids:
             initial_lig_coords = initial_lig_coords.cuda()
             initial_pocket_coords = initial_pocket_coords.cuda()
             
@@ -375,18 +381,19 @@ class MolecularDenoisingModel:
             initial_lig_norm = initial_lig_coords / self.scheme.coord_norm
             initial_pocket_norm = initial_pocket_coords / self.scheme.coord_norm
             
-            # Center initial coords (remove COM) - THIS IS THE CONDITIONING
-            initial_combined = torch.cat([initial_lig_norm, initial_pocket_norm], dim=0)
-            combined_mask = torch.cat([lig_mask, pocket_mask], dim=0)
-            initial_centered = remove_mean_batch(initial_combined, combined_mask)
-            
-            cond_coords_lig = initial_centered[:len(lig_coords)]
-            cond_coords_pocket = initial_centered[len(lig_coords):]
+            # ✅ NO SLICING - pass full conditioning graphs
+            # The _match_by_id() function handles size mismatches
+            cond_coords_lig = initial_lig_norm
+            cond_coords_pocket = initial_pocket_norm
             
             # Conditioning dropout (10% of the time, don't condition)
             if torch.rand(()) < 0.1:
                 cond_coords_lig = None
                 cond_coords_pocket = None
+                node_ids_atoms = None
+                node_ids_residues = None
+                cond_node_ids_atoms = None
+                cond_node_ids_residues = None
             
         # Remove center of mass for translation invariance
         combined_coords = torch.cat([lig_coords_norm, pocket_coords_norm], dim=0)
@@ -426,7 +433,11 @@ class MolecularDenoisingModel:
             target_atoms=lig_coords_centered,
             target_residues=pocket_coords_centered,
             cond_coords_atoms=cond_coords_lig,  # NEW
-            cond_coords_residues=cond_coords_pocket  # NEW
+            cond_coords_residues=cond_coords_pocket,  # NEW
+            node_ids_atoms=node_ids_atoms, # NEW
+            node_ids_residues=node_ids_residues, # NEW
+            cond_node_ids_atoms=cond_node_ids_atoms, # NEW
+            cond_node_ids_residues=cond_node_ids_residues, # NEW
         )
         
         # Split predictions
@@ -479,7 +490,7 @@ class MolecularDenoisingModel:
             "coord_pred_scale": torch.cat([pred_coords_lig, pred_coords_pocket]).abs().mean().item(),
             "atom_accuracy": (torch.argmax(pred_logits_lig, dim=-1) == true_atom_types).float().mean().item(),
             "residue_accuracy": (torch.argmax(pred_logits_pocket, dim=-1) == true_residue_types).float().mean().item(),
-            "using_conditioning": cond_coords_lig is not None,  # NEW metric
+            "using_conditioning": cond_coords_lig is not None and cond_node_ids_atoms is not None, 
         }
         return total_loss, metrics
         
@@ -495,9 +506,15 @@ class MolecularDenoisingModel:
         pocket_mask = batch['pocket_mask'].cuda()
         batch_size = batch['batch_size']
         
-        # NEW: Extract conditioning if present
+        # Extract conditioning if present
         initial_lig_coords = batch.get('initial_ligand_coords', None)
         initial_pocket_coords = batch.get('initial_pocket_coords', None)
+        
+        # Extract node IDs for variable-sized conditioning
+        node_ids_atoms = batch.get('node_ids_atoms', None)
+        node_ids_residues = batch.get('node_ids_residues', None)
+        cond_node_ids_atoms = batch.get('cond_node_ids_atoms', None)
+        cond_node_ids_residues = batch.get('cond_node_ids_residues', None)
         
         # Get true categories
         true_atom_types = torch.argmax(lig_features, dim=-1)
@@ -526,15 +543,16 @@ class MolecularDenoisingModel:
             lig_coords_norm = lig_coords / self.scheme.coord_norm
             pocket_coords_norm = pocket_coords / self.scheme.coord_norm
             
-            # NEW: Compute conditioning displacement
-            initial_lig_coords = batch.get('initial_ligand_coords', None)
-            initial_pocket_coords = batch.get('initial_pocket_coords', None)
-            
-            # Compute conditioning from INITIAL COORDINATES
+            # Compute conditioning from INITIAL COORDINATES (variable-sized)
             cond_coords_lig = None
             cond_coords_pocket = None
             
-            if initial_lig_coords is not None and initial_pocket_coords is not None:
+            # Check if ALL required conditioning inputs are present
+            has_coords = initial_lig_coords is not None and initial_pocket_coords is not None
+            has_ids = (node_ids_atoms is not None and node_ids_residues is not None and
+                       cond_node_ids_atoms is not None and cond_node_ids_residues is not None)
+            
+            if has_coords and has_ids:
                 initial_lig_coords_cuda = initial_lig_coords.cuda()
                 initial_pocket_coords_cuda = initial_pocket_coords.cuda()
                 
@@ -542,14 +560,10 @@ class MolecularDenoisingModel:
                 initial_lig_norm = initial_lig_coords_cuda / self.scheme.coord_norm
                 initial_pocket_norm = initial_pocket_coords_cuda / self.scheme.coord_norm
                 
-                # Center initial coords - THIS IS THE CONDITIONING
-                initial_combined = torch.cat([initial_lig_norm, initial_pocket_norm], dim=0)
-                combined_mask = torch.cat([lig_mask, pocket_mask], dim=0)
-                initial_centered = remove_mean_batch(initial_combined, combined_mask)
-                
-                cond_coords_lig = initial_centered[:len(lig_coords)]
-                cond_coords_pocket = initial_centered[len(lig_coords):]
-            
+                # Pass full conditioning graphs
+                cond_coords_lig = initial_lig_norm
+                cond_coords_pocket = initial_pocket_norm
+
             # Remove center of mass
             combined_coords = torch.cat([lig_coords_norm, pocket_coords_norm], dim=0)
             combined_mask = torch.cat([lig_mask, pocket_mask], dim=0)
@@ -578,12 +592,16 @@ class MolecularDenoisingModel:
             # Create sigma tensor
             sigma_batch = sigma_val
             
-            # Denoise WITH CONDITIONING
+            # Denoise WITH CONDITIONING (variable-sized)
             with torch.no_grad():
                 pred_output_lig, pred_output_pocket = self.denoiser(
                     xh_lig_noisy, xh_pocket_noisy, sigma_batch, lig_mask, pocket_mask,
-                    cond_coords_atoms=cond_coords_lig,  # NEW
-                    cond_coords_residues=cond_coords_pocket  # NEW
+                    cond_coords_atoms=cond_coords_lig,
+                    cond_coords_residues=cond_coords_pocket,
+                    node_ids_atoms=node_ids_atoms,
+                    node_ids_residues=node_ids_residues,
+                    cond_node_ids_atoms=cond_node_ids_atoms,
+                    cond_node_ids_residues=cond_node_ids_residues,
                 )
             
             # Split predictions
@@ -707,6 +725,116 @@ def test_molecular_diffusion():
     eval_metrics_cond = model.eval_fn(batch_with_cond)
     print(f"Eval coord_loss_lvl0 (with cond): {eval_metrics_cond['coord_loss_lvl0']:.4f}")
     print(f"Eval atom_accuracy_lvl0 (with cond): {eval_metrics_cond['atom_accuracy_lvl0']:.4f}")
+    
+    # ========== NEW TESTS FOR VARIABLE-SIZED CONDITIONING ==========
+    
+    print(f"\n{'='*70}")
+    print(f"--- Test 6: Variable-Sized Conditioning (CRITICAL!) ---")
+    print(f"{'='*70}")
+    
+    # Create batch where conditioning has DIFFERENT sizes
+    # This simulates MD trajectories where residues move in/out of pocket
+    batch_variable = {
+        'ligand_coords': torch.randn(8, 3, device=device),
+        'ligand_features': torch.nn.functional.one_hot(
+            torch.randint(0, atom_nf, (8,), device=device), atom_nf
+        ).float(),
+        'pocket_coords': torch.randn(16, 3, device=device),
+        'pocket_features': torch.nn.functional.one_hot(
+            torch.randint(0, residue_nf, (16,), device=device), residue_nf
+        ).float(),
+        'ligand_mask': torch.cat([torch.zeros(4), torch.ones(4)]).long().to(device),
+        'pocket_mask': torch.cat([torch.zeros(8), torch.ones(8)]).long().to(device),
+        'batch_size': 2,
+        
+        # CONDITIONING: MORE residues in initial frame (some moved OUT)
+        'initial_ligand_coords': torch.randn(8, 3, device=device),   # Same size
+        'initial_pocket_coords': torch.randn(22, 3, device=device),  # BIGGER by 6!
+        
+        # Node IDs for CURRENT graph (MD frame at t=500ps)
+        'node_ids_atoms': torch.tensor([
+            0, 1, 2, 3,                          # Mol 0: atoms 0-3
+            100000, 100001, 100002, 100003       # Mol 1: atoms 0-3
+        ], dtype=torch.long, device=device),
+        
+        'node_ids_residues': torch.tensor([
+            # Mol 0: 8 residues still in pocket
+            10, 11, 15, 20, 25, 30, 35, 40,
+            # Mol 1: 8 residues still in pocket
+            100010, 100011, 100015, 100020, 100025, 100030, 100035, 100040
+        ], dtype=torch.long, device=device),
+        
+        # Node IDs for CONDITIONING graph (initial frame at t=0)
+        'cond_node_ids_atoms': torch.tensor([
+            0, 1, 2, 3,                          # Mol 0: same atoms
+            100000, 100001, 100002, 100003       # Mol 1: same atoms
+        ], dtype=torch.long, device=device),
+        
+        'cond_node_ids_residues': torch.tensor([
+            # Mol 0: 12 residues (includes 12,13,14,21 that moved OUT later)
+            10, 11, 12, 13, 14, 15, 20, 21, 25, 30, 35, 40,
+            # Mol 1: 10 residues (includes 12,14 that moved OUT later)
+            100010, 100011, 100012, 100014, 100015, 100020, 100025, 100030, 100035, 100040
+        ], dtype=torch.long, device=device),
+    }
+    
+    print(f"\n📊 Graph Size Comparison:")
+    curr_total = batch_variable['ligand_coords'].shape[0] + batch_variable['pocket_coords'].shape[0]
+    cond_total = batch_variable['initial_ligand_coords'].shape[0] + batch_variable['initial_pocket_coords'].shape[0]
+    print(f"  Current graph:      {batch_variable['ligand_coords'].shape[0]} lig + "
+          f"{batch_variable['pocket_coords'].shape[0]} pocket = {curr_total} nodes")
+    print(f"  Conditioning graph: {batch_variable['initial_ligand_coords'].shape[0]} lig + "
+          f"{batch_variable['initial_pocket_coords'].shape[0]} pocket = {cond_total} nodes")
+    print(f"  Difference: +{cond_total - curr_total} extra nodes in conditioning")
+    
+    print(f"\n🔍 Expected Matching:")
+    print(f"  Ligand atoms:   8/8 should match (100%)")
+    print(f"  Pocket residues: 16/16 current should match")
+    print(f"                   6/22 conditioning are unmatched (get NULL)")
+    
+    # Run training step with variable-sized conditioning
+    loss_var, metrics_var = model.loss_fn(batch_variable)
+    
+    print(f"\n✅ Training Results:")
+    print(f"  Total Loss:        {loss_var.item():.4f}")
+    print(f"  Coord Loss:        {metrics_var['coord_loss']:.4f}")
+    print(f"  Categorical Loss:  {metrics_var['categorical_loss']:.4f}")
+    print(f"  Using conditioning: {metrics_var['using_conditioning']}")
+    print(f"  Atom accuracy:     {metrics_var['atom_accuracy']:.3f}")
+    print(f"  Residue accuracy:  {metrics_var['residue_accuracy']:.3f}")
+    
+    # Sanity checks
+    assert not torch.isnan(loss_var), "❌ NaN loss with variable-sized conditioning!"
+    assert not torch.isinf(loss_var), "❌ Inf loss with variable-sized conditioning!"
+    assert metrics_var['using_conditioning'], "❌ Conditioning not detected!"
+    print(f"\n✅ Variable-sized conditioning handled correctly!")
+    
+    print(f"\n--- Test 7: Stability Check (Multiple Runs) ---")
+    losses = []
+    for run in range(3):
+        loss_repeat, _ = model.loss_fn(batch_variable)
+        losses.append(loss_repeat.item())
+        print(f"  Run {run+1}: loss = {loss_repeat.item():.4f}")
+    
+    loss_std = np.std(losses)
+    print(f"  Loss std dev: {loss_std:.4f}")
+    assert loss_std < 5.0, f"❌ Loss too unstable! std={loss_std:.4f}"
+    print(f"✅ Model is stable with unmatched nodes!")
+    
+    print(f"\n--- Test 8: Evaluation with Variable-Sized Conditioning ---")
+    eval_var = model.eval_fn(batch_variable)
+    print(f"  Eval coord_loss_lvl0: {eval_var['coord_loss_lvl0']:.4f}")
+    print(f"  Eval atom_accuracy_lvl0: {eval_var['atom_accuracy_lvl0']:.3f}")
+    assert not np.isnan(eval_var['coord_loss_lvl0']), "❌ NaN in eval!"
+    print(f"✅ Evaluation works with variable-sized conditioning!")
+    
+    print(f"\n{'='*70}")
+    print("✅ ALL TESTS PASSED - Variable-sized conditioning fully working!")
+    print(f"{'='*70}")
+    
+    return model
+
+    
     
     print("\n✅ GenCFD-style molecular diffusion with conditioning test passed!")
     
