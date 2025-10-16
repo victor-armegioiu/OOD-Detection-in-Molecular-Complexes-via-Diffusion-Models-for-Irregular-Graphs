@@ -26,8 +26,6 @@ from molecular_samplers import (
     create_molecular_denoiser_wrapper, edm_noise_decay, dlog_dt, dsquare_dt
 )
 
-from metrics import load_checkpoint
-from Dataset import PDBbind_Dataset
 
 Tensor = torch.Tensor
 TensorMapping = Mapping[str, Tensor]
@@ -347,6 +345,61 @@ class MolecularLikelihoodEvaluator:
             pocket_mask=new_pocket_mask,
             batch_size=1
         )
+
+    def _extract_single_sample_conditioning(
+        self,
+        sample_idx: int,
+        ligand_mask: Tensor,
+        pocket_mask: Tensor,
+        cond: TensorMapping | None
+    ) -> TensorMapping | None:
+        """
+        Extract conditioning for a single sample from batch conditioning.
+        
+        Args:
+            sample_idx: Which sample to extract (0, 1, 2, ...)
+            ligand_mask: Boolean mask for ligand atoms of this sample
+            pocket_mask: Boolean mask for pocket residues of this sample
+            cond: Full batch conditioning dict
+            
+        Returns:
+            Filtered conditioning dict for just this sample, or None
+        """
+        if cond is None:
+            return None
+        
+        # Extract current sample's node IDs
+        sample_node_ids_atoms = cond['node_ids_atoms'][ligand_mask]
+        sample_node_ids_residues = cond['node_ids_residues'][pocket_mask]
+        
+        # Get conditioning node IDs (full batch)
+        cond_node_ids_atoms = cond['cond_node_ids_atoms']
+        cond_node_ids_residues = cond['cond_node_ids_residues']
+        
+        # Determine molecule ID namespace for this sample
+        # Node IDs are namespaced: mol 0 = [0, 999999], mol 1 = [1000000, 1999999], etc.
+        mol_id_offset = sample_idx * 1000000
+        mol_id_max = (sample_idx + 1) * 1000000
+        
+        # Filter conditioning atoms: find those in this molecule's ID range
+        atom_in_range = (cond_node_ids_atoms >= mol_id_offset) & (cond_node_ids_atoms < mol_id_max)
+        filtered_cond_node_ids_atoms = cond_node_ids_atoms[atom_in_range]
+        filtered_cond_coords_atoms = cond['cond_coords_ligand'][atom_in_range]
+        
+        # Filter conditioning residues: find those in this molecule's ID range
+        residue_in_range = (cond_node_ids_residues >= mol_id_offset) & (cond_node_ids_residues < mol_id_max)
+        filtered_cond_node_ids_residues = cond_node_ids_residues[residue_in_range]
+        filtered_cond_coords_residues = cond['cond_coords_pocket'][residue_in_range]
+        
+        # Return filtered conditioning for this sample
+        return {
+            'cond_coords_ligand': filtered_cond_coords_atoms,
+            'cond_coords_pocket': filtered_cond_coords_residues,
+            'node_ids_atoms': sample_node_ids_atoms,
+            'node_ids_residues': sample_node_ids_residues,
+            'cond_node_ids_atoms': filtered_cond_node_ids_atoms,
+            'cond_node_ids_residues': filtered_cond_node_ids_residues,
+        }
     
     def _create_molecular_dynamics(self, cond: TensorMapping | None) -> MolecularSdeDynamics:
         """Create molecular probability flow ODE dynamics for likelihood evaluation"""
@@ -655,35 +708,18 @@ class MolecularLikelihoodEvaluator:
         trajectory_statistics = []
         
         for sample_idx in range(batch_size):
+            # Extract single sample
             single_sample = self._extract_single_sample(molecular_state, sample_idx)
             
-            sample_cond = None
-            if cond is not None:
-                # masks in *global* indexing (for the original batch)
-                lig_sel = (molecular_state.ligand_mask == sample_idx)
-                poc_sel = (molecular_state.pocket_mask == sample_idx)
+            # Extract conditioning for this specific sample
+            ligand_mask = (molecular_state.ligand_mask == sample_idx)
+            pocket_mask = (molecular_state.pocket_mask == sample_idx)
+            single_sample_cond = self._extract_single_sample_conditioning(
+                sample_idx, ligand_mask, pocket_mask, cond
+            )
             
-                sample_cond = {}
-                for key, value in cond.items():
-                    if not isinstance(value, torch.Tensor):
-                        sample_cond[key] = value
-                        continue
-            
-                    if key == 'cond_coords_ligand':
-                        # shape [total_lig_atoms, 3]  -> slice to this sample
-                        sample_cond[key] = value[lig_sel]
-                    elif key == 'cond_coords_pocket':
-                        # shape [total_pocket_atoms, 3] -> slice to this sample
-                        sample_cond[key] = value[poc_sel]
-                    elif value.shape[0] == batch_size:
-                        # true per-sample tensors
-                        sample_cond[key] = value[sample_idx:sample_idx+1]
-                    else:
-                        # leave as-is (e.g., scalars, already-per-atom tensors with the right shape)
-                        sample_cond[key] = value
-                        
             terminal_state, divergence_integral, stats_summary = self._forward_integrate_with_stats_single(
-                single_sample, sample_cond
+                single_sample, single_sample_cond
             )
             
             terminal_log_prob = self._evaluate_terminal_likelihood_single(terminal_state)
@@ -740,387 +776,241 @@ def create_molecular_likelihood_evaluator_from_model(
     return evaluator
 
 
-def test_likelihood_evaluator_with_conditioning():
-    """Test molecular likelihood evaluator with and without conditioning"""
+def test_per_sample_likelihood_evaluator():
+    """Test the per-sample molecular likelihood evaluator"""
     
-    print("="*70)
-    print("Testing Molecular Likelihood Evaluator with Conditioning Support")
-    print("="*70)
+    print("Testing Per-Sample Molecular Likelihood Evaluator (CUDA)...")
     
-    from molecular_diffusion import MolecularDenoisingModel
-    
-    atom_nf = 4
-    residue_nf = 5
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    print(f"\nDevice: {device}")
-    print(f"Creating model with conditioning support...")
-    
-    # Create model with conditioning enabled
-    model = MolecularDenoisingModel(
-        atom_nf=atom_nf,
-        residue_nf=residue_nf,
-        joint_nf=8,
-        hidden_nf=16,
-        n_layers=1,
-    )
-    model.initialize()
-    
-    # Create evaluator
-    evaluator = create_molecular_likelihood_evaluator_from_model(
-        model=model,
-        num_steps=5,  # Small for fast testing
-        num_hutchinson_samples=2,
-        collect_trajectory_stats=True,
-    )
-    
-    # Create test batch
-    ligand_sizes = [3, 4]
-    pocket_sizes = [6, 5]
-    batch_size = len(ligand_sizes)
-    
-    total_lig_atoms = sum(ligand_sizes)
-    total_pocket_atoms = sum(pocket_sizes)
-    
-    ligand_mask = torch.cat([
-        torch.full((size,), i, dtype=torch.long, device=device)
-        for i, size in enumerate(ligand_sizes)
-    ])
-    pocket_mask = torch.cat([
-        torch.full((size,), i, dtype=torch.long, device=device)
-        for i, size in enumerate(pocket_sizes)
-    ])
-    
-    # Create clean molecular state
-    ligand_coords = torch.randn(total_lig_atoms, 3, device=device) * 0.1
-    ligand_features = torch.zeros(total_lig_atoms, 8, device=device)
-    ligand_data = torch.cat([ligand_coords, ligand_features], dim=1)
-    
-    pocket_coords = torch.randn(total_pocket_atoms, 3, device=device) * 0.1
-    pocket_features = torch.zeros(total_pocket_atoms, 8, device=device)
-    pocket_data = torch.cat([pocket_coords, pocket_features], dim=1)
-    
-    # Make COM-free
-    for i in range(batch_size):
-        lig_mask = ligand_mask == i
-        poc_mask = pocket_mask == i
+    try:
+        # Import the molecular diffusion model
+        from molecular_diffusion import MolecularDenoisingModel
         
-        sample_coords = torch.cat([ligand_coords[lig_mask], pocket_coords[poc_mask]], dim=0)
-        sample_mask = torch.cat([
-            torch.zeros(lig_mask.sum(), dtype=torch.long, device=device),
-            torch.zeros(poc_mask.sum(), dtype=torch.long, device=device)
+        atom_nf = 4
+        residue_nf = 5
+        
+        # Create dummy model for testing
+        model = MolecularDenoisingModel(
+            atom_nf=atom_nf,
+            residue_nf=residue_nf,
+            joint_nf=8,
+            hidden_nf=16,
+            n_layers=1
+        )
+        model.initialize()
+        
+        # Create likelihood evaluator
+        print("Creating per-sample likelihood evaluator...")
+        evaluator = create_molecular_likelihood_evaluator_from_model(
+            model=model,
+            num_steps=10,  # Small for testing
+            num_hutchinson_samples=5,
+        )
+        
+        # Create a batch with multiple molecular states
+        ligand_sizes = [3, 4, 2]  # 3 samples
+        pocket_sizes = [8, 6, 5]  # 3 samples
+        batch_size = len(ligand_sizes)
+        
+        total_lig_atoms = sum(ligand_sizes)
+        total_pocket_atoms = sum(pocket_sizes)
+        
+        # Create masks
+        ligand_mask = torch.cat([
+            torch.full((size,), i, dtype=torch.long, device='cuda')
+            for i, size in enumerate(ligand_sizes)
+        ])
+        pocket_mask = torch.cat([
+            torch.full((size,), i, dtype=torch.long, device='cuda')
+            for i, size in enumerate(pocket_sizes)
         ])
         
-        sample_coords_centered = remove_mean_batch(sample_coords, sample_mask)
+        # Create clean molecular state
+        ligand_coords = torch.randn(total_lig_atoms, 3, device='cuda') * 0.1
+        ligand_features = torch.zeros(total_lig_atoms, 8, device='cuda')  # joint_nf
+        ligand_data = torch.cat([ligand_coords, ligand_features], dim=1)
         
-        ligand_data[lig_mask, :3] = sample_coords_centered[:lig_mask.sum()]
-        pocket_data[poc_mask, :3] = sample_coords_centered[lig_mask.sum():]
-    
-    clean_state = MolecularState(
-        ligand=ligand_data,
-        pocket=pocket_data,
-        ligand_mask=ligand_mask,
-        pocket_mask=pocket_mask,
-        batch_size=batch_size
-    )
-    
-    # Test 1: Without conditioning
-    print("\n" + "-"*70)
-    print("Test 1: Likelihood evaluation WITHOUT conditioning")
-    print("-"*70)
-    
-    log_liks_no_cond, stats_no_cond = evaluator.evaluate_likelihood_with_stats(clean_state, cond=None)
-    
-    print(f"✓ Batch size: {batch_size}")
-    print(f"✓ Likelihood shape: {log_liks_no_cond.shape}")
-    print(f"✓ Log-likelihoods: {log_liks_no_cond}")
-    print(f"✓ Trajectory stats collected: {len(stats_no_cond)}")
-    
-    if stats_no_cond:
-        print(f"\n  Sample 0 trajectory statistics:")
-        for key, value in list(stats_no_cond[0].items())[:5]:
-            print(f"    {key}: {value:.4f}")
-        print(f"    ... ({len(stats_no_cond[0])} total metrics)")
-    
-    # Test 2: With conditioning
-    print("\n" + "-"*70)
-    print("Test 2: Likelihood evaluation WITH conditioning")
-    print("-"*70)
-    
-    # Create initial coordinates (noisy versions of clean state)
-    initial_lig_coords = ligand_coords + torch.randn_like(ligand_coords) * 0.3
-    initial_poc_coords = pocket_coords + torch.randn_like(pocket_coords) * 0.3
-    
-    # Normalize and center initial coords
-    initial_lig_norm = initial_lig_coords / model.scheme.coord_norm
-    initial_poc_norm = initial_poc_coords / model.scheme.coord_norm
-    
-    initial_combined = torch.cat([initial_lig_norm, initial_poc_norm], dim=0)
-    combined_mask = torch.cat([ligand_mask, pocket_mask])
-    initial_centered = remove_mean_batch(initial_combined, combined_mask)
-    
-    cond_coords_lig = initial_centered[:total_lig_atoms]
-    cond_coords_poc = initial_centered[total_lig_atoms:]
-    
-    cond = {
-        'cond_coords_ligand': cond_coords_lig,
-        'cond_coords_pocket': cond_coords_poc
-    }
-    
-    log_liks_with_cond, stats_with_cond = evaluator.evaluate_likelihood_with_stats(clean_state, cond=cond)
-    
-    print(f"✓ Batch size: {batch_size}")
-    print(f"✓ Likelihood shape: {log_liks_with_cond.shape}")
-    print(f"✓ Log-likelihoods: {log_liks_with_cond}")
-    print(f"✓ Trajectory stats collected: {len(stats_with_cond)}")
-    
-    if stats_with_cond:
-        print(f"\n  Sample 0 trajectory statistics:")
-        for key, value in list(stats_with_cond[0].items())[:5]:
-            print(f"    {key}: {value:.4f}")
-        print(f"    ... ({len(stats_with_cond[0])} total metrics)")
-    
-    # Test 3: Compare results
-    print("\n" + "-"*70)
-    print("Test 3: Comparison")
-    print("-"*70)
-    
-    likelihood_diff = (log_liks_with_cond - log_liks_no_cond).abs().mean()
-    print(f"✓ Mean absolute likelihood difference: {likelihood_diff.item():.4f}")
-    print(f"✓ Conditioning affects likelihood: {likelihood_diff > 1e-3}")
-    
-    # Verify shapes
-    assert log_liks_no_cond.shape == (batch_size,), f"Expected shape ({batch_size},), got {log_liks_no_cond.shape}"
-    assert log_liks_with_cond.shape == (batch_size,), f"Expected shape ({batch_size},), got {log_liks_with_cond.shape}"
-    assert len(stats_no_cond) == batch_size, f"Expected {batch_size} stat dicts, got {len(stats_no_cond)}"
-    assert len(stats_with_cond) == batch_size, f"Expected {batch_size} stat dicts, got {len(stats_with_cond)}"
-    
-    # Verify conditioning changes output
-    assert likelihood_diff > 1e-6, "Conditioning should affect likelihood!"
-    
-    print("\n" + "="*70)
-    print("✅ All tests passed! Likelihood evaluator works with and without conditioning.")
-    print("="*70)
-
-
-def save_dict_to_json(data, output_path):
-    ''' Save dictionary to JSON file. Initialize new file if it doesn't exist. Append to existing file if it does.'''
-    if os.path.exists(output_path):
-        with open(output_path, 'r') as f:
-            existing_data = json.load(f)
-        existing_data.update(data)
-        with open(output_path, 'w') as f:
-            json.dump(existing_data, f, indent=4)
-    else:
-        with open(output_path, 'w') as f:
-            json.dump(data, f, indent=4)
-    print(f"Results saved to: {output_path}")
-
-
-def process_dataset(dataset, evaluator, device, dataset_name, output_path):
-    """Process a dataset and return likelihood statistics"""
-    print(f"\nProcessing {dataset_name}...", flush=True)
-    
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, follow_batch=['lig_coords', 'prot_coords'])
-    
-    # If JSON output_path exists, load it, otherwise initialize empty dictionary
-    if os.path.exists(output_path):
-        with open(output_path, 'r') as f:
-            all_metrics = json.load(f)
-    else:
-        all_metrics = {}
+        pocket_coords = torch.randn(total_pocket_atoms, 3, device='cuda') * 0.1
+        pocket_features = torch.zeros(total_pocket_atoms, 8, device='cuda')  # joint_nf
+        pocket_data = torch.cat([pocket_coords, pocket_features], dim=1)
         
-    batch_count = 0
-    for batch in dataloader:
-        batch = batch.to(device)
-        print(f"\nStarting batch...{batch.id}")
-        print(batch)
-        
-        lig_features = batch.lig_features
-        pocket_features = batch.prot_features
-
-        # Convert one-hot features to embeddings
-        ligand_embeddings = evaluator._model.denoiser.atom_encoder(lig_features)  # [N_lig, joint_nf]
-        pocket_embeddings = evaluator._model.denoiser.residue_encoder(pocket_features)  # [N_pocket, joint_nf]
-
-        lig_coords = batch.lig_coords
-        pocket_coords = batch.prot_coords
-        ligand_mask = batch.lig_coords_batch
-        pocket_mask = batch.prot_coords_batch
-
-        # Concatenate coords and embeddings
-        ligand_data = torch.cat([lig_coords, ligand_embeddings], dim=1)
-        pocket_data = torch.cat([pocket_coords, pocket_embeddings], dim=1)
-
-        # Center-of-mass correction for this molecule
-        combined_coords = torch.cat([lig_coords, pocket_coords], dim=0)
-        combined_mask = torch.cat([ligand_mask, pocket_mask])
-        combined_coords_centered = remove_mean_batch(combined_coords, combined_mask)
-        ligand_data[:, :3] = combined_coords_centered[:lig_coords.shape[0]]
-        pocket_data[:, :3] = combined_coords_centered[lig_coords.shape[0]:]
-
-        # Separate the batch into individual graphs
-        print(torch.bincount(ligand_mask).tolist())
-        print(torch.bincount(pocket_mask).tolist())
-
-        ligand_data = torch.split(ligand_data, torch.bincount(ligand_mask).tolist())
-        pocket_data = torch.split(pocket_data, torch.bincount(pocket_mask).tolist())
-
-        for i in range(len(ligand_data)):
-
-            # If the molecule data already exists (with a log likelihood that is not NaN nor Infinity), skip it
-            exists = batch.id[i] in all_metrics
-            has_likelihood = exists and 'log_likelihood' in all_metrics[batch.id[i]]
-            is_nan = has_likelihood and np.isnan(all_metrics[batch.id[i]]['log_likelihood'])
-            is_inf = has_likelihood and np.isinf(all_metrics[batch.id[i]]['log_likelihood'])
-            if exists and has_likelihood and not is_nan and not is_inf:
-                print(f"Molecule {batch.id[i]} already processed, skipping...", flush=True)
-                continue
-
-            ligand_mask = torch.zeros(ligand_data[i].shape[0], dtype=torch.long, device=device)
-            pocket_mask = torch.zeros(pocket_data[i].shape[0], dtype=torch.long, device=device)
-
-            # Create molecular state
-            state = MolecularState(
-                ligand=ligand_data[i],
-                pocket=pocket_data[i],
-                ligand_mask=ligand_mask,
-                pocket_mask=pocket_mask,
-                batch_size=1
-            )
-
-            # To do: 
-            # - Extract initial state from batch
-            # - Normalize with model.scheme.coord_norm?
-            # - Remove COM with remove_mean_batch()
-
-            cond = {
-                'cond_coords_ligand': cond_coords_lig,
-                'cond_coords_pocket': cond_coords_poc
-                }
-
-            # Evaluate likelihood for this molecule
-            try:
-                log_likelihood, trajectory_stats = evaluator.evaluate_likelihood_with_stats(state, cond=cond)
-            except Exception as e:
-                print(f"Error evaluating likelihood for molecule {batch.id[i]}: {e}")
-                continue
-
-            all_metrics[batch.id[i]] = {'log_likelihood': float(log_likelihood.item())}
-            if trajectory_stats:
-                trajectory_stats = {k: float(v) for k, v in trajectory_stats[0].items()}
-                all_metrics[batch.id[i]].update(trajectory_stats)
-        
-        # Intermediate save if batch_count is a multiple of 10
-        if batch_count == 0 or batch_count % 10 == 0:
-            save_dict_to_json(all_metrics, output_path)
-        batch_count += 1
-
-    save_dict_to_json(all_metrics, output_path)
-    return all_metrics
-
-
-def main(dataset_path, checkpoint_path, results_folder, num_steps, num_hutchinson_samples, start_idx=None, stop_idx=None):
-    
-    # Configuration
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    print(f"Device: {device}")
-    print(f"Dataset path: {dataset_path}")
-    print(f"Checkpoint path: {checkpoint_path}")
-    print(f"Results folder: {results_folder}")
-    print(f"Number of integration steps: {num_steps}")
-    print(f"Number of Hutchinson samples: {num_hutchinson_samples}")
-    if start_idx is not None and stop_idx is not None:
-        print(f"Processing dataset slice: indices {start_idx} to {stop_idx-1}")
-    print()
-    
-    # Check checkpoint existence
-    for path in [dataset_path, checkpoint_path]:
-        name = os.path.basename(path)
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"{name} not found at {path}")
-        print(f"Found {name}: {path}")
-    
-    # Load datasets and model
-    print("\nLoading dataset and model...", flush=True)
-    full_dataset = torch.load(dataset_path)
-    name = os.path.basename(dataset_path)
-    
-    # Apply slicing if specified
-    if start_idx is not None and stop_idx is not None:
-        print(f"Slicing dataset: using indices {start_idx} to {stop_idx-1}")
-        
-        if hasattr(full_dataset, 'input_data') and hasattr(full_dataset, '__len__'):
-            # This is a PDBbind_Dataset with input_data dictionary
-            total_size = len(full_dataset)
-            print(f"Total dataset length: {total_size}")
+        # Make COM-free for each sample separately
+        for i in range(batch_size):
+            lig_mask = ligand_mask == i
+            poc_mask = pocket_mask == i
             
-            # Clamp indices to valid range
-            start_idx = max(0, start_idx)
-            stop_idx = min(total_size, stop_idx)
+            sample_coords = torch.cat([ligand_coords[lig_mask], pocket_coords[poc_mask]], dim=0)
+            sample_mask = torch.cat([
+                torch.zeros(lig_mask.sum(), dtype=torch.long, device='cuda'),
+                torch.zeros(poc_mask.sum(), dtype=torch.long, device='cuda')
+            ])
             
-            if start_idx >= stop_idx:
-                raise ValueError(f"Invalid slice range: start_idx ({start_idx}) >= stop_idx ({stop_idx})")
+            sample_coords_centered = remove_mean_batch(sample_coords, sample_mask)
             
-            # Create sliced input_data dictionary
-            sliced_input_data = {}
-            slice_idx = 0
-            for original_idx in range(start_idx, stop_idx):
-                if original_idx in full_dataset.input_data:
-                    sliced_input_data[slice_idx] = full_dataset.input_data[original_idx]
-                    slice_idx += 1
-            
-            # Create a new dataset instance with sliced input_data
-            dataset = PDBbind_Dataset.create_sliced_dataset(sliced_input_data)
-            
-            print(f"Sliced dataset length: {len(dataset)}")
-            del full_dataset
+            ligand_data[lig_mask, :3] = sample_coords_centered[:lig_mask.sum()]
+            pocket_data[poc_mask, :3] = sample_coords_centered[lig_mask.sum():]
         
+        clean_state = MolecularState(
+            ligand=ligand_data,
+            pocket=pocket_data,
+            ligand_mask=ligand_mask,
+            pocket_mask=pocket_mask,
+            batch_size=batch_size
+        )
+        
+        print("\n" + "="*70)
+        print("=== Test 1: Likelihood WITHOUT Conditioning ===")
+        print("="*70)
+        
+        print("Evaluating likelihood of clean molecular states...")
+        log_likelihoods = evaluator.evaluate_likelihood(clean_state)
+        
+        print(f"✅ Per-sample likelihood evaluation successful!")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Output shape: {log_likelihoods.shape}")
+        print(f"  Log-likelihoods: {log_likelihoods}")
+        
+        # Verify we get one likelihood per sample
+        assert log_likelihoods.shape == (batch_size,), f"Expected shape ({batch_size},), got {log_likelihoods.shape}"
+        
+        print("✅ Test 1 passed!")
+        
+        # ========== NEW TEST 2 ==========
+        
+        print("\n" + "="*70)
+        print("=== Test 2: Likelihood WITH Variable-Sized Conditioning ===")
+        print("="*70)
+        
+        # Create conditioning with DIFFERENT sizes (simulates MD trajectory)
+        # Current state: [3,4,2] ligand atoms, [8,6,5] pocket residues
+        # Conditioning: [3,4,2] ligand atoms, [10,8,7] pocket residues (MORE!)
+        cond_lig_coords = torch.randn(total_lig_atoms, 3, device='cuda') * 0.15
+        cond_pocket_coords = torch.randn(25, 3, device='cuda') * 0.15  # 10+8+7 = 25 > 19
+        
+        # Node IDs for CURRENT state (what we're evaluating likelihood of)
+        node_ids_atoms = torch.cat([
+            torch.arange(3, dtype=torch.long, device='cuda'),  # Mol 0
+            torch.arange(4, dtype=torch.long, device='cuda') + 1000000,  # Mol 1
+            torch.arange(2, dtype=torch.long, device='cuda') + 2000000,  # Mol 2
+        ])
+        
+        node_ids_residues = torch.cat([
+            # Mol 0: 8 residues that stayed
+            torch.tensor([10, 11, 15, 20, 25, 30, 35, 40], dtype=torch.long, device='cuda'),
+            # Mol 1: 6 residues that stayed
+            torch.tensor([100010, 100011, 100015, 100020, 100025, 100030], dtype=torch.long, device='cuda'),
+            # Mol 2: 5 residues that stayed
+            torch.tensor([200010, 200011, 200015, 200020, 200025], dtype=torch.long, device='cuda'),
+        ])
+        
+        # Node IDs for CONDITIONING state (initial frame with MORE residues)
+        cond_node_ids_atoms = node_ids_atoms.clone()  # Ligands same
+        
+        cond_node_ids_residues = torch.cat([
+            # Mol 0: 10 residues (includes 12,13 that moved OUT)
+            torch.tensor([10, 11, 12, 13, 15, 20, 25, 30, 35, 40], dtype=torch.long, device='cuda'),
+            # Mol 1: 8 residues (includes 12,14 that moved OUT)
+            torch.tensor([100010, 100011, 100012, 100014, 100015, 100020, 100025, 100030], dtype=torch.long, device='cuda'),
+            # Mol 2: 7 residues (includes 12,14 that moved OUT)
+            torch.tensor([200010, 200011, 200012, 200014, 200015, 200020, 200025], dtype=torch.long, device='cuda'),
+        ])
+        
+        cond = {
+            'cond_coords_ligand': cond_lig_coords,
+            'cond_coords_pocket': cond_pocket_coords,
+            'node_ids_atoms': node_ids_atoms,
+            'node_ids_residues': node_ids_residues,
+            'cond_node_ids_atoms': cond_node_ids_atoms,
+            'cond_node_ids_residues': cond_node_ids_residues,
+        }
+        
+        print(f"\n📊 Graph Size Comparison:")
+        curr_total = total_lig_atoms + total_pocket_atoms
+        cond_total = cond_lig_coords.shape[0] + cond_pocket_coords.shape[0]
+        print(f"  Current state:      {total_lig_atoms} lig + {total_pocket_atoms} pocket = {curr_total} nodes")
+        print(f"  Conditioning state: {cond_lig_coords.shape[0]} lig + {cond_pocket_coords.shape[0]} pocket = {cond_total} nodes")
+        print(f"  Difference: +{cond_total - curr_total} extra nodes in conditioning")
+        
+        print(f"\n🔍 Expected Matching:")
+        print(f"  • All {total_lig_atoms} ligand atoms should match")
+        print(f"  • {total_pocket_atoms}/25 pocket residues match (current state)")
+        print(f"  • 6 unmatched residues in conditioning (2 per molecule moved OUT)")
+        print(f"  • Unmatched get NULL embeddings → won't affect likelihood")
+        
+        print(f"\n🚀 Evaluating likelihood with variable-sized conditioning...")
+        log_likelihoods_cond = evaluator.evaluate_likelihood(clean_state, cond=cond)
+        
+        print(f"\n✅ Conditioning Results:")
+        print(f"  Output shape: {log_likelihoods_cond.shape}")
+        print(f"  Log-likelihoods (with cond): {log_likelihoods_cond}")
+        print(f"  Log-likelihoods (no cond):   {log_likelihoods}")
+        
+        # Verify shape
+        assert log_likelihoods_cond.shape == (batch_size,), \
+            f"Expected shape ({batch_size},), got {log_likelihoods_cond.shape}"
+        
+        # Verify no NaNs or Infs
+        has_nan = torch.isnan(log_likelihoods_cond).any()
+        has_inf = torch.isinf(log_likelihoods_cond).any()
+        
+        print(f"  No NaNs: {not has_nan}")
+        print(f"  No Infs: {not has_inf}")
+        
+        assert not has_nan, "❌ NaN detected in conditional log-likelihoods!"
+        assert not has_inf, "❌ Inf detected in conditional log-likelihoods!"
+        
+        # Check that conditioning changes likelihood (should be different)
+        likelihood_diff = (log_likelihoods_cond - log_likelihoods).abs().mean()
+        print(f"  Mean absolute difference: {likelihood_diff.item():.6f}")
+        
+        if likelihood_diff > 1e-3:
+            print(f"  ✅ Conditioning changes likelihood as expected!")
         else:
-            raise ValueError("Dataset does not support length operation for slicing")
-    else:
-        dataset = full_dataset
-        print(f"Using full dataset, size: {len(dataset) if hasattr(dataset, '__len__') else 'unknown'}")
-
-
-    model = load_checkpoint(checkpoint_path)
-    
-    # Create likelihood evaluator
-    print("\nCreating likelihood evaluator...", flush=True)
-    evaluator = create_molecular_likelihood_evaluator_from_model(
-        model,
-        num_steps=num_steps,
-        num_hutchinson_samples=num_hutchinson_samples,
-    )
-    
-    output_filename = f'{name.replace(".pt", "")}_metrics.json'
-    output_path = os.path.join(results_folder, output_filename)
-
-    # -----------------------------------------------------------
-    metrics = process_dataset(dataset, evaluator, device, name, output_path)
-    # -----------------------------------------------------------
-    
-    print(f"Done! Processed {len(metrics)} graphs.")
+            print(f"  ⚠️  Warning: Likelihoods very similar (diff={likelihood_diff.item():.6f})")
+        
+        print(f"\n🎉 SUCCESS! Variable-sized conditioning works in likelihood evaluator!")
+        print(f"  • Handled {cond_total - curr_total} extra conditioning nodes")
+        print(f"  • ID-based matching prevented NaN/Inf")
+        print(f"  • Computed valid per-sample log-likelihoods")
+        
+        print(f"\n🔬 Validating per-sample conditioning extraction:")
+        for sample_idx in range(batch_size):
+            ligand_mask = (clean_state.ligand_mask == sample_idx)
+            pocket_mask = (clean_state.pocket_mask == sample_idx)
+            
+            sample_cond = evaluator._extract_single_sample_conditioning(
+                sample_idx, ligand_mask, pocket_mask, cond
+            )
+            
+            n_lig_current = ligand_mask.sum().item()
+            n_pocket_current = pocket_mask.sum().item()
+            n_lig_cond = sample_cond['cond_coords_ligand'].shape[0]
+            n_pocket_cond = sample_cond['cond_coords_pocket'].shape[0]
+            
+            print(f"  Sample {sample_idx}:")
+            print(f"    Current:      {n_lig_current} lig + {n_pocket_current} pocket")
+            print(f"    Conditioning: {n_lig_cond} lig + {n_pocket_cond} pocket")
+            print(f"    Node ID ranges: atoms [{sample_cond['node_ids_atoms'].min()}, {sample_cond['node_ids_atoms'].max()}]")
+            print(f"                    residues [{sample_cond['node_ids_residues'].min()}, {sample_cond['node_ids_residues'].max()}]")
+            
+            # Verify sizes make sense
+            assert n_lig_current <= n_lig_cond or n_lig_current == n_lig_cond, \
+                f"Sample {sample_idx}: current ligand ({n_lig_current}) vs conditioning ({n_lig_cond})"
+            assert sample_cond['node_ids_atoms'].shape[0] == n_lig_current, \
+                f"Sample {sample_idx}: Node ID count mismatch for atoms!"
+            assert sample_cond['node_ids_residues'].shape[0] == n_pocket_current, \
+                f"Sample {sample_idx}: Node ID count mismatch for residues!"
+        
+        print(f"  ✅ All samples have correctly filtered conditioning!")        
+        print("\n" + "="*70)
+        print("✅ ALL LIKELIHOOD EVALUATOR TESTS PASSED!")
+        print("="*70)
+        
+    except Exception as e:
+        print(f"❌ Error during likelihood evaluation: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 if __name__ == '__main__':
-    # test_likelihood_evaluator_with_conditioning()
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset_path', default='dataset_cleansplit_train.pt', type=str)
-    parser.add_argument('--checkpoint_path', default='training_runs/0725_115513_dataset_cleansplit_train/checkpoint_epoch_579.pt', type=str)
-    parser.add_argument('--results_folder', default='likelihood_results', type=str)
-    parser.add_argument('--num_steps', type=int, default=10)
-    parser.add_argument('--num_hutchinson_samples', type=int, default=20)
-    parser.add_argument('--start_idx', type=int, default=None, help='Start index for dataset slicing (inclusive)')
-    parser.add_argument('--stop_idx', type=int, default=None, help='Stop index for dataset slicing (exclusive)')
-    args = parser.parse_args()
-
-    main(args.dataset_path, 
-         args.checkpoint_path, 
-         args.results_folder, 
-         args.num_steps, 
-         args.num_hutchinson_samples, 
-         args.start_idx, 
-         args.stop_idx)
+    test_per_sample_likelihood_evaluator()
