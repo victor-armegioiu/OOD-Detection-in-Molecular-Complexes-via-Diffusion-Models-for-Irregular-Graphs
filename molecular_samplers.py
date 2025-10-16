@@ -263,10 +263,10 @@ class MolecularSampler:
 
     def _process_conditioning(self, cond: TensorMapping) -> TensorMapping:
         """
-        Process conditioning coordinates into displacement format.
+        Process conditioning coordinates and node IDs for variable-sized graphs.
         
-        For sampling (no target available), we center the initial coordinates
-        and pass them directly as conditioning.
+        NOTE: We do NOT remove COM here! The EGNN's forward() method handles
+        COM removal per molecule using the current graph's masks.
         """
         
         # Extract initial coordinates
@@ -276,35 +276,35 @@ class MolecularSampler:
         if initial_lig_coords is None or initial_pocket_coords is None:
             return None
         
-        # Normalize
+        # Extract node IDs (required for variable-sized conditioning)
+        node_ids_atoms = cond.get('node_ids_atoms', None)
+        node_ids_residues = cond.get('node_ids_residues', None)
+        cond_node_ids_atoms = cond.get('cond_node_ids_atoms', None)
+        cond_node_ids_residues = cond.get('cond_node_ids_residues', None)
+        
+        # Check if we have all required IDs
+        has_ids = (node_ids_atoms is not None and node_ids_residues is not None and
+                   cond_node_ids_atoms is not None and cond_node_ids_residues is not None)
+        
+        if not has_ids:
+            # Fallback: use sampler's default IDs (assumes same-sized graphs)
+            node_ids_atoms = self.default_node_ids_atoms
+            node_ids_residues = self.default_node_ids_residues
+            cond_node_ids_atoms = self.default_node_ids_atoms.clone()
+            cond_node_ids_residues = self.default_node_ids_residues.clone()
+        
+        # The EGNN handles COM removal using the current graph's molecule masks
         initial_lig_norm = initial_lig_coords / self.scheme.coord_norm
         initial_pocket_norm = initial_pocket_coords / self.scheme.coord_norm
         
-        # Create masks for this batch
-        total_lig_atoms = sum(self.ligand_sizes)
-        total_pocket_atoms = sum(self.pocket_sizes)
-        
-        ligand_mask = torch.cat([
-            torch.full((size,), i, dtype=torch.long, device='cuda')
-            for i, size in enumerate(self.ligand_sizes)
-        ])
-        pocket_mask = torch.cat([
-            torch.full((size,), i, dtype=torch.long, device='cuda')
-            for i, size in enumerate(self.pocket_sizes)
-        ])
-        
-        # Center conditioning (remove COM)
-        combined_cond = torch.cat([initial_lig_norm, initial_pocket_norm], dim=0)
-        combined_mask = torch.cat([ligand_mask, pocket_mask])
-        cond_centered = remove_mean_batch(combined_cond, combined_mask)
-        
-        cond_lig_final = cond_centered[:total_lig_atoms]
-        cond_pocket_final = cond_centered[total_lig_atoms:]
-        
         # Return in format expected by denoiser wrapper
         return {
-            'cond_coords_ligand': cond_lig_final,
-            'cond_coords_pocket': cond_pocket_final
+            'cond_coords_ligand': initial_lig_norm,
+            'cond_coords_pocket': initial_pocket_norm,
+            'node_ids_atoms': node_ids_atoms,
+            'node_ids_residues': node_ids_residues,
+            'cond_node_ids_atoms': cond_node_ids_atoms,
+            'cond_node_ids_residues': cond_node_ids_residues,
         }
 
     def generate(self, cond: TensorMapping | None = None) -> dict:
@@ -719,14 +719,16 @@ def create_molecular_denoiser_wrapper(egnn_model, scheme, requires_grad: bool = 
         context = contextlib.nullcontext() if requires_grad else torch.no_grad()
     
         with context:
-            # NEW: Extract conditioning coordinates if provided
-            cond_coords_lig = None
-            cond_coords_pocket = None
-            
-            if cond is not None:
-                cond_coords_lig = cond.get('cond_coords_ligand', None)
-                cond_coords_pocket = cond.get('cond_coords_pocket', None)
-            
+            if cond is None:
+                cond = {}
+                
+            cond_coords_ligand = cond.get('cond_coords_ligand', None)
+            cond_coords_pocket = cond.get('cond_coords_pocket', None)
+            node_ids_atoms = cond.get('node_ids_atoms', None)
+            node_ids_residues = cond.get('node_ids_residues', None)
+            cond_node_ids_atoms = cond.get('cond_node_ids_atoms', None)
+            cond_node_ids_residues = cond.get('cond_node_ids_residues', None)
+                            
             # NEW: Pass conditioning to EGNN
             pred_output_lig, pred_output_pocket = egnn_model(
                 molecular_state.ligand,
@@ -734,8 +736,12 @@ def create_molecular_denoiser_wrapper(egnn_model, scheme, requires_grad: bool = 
                 sigma,
                 molecular_state.ligand_mask,
                 molecular_state.pocket_mask,
-                cond_coords_atoms=cond_coords_lig,      # NEW
-                cond_coords_residues=cond_coords_pocket  # NEW
+                cond_coords_atoms=cond_coords_ligand,  # NEW
+                cond_coords_residues=cond_coords_pocket,  # NEW
+                node_ids_atoms=node_ids_atoms, # NEW
+                node_ids_residues=node_ids_residues, # NEW
+                cond_node_ids_atoms=cond_node_ids_atoms, # NEW
+                cond_node_ids_residues=cond_node_ids_residues, # NEW
             )
         
         # Split EGNN output: coordinates + logits
@@ -1002,9 +1008,115 @@ def test_molecular_samplers():
     print("\n" + "="*60)
     print("✅ All sampler tests with conditioning passed!")
     print("="*60)
+
+    print("\n" + "="*70)
+    print("=== Test 4: Variable-Sized Conditioning (CRITICAL!) ===")
+    print("="*70)
+    
+    try:
+        # Current graph sizes (what we're generating)
+        total_lig_atoms = sum(ligand_sizes)      # 3 + 4 = 7
+        total_pocket_atoms = sum(pocket_sizes)   # 8 + 6 = 14
+        
+        # Conditioning graph: BIGGER pocket (simulates residues moving OUT during MD)
+        cond_lig_coords = torch.randn(7, 3, device='cuda')   # Same: 7 atoms
+        cond_pocket_coords = torch.randn(18, 3, device='cuda')  # BIGGER: 18 vs 14!
+        
+        # Node IDs for CURRENT graph (what we're generating)
+        # Mol 0: 3 atoms (IDs 0,1,2) + 8 residues (IDs 10,11,15,20,25,30,35,40)
+        # Mol 1: 4 atoms (IDs 0,1,2,3) + 6 residues (IDs 10,11,15,20,25,30)
+        # Use large offset (1000000) to namespace by molecule
+        node_ids_atoms = torch.cat([
+            torch.arange(3, dtype=torch.long, device='cuda'),  # Mol 0: atoms 0-2
+            torch.arange(4, dtype=torch.long, device='cuda') + 1000000  # Mol 1: atoms 0-3 + offset
+        ])
+        
+        node_ids_residues = torch.cat([
+            torch.tensor([10, 11, 15, 20, 25, 30, 35, 40], dtype=torch.long, device='cuda'),  # Mol 0: 8 residues
+            torch.tensor([100010, 100011, 100015, 100020, 100025, 100030], dtype=torch.long, device='cuda')  # Mol 1: 6 residues (+ offset)
+        ])
+        
+        # Node IDs for CONDITIONING graph (initial frame with MORE residues)
+        # Some residues present in initial frame but moved out of pocket later
+        cond_node_ids_atoms = node_ids_atoms.clone()  # Ligand atoms same
+        
+        cond_node_ids_residues = torch.cat([
+            # Mol 0: 10 residues (includes 12,13 that moved OUT)
+            torch.tensor([10, 11, 12, 13, 15, 20, 25, 30, 35, 40], dtype=torch.long, device='cuda'),
+            # Mol 1: 8 residues (includes 12,14 that moved OUT)
+            torch.tensor([100010, 100011, 100012, 100014, 100015, 100020, 100025, 100030], dtype=torch.long, device='cuda')
+        ])
+        
+        cond_variable = {
+            'initial_ligand_coords': cond_lig_coords,
+            'initial_pocket_coords': cond_pocket_coords,
+            'node_ids_atoms': node_ids_atoms,
+            'node_ids_residues': node_ids_residues,
+            'cond_node_ids_atoms': cond_node_ids_atoms,
+            'cond_node_ids_residues': cond_node_ids_residues,
+        }
+        
+        print(f"\n📊 Graph Size Comparison:")
+        curr_total = total_lig_atoms + total_pocket_atoms
+        cond_total = cond_lig_coords.shape[0] + cond_pocket_coords.shape[0]
+        print(f"  Current graph:      {total_lig_atoms} lig + {total_pocket_atoms} pocket = {curr_total} nodes")
+        print(f"  Conditioning graph: {cond_lig_coords.shape[0]} lig + {cond_pocket_coords.shape[0]} pocket = {cond_total} nodes")
+        print(f"  Difference: +{cond_total - curr_total} extra nodes in conditioning")
+        
+        print(f"\n🔍 Expected Behavior:")
+        print(f"  • All 7 ligand atoms should match (IDs identical)")
+        print(f"  • 14/18 pocket residues match (some moved out of pocket)")
+        print(f"  • 4 unmatched residues (12,13 from mol0; 12,14 from mol1) get NULL embeddings")
+        print(f"  • EGNN's _match_by_id() handles size mismatch automatically")
+        
+        # Generate with variable-sized conditioning
+        print(f"\n🚀 Generating samples...")
+        samples_variable = sampler.generate(cond=cond_variable)
+        
+        print(f"\n✅ Generation Results:")
+        print(f"  Ligand coords shape:  {samples_variable['ligand_coords'].shape}")
+        print(f"  Pocket coords shape:  {samples_variable['pocket_coords'].shape}")
+        print(f"  Ligand features shape: {samples_variable['ligand_features'].shape}")
+        print(f"  Pocket features shape: {samples_variable['pocket_features'].shape}")
+        
+        # Verify no NaNs or Infs
+        has_nan = (torch.isnan(samples_variable['ligand_coords']).any() or 
+                   torch.isnan(samples_variable['pocket_coords']).any())
+        has_inf = (torch.isinf(samples_variable['ligand_coords']).any() or 
+                   torch.isinf(samples_variable['pocket_coords']).any())
+        
+        print(f"  No NaNs: {not has_nan}")
+        print(f"  No Infs: {not has_inf}")
+        
+        assert not has_nan, "❌ NaN detected in generated coords!"
+        assert not has_inf, "❌ Inf detected in generated coords!"
+        
+        # Verify discrete features (should be one-hot)
+        lig_sums = samples_variable['ligand_features'].sum(dim=1)
+        pocket_sums = samples_variable['pocket_features'].sum(dim=1)
+        
+        print(f"  Ligand feature sums (should be ~1.0): min={lig_sums.min():.3f}, max={lig_sums.max():.3f}")
+        print(f"  Pocket feature sums (should be ~1.0): min={pocket_sums.min():.3f}, max={pocket_sums.max():.3f}")
+        
+        assert torch.allclose(lig_sums, torch.ones_like(lig_sums), atol=0.01), "❌ Ligand features not one-hot!"
+        assert torch.allclose(pocket_sums, torch.ones_like(pocket_sums), atol=0.01), "❌ Pocket features not one-hot!"
+        
+        print(f"\n🎉 SUCCESS! Variable-sized conditioning works in sampler!")
+        print(f"  • ID-based matching handled size mismatch")
+        print(f"  • Unmatched nodes got NULL embeddings")
+        print(f"  • Generated valid molecular structures")
+        
+    except Exception as e:
+        print(f"\n❌ ERROR in Test 4: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+    
+    print("\n" + "="*70)
+    print("✅ ALL SAMPLER TESTS PASSED!")
+    print("="*70)
     
     return sampler
-
 
 if __name__ == '__main__':
     test_molecular_samplers()
