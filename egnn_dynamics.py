@@ -771,8 +771,6 @@ class EGNNDynamics(nn.Module):
             node_ids_residues = node_ids_residues.long().to(device)
             cond_node_ids_atoms = cond_node_ids_atoms.long().to(device)
             cond_node_ids_residues = cond_node_ids_residues.long().to(device)
-
-            print('Conditioning is available.')
             
             # Match nodes by ID - O(N log M)
             matched_cond_atoms, match_mask_atoms = self._match_by_id(
