@@ -5,7 +5,7 @@ wandb/
 *.sh
 *.db
 *.txt
-dataset*.pt
+*.pt
 
 datasets/
 optimization_runs/
