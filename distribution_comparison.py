@@ -53,8 +53,8 @@ def parse_arguments():
                         help='Clip data to specified percentiles (e.g., 1 99 for 1st to 99th percentile)')
     parser.add_argument('--cut_outliers', action='store_true',
                         help='Cut outliers instead of clipping them')
-    parser.add_argument('--normalize_outliers', action='store_true',
-                        help='Normalize outliers using robust scaling (brings outliers closer to main distribution)')
+    parser.add_argument('--remove_outliers', action='store_true', help='Remove outliers using IQR method')
+    parser.add_argument('--robust_scaling', action='store_true', help='Normalize outliers using robust scaling (brings outliers closer to main distribution)')
     parser.add_argument('--normalize_range', nargs=2, type=float,
                         help='Normalize entire distributions to specified range (e.g., 0 1 for [0,1] range)')
     parser.add_argument('--merge_patterns', nargs='+', type=str,
@@ -75,8 +75,9 @@ class DistributionComparator:
                 directory_path: str, 
                 metric: str,
                 clip_percentiles: Optional[Tuple[float, float]] = None, 
+                remove_outliers: bool = False,
                 cut_outliers: bool = False,
-                normalize_outliers: bool = False,
+                robust_scaling: bool = False,
                 normalize_range: Optional[Tuple[float, float]] = None,
                 merge_patterns: Optional[List[str]] = None):
         """
@@ -86,15 +87,17 @@ class DistributionComparator:
             directory_path: Path to directory containing .json files
             clip_percentiles: Tuple of (lower_percentile, upper_percentile) for clipping, e.g., (1, 99)
             cut_outliers: Whether to cut outliers instead of clipping them
-            normalize_outliers: Whether to normalize outliers using robust scaling
+            robust_scaling: Whether to normalize outliers using robust scaling
             normalize_range: Tuple of (min_val, max_val) to normalize distributions to, e.g., (0, 1)
             merge_patterns: List of patterns to merge datasets (e.g., ['train', 'validation'] will merge datasets containing these words)
         """
+
         self.directory_path = Path(directory_path)
         self.metric = metric
         self.clip_percentiles = clip_percentiles
         self.cut_outliers = cut_outliers
-        self.normalize_outliers = normalize_outliers
+        self.remove_outliers = remove_outliers
+        self.robust_scaling = robust_scaling
         self.normalize_range = normalize_range
         self.merge_patterns = merge_patterns or []
         self.distributions = {}
@@ -104,11 +107,11 @@ class DistributionComparator:
         self.metrics = {}
         self.pairwise_metrics = {}
 
-        print(f"Comparing distributions in {self.directory_path}")
+        print(f"\nComparing distributions in {self.directory_path}")
         print(f"  Metric: {self.metric}")
         print(f"  Clip percentiles: {self.clip_percentiles}")
         print(f"  Cut outliers: {self.cut_outliers}")
-        print(f"  Normalize outliers: {self.normalize_outliers}")
+        print(f"  Robust scaling: {self.robust_scaling}")
         print(f"  Normalize range: {self.normalize_range}")
         print(f"  Merge patterns: {self.merge_patterns}")
 
@@ -116,11 +119,9 @@ class DistributionComparator:
     def preprocess_distribution(self, data: np.ndarray, ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Preprocess a single distribution with clipping and/or normalization.
-        
         Args:
             data: Input distribution data
             ids: Input distribution IDs (must be same length as data)
-            
         Returns:
             Tuple of (processed_data, processed_ids)
         """
@@ -130,31 +131,57 @@ class DistributionComparator:
         processed_data = data.copy()
         processed_ids = ids.copy()
         
-        # Step 1: Normalize outliers using robust scaling
-        if self.normalize_outliers:
+
+        # Step 1: Removing the outliers with IQR method
+        if self.remove_outliers:
+            median = np.median(processed_data)    
+            q75, q25 = np.percentile(processed_data, [75, 25])
+            iqr = q75 - q25
+    
+            if iqr > 0:  # Avoid division by zero
+                # Define outlier bounds (1.5 * IQR rule)
+                lower_bound = q25 - 1.5 * iqr
+                upper_bound = q75 + 1.5 * iqr
+                print(f"  Outlier bounds: [{lower_bound:.2e}, {upper_bound:.2e}]")
+
+                if self.cut_outliers:
+                    # CUTTING THE OUTLIERS - need to remove corresponding IDs too
+                    valid_mask = (processed_data < upper_bound) & (processed_data > lower_bound)
+                    processed_data = processed_data[valid_mask]
+                    processed_ids = processed_ids[valid_mask]
+                    print(f"  Cut off outliers outside the range [{lower_bound:.2e}, {upper_bound:.2e}]")
+                else:
+                    # CLIPPING THE OUTLIERS
+                    processed_data = np.clip(processed_data, lower_bound, upper_bound)
+                    print(f"  Clipped to [{lower_bound}, {upper_bound}]")
+            else:
+                print(f"  No outliers removed")
+
+
+        # Step 2: Apply robust scaling
+        if self.robust_scaling:
             # Use median and IQR for robust scaling
             median = np.median(processed_data)
             q75, q25 = np.percentile(processed_data, [75, 25])
             iqr = q75 - q25
             
             if iqr > 0:  # Avoid division by zero
-                # Define outlier bounds (1.5 * IQR rule)
-                lower_bound = q25 - 1.5 * iqr
-                upper_bound = q75 + 1.5 * iqr
+                # Define bounds
+                lower_bound = q25 - 0.5 * iqr
+                upper_bound = q75 + 0.5 * iqr
                 
-                # Find outliers
-                outlier_mask = (processed_data < lower_bound) | (processed_data > upper_bound)
-                outlier_indices = np.where(outlier_mask)[0]
+                mask = (processed_data < lower_bound) | (processed_data > upper_bound)
+                indices = np.where(mask)[0]
                 
-                if len(outlier_indices) > 0:
+                if len(indices) > 0:
                     # Normalize outliers by bringing them closer to the main distribution
                     # Use a sigmoid-like transformation to smoothly bring outliers in
-                    outlier_data = processed_data[outlier_mask]
+                    data_to_scale = processed_data[mask]
                     
                     # Calculate how far outliers are from bounds
-                    distances = np.where(outlier_data < lower_bound, 
-                                       lower_bound - outlier_data,
-                                       outlier_data - upper_bound)
+                    distances = np.where(data_to_scale < lower_bound, 
+                                       lower_bound - data_to_scale,
+                                       data_to_scale - upper_bound)
                     
                     # Apply a smooth transformation to bring outliers closer
                     # Use a factor that reduces the distance by 99%
@@ -162,33 +189,13 @@ class DistributionComparator:
                     new_distances = distances * reduction_factor
                     
                     # Apply the transformation
-                    processed_data[outlier_mask] = np.where(
-                        outlier_data < lower_bound,
+                    processed_data[mask] = np.where(
+                        data_to_scale < lower_bound,
                         lower_bound - new_distances,
                         upper_bound + new_distances
                     )
-                    
-                    print(f"  Normalized {len(outlier_indices)} outliers using robust scaling")
-        
-        # Step 2: Clipping at percentiles (before range normalization)
-        if self.clip_percentiles is not None:
-            lower_percentile, upper_percentile = self.clip_percentiles
-            lower_bound = np.percentile(processed_data, lower_percentile)
-            upper_bound = np.percentile(processed_data, upper_percentile)
+                    print(f"  Normalized {len(indices)} outliers using robust scaling")
 
-            if not self.cut_outliers:
-                # CLIPPING THE OUTLIERS
-                processed_data = np.clip(processed_data, lower_bound, upper_bound)
-                print(f"  Clipped to [{lower_percentile}th, {upper_percentile}th] percentiles: "
-                      f"[{lower_bound:.2e}, {upper_bound:.2e}]")
-        
-            if self.cut_outliers:
-                # CUTTING THE OUTLIERS - need to remove corresponding IDs too
-                valid_mask = (processed_data > lower_bound) & (processed_data < upper_bound)
-                processed_data = processed_data[valid_mask]
-                processed_ids = processed_ids[valid_mask]
-                print(f"  Cut off outliers at [{lower_percentile}th, {upper_percentile}th] percentiles: "
-                    f"[{lower_bound:.2e}, {upper_bound:.2e}] - removed {np.sum(~valid_mask)} values")
 
         # Step 3: Normalize entire distribution to specified range (after clipping)
         if self.normalize_range is not None:
@@ -396,6 +403,9 @@ class DistributionComparator:
                 'mean': np.mean(data),
                 'std': np.std(data),
                 'median': np.median(data),
+                'std': np.std(data),
+                'q25': np.percentile(data, 25),
+                'q75': np.percentile(data, 75),
                 'min': np.min(data),
                 'max': np.max(data),
                 'skewness': stats.skew(data),
@@ -497,15 +507,15 @@ class DistributionComparator:
         for name, metrics in self.metrics.items():
             metrics_data.append([
                 name,
-                f"{metrics['mean']:.2e}",
+                f"{metrics['median']:.2e}",
                 f"{metrics['std']:.2e}",
-                f"{metrics['skewness']:.3f}",
-                f"{metrics['kurtosis']:.3f}",
+                f"{metrics['q25']:.2e}",
+                f"{metrics['q75']:.2e}",
                 f"{metrics['count']}"
             ])
         
         table = ax2.table(cellText=metrics_data,
-                         colLabels=['Distribution', 'Mean', 'Std', 'Skewness', 'Kurtosis', 'Count'],
+                         colLabels=['Distribution', 'Median', 'Std', '25th %ile', '75th %ile', 'Count'],
                          cellLoc='center',
                          loc='center',
                          bbox=[0, 0, 1, 1])
@@ -566,14 +576,16 @@ class DistributionComparator:
         data_for_box = [data for _, data in self.distributions.items()]
         labels = [name for name, _ in self.distributions.items()]
         
-        bp = ax4.boxplot(data_for_box, labels=labels, patch_artist=True)
+        bp = ax4.boxplot(data_for_box, labels=labels, patch_artist=True, showfliers=False)
         
         # Color the boxes
         for patch, color in zip(bp['boxes'], colors):
             patch.set_facecolor(color)
             patch.set_alpha(0.7)
         
-        ax4.set_ylabel('Value')
+        # ax4.set_ylabel('Value')
+        ax4.set_ylabel('Value (log scale)')
+        ax4.set_yscale('symlog')
         ax4.set_title(f'Distribution Summary (Box Plot) - {self.metric}', fontsize=14, fontweight='bold')
         ax4.grid(True, alpha=0.3)
         
@@ -588,8 +600,6 @@ class DistributionComparator:
         preprocessing_info = []
         if self.merge_patterns:
             preprocessing_info.append(f"Merged: {', '.join(self.merge_patterns)}")
-        if self.normalize_outliers:
-            preprocessing_info.append("Outliers normalized")
         if self.clip_percentiles is not None:
             preprocessing_info.append(f"Clipped: {self.clip_percentiles[0]}-{self.clip_percentiles[1]}th percentile")
         if self.normalize_range is not None:
@@ -701,8 +711,6 @@ class DistributionComparator:
         preprocessing_info = []
         if self.merge_patterns:
             preprocessing_info.append(f"Merged: {', '.join(self.merge_patterns)}")
-        if self.normalize_outliers:
-            preprocessing_info.append("Outliers normalized")
         if self.clip_percentiles is not None:
             preprocessing_info.append(f"Clipped: {self.clip_percentiles[0]}-{self.clip_percentiles[1]}th percentile")
         if self.normalize_range is not None:
@@ -841,8 +849,6 @@ class DistributionComparator:
         preprocessing_info = []
         if self.merge_patterns:
             preprocessing_info.append(f"Merged: {', '.join(self.merge_patterns)}")
-        if self.normalize_outliers:
-            preprocessing_info.append("Outliers normalized")
         if self.clip_percentiles is not None:
             preprocessing_info.append(f"Clipped: {self.clip_percentiles[0]}-{self.clip_percentiles[1]}th percentile")
         if self.normalize_range is not None:
@@ -998,8 +1004,6 @@ class DistributionComparator:
         preprocessing_info = []
         if self.merge_patterns:
             preprocessing_info.append(f"Merged: {', '.join(self.merge_patterns)}")
-        if self.normalize_outliers:
-            preprocessing_info.append("Outliers normalized")
         if self.clip_percentiles is not None:
             preprocessing_info.append(f"Clipped: {self.clip_percentiles[0]}-{self.clip_percentiles[1]}th percentile")
         if self.normalize_range is not None:
@@ -1037,11 +1041,6 @@ class DistributionComparator:
         else:
             print("✗ No dataset merging applied")
             
-        if self.normalize_outliers:
-            print("✓ Outlier normalization: Applied robust scaling")
-        else:
-            print("✗ No outlier normalization applied")
-            
         if self.clip_percentiles is not None:
             print(f"✓ Clipping: {self.clip_percentiles[0]}th to {self.clip_percentiles[1]}th percentiles")
         else:
@@ -1057,10 +1056,11 @@ class DistributionComparator:
         for name, metrics in sorted(self.metrics.items()):
             print(f"\n{name}:")
             print(f"  Count: {metrics['count']:,}")
-            print(f"  Mean: {metrics['mean']:.2e}")
+            print(f"  Median: {metrics['median']:.2e}")
             print(f"  Std: {metrics['std']:.2e}")
-            print(f"  Median: {metrics['median']:.4f}")
-            print(f"  Range: [{metrics['min']:.4f}, {metrics['max']:.4f}]")
+            print(f"  25th percentile: {metrics['q25']:.2e}")
+            print(f"  75th percentile: {metrics['q75']:.2e}")
+            print(f"  Range: [{metrics['min']:.2e}, {metrics['max']:.2e}]")
             print(f"  Skewness: {metrics['skewness']:.4f}")
             print(f"  Kurtosis: {metrics['kurtosis']:.4f}")
             
@@ -1114,13 +1114,14 @@ def main():
             args.directory, 
             metric=args.metric,
             clip_percentiles=clip_percentiles,
+            remove_outliers=args.remove_outliers,
             cut_outliers=args.cut_outliers,
-            normalize_outliers=args.normalize_outliers,
+            robust_scaling=args.robust_scaling,
             normalize_range=normalize_range,
             merge_patterns=args.merge_patterns
         )
         
-        # Load distributions
+        # Load distributions and preprocess them
         print("Loading distributions...")
         distributions, distribution_ids = comparator.load_distributions()
         print(f"Loaded {len(distributions)} distributions")
