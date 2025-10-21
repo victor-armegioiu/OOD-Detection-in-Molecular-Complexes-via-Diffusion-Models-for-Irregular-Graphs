@@ -1032,7 +1032,9 @@ def process_dataset(dataset, evaluator, device, dataset_name, output_path):
     """Process a dataset and return likelihood statistics"""
     print(f"\nProcessing {dataset_name}...", flush=True)
     
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, follow_batch=['lig_coords', 'prot_coords'])
+    dataloader = DataLoader(dataset, batch_size=5, shuffle=False, 
+                            follow_batch=['lig_coords', 'prot_coords', 
+                                          'initial_ligand_coords', 'initial_pocket_coords'])
     
     # If JSON output_path exists, load it, otherwise initialize empty dictionary
     if os.path.exists(output_path):
