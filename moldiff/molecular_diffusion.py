@@ -750,8 +750,8 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         noise_lig = torch.randn_like(xh_lig_clean, device=self.device)
         # embedding_noise_pocket = torch.randn_like(xh_pocket_clean[:, self.n_dims:], device=self.device)
 
-        # Make coordinate noise for ligands COM-free (but not embedding noise))
-        noise_lig[:, :self.n_dims] = remove_mean_batch(noise_lig[:, :self.n_dims], lig_mask)
+        # # Make coordinate noise for ligands COM-free (but not embedding noise))
+        # noise_lig[:, :self.n_dims] = remove_mean_batch(noise_lig[:, :self.n_dims], lig_mask)
 
         # Add noise
         sigma_expanded_lig = sigma[lig_mask].unsqueeze(1)  # [N_lig, 1]
@@ -838,8 +838,8 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         # Generate Gaussian noise for the entire state
         noise_lig = torch.randn_like(xh_lig_clean, device=self.device)
 
-        # Make coordinate noise for ligands COM-free (but not embedding noise))
-        noise_lig[:, :self.n_dims] = remove_mean_batch(noise_lig[:, :self.n_dims], lig_mask)
+        # # Make coordinate noise for ligands COM-free (but not embedding noise))
+        # noise_lig[:, :self.n_dims] = remove_mean_batch(noise_lig[:, :self.n_dims], lig_mask)
 
         # Add noise
         sigma_expanded_lig = sigma[lig_mask].unsqueeze(1)  # [N_lig, 1]

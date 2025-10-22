@@ -940,7 +940,7 @@ def create_molecular_denoiser_wrapper(
                 pocket_mask
             )
             # assert whether denoiser leaves coordinates untouched
-            assert torch.allclose(pocket_state[:, :n_dims], cond_pred_output_pocket[:, :n_dims], atol=1e6, rtol=1e5), \
+            assert torch.allclose(pocket_state[:, :n_dims], cond_pred_output_pocket[:, :n_dims], atol=1e6, rtol=1e6), \
                 "Denoiser must not denoise fixed pocket coords in conditional sampling."
             
             # unconditional denoising

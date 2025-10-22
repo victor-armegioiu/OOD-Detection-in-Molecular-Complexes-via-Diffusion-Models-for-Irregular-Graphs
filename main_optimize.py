@@ -473,6 +473,7 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
     early_stopped = False
     eval_history = []  # For debugging/logging
     epoch_times = []
+    cfg_passes = [0, 0] # for debugging
 
     best_epoch_metrics = None
     best_epoch_idx = -1
@@ -504,9 +505,11 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
             optimizer.zero_grad()
 
             # Forward pass
-            if config["cfg_training"] and torch.rand(()) < config["cfg_p_uncond"]:
+            cfg_passes[0] += 1
+            if config["cfg_training"] and (torch.rand(()) < config["cfg_p_uncond"]):
                 # unconditional loss
                 loss, metrics = model.null_residue_loss_fn(batch)
+                cfg_passes[1] += 1
             else:
                 # traditional loss
                 loss, metrics = model.loss_fn(batch)
@@ -550,6 +553,7 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
                     'batch/geometric_loss_total': metrics['geometric_loss_total'],
                     'batch/avg_sigma': metrics['avg_sigma'],
                     'batch/learning_rate': optimizer.param_groups[0]['lr'],
+                    'batch/cfg_pass_fraction': cfg_passes[1] / cfg_passes[0]
                     'epoch': epoch + 1,
                     'batch': batch_idx + 1
                 })
