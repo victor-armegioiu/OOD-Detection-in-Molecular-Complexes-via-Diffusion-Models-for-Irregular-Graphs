@@ -288,6 +288,12 @@ class MolecularSampler:
         
         # Create initial molecular state.
         molecular_state1 = self._create_initial_noisy_state()
+        if cond is not None:
+            assert all([key in cond.keys() for key in ["pocket_state", "pocket_mask"]])
+            molecular_state1 = molecular_state1._replace(
+                pocket=cond["pocket_state"],
+                pocket_mask=cond["pocket_mask"]
+            )
         
         # Denoise iteratively
         denoised_state = self.denoise(
