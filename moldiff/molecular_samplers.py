@@ -738,8 +738,10 @@ class ConditionalMolecularSdeSampler(MolecularSdeSampler):
 
         # normalize pocket coordinates
         normalized_pocket_coordinates = pocket_coords / self.scheme.coord_norm
-        # encode pocket features
+        # encode pocket features and normalize
         encoded_pocket_features = self._model.denoiser.residue_encoder(pocket_features)
+        encoded_pocket_features = F.normalize(encoded_pocket_features, dim=-1) 
+
 
         # concat for initial encoded pocket state
         pocket_state = torch.cat([normalized_pocket_coordinates, encoded_pocket_features], dim=1)
