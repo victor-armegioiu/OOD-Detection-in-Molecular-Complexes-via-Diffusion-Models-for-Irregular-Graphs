@@ -286,6 +286,9 @@ class MolecularSampler:
         if self.tspan is None or self.tspan.ndim != 1:
             raise ValueError("`tspan` must be a 1-d Tensor.")
         
+        # # DEBUG PRINT
+        # print(f"Conditional Batch:\n{cond['pocket_state']}")
+        
         # Create initial molecular state.
         molecular_state1 = self._create_initial_noisy_state()
         if cond is not None:
@@ -295,12 +298,31 @@ class MolecularSampler:
                 pocket_mask=cond["pocket_mask"]
             )
         
+        # # DEBUG PRINT
+        # print(f"Pocket State going into self.denoise in generate :\n{molecular_state1.pocket}")
+
+        
         # Denoise iteratively
         denoised_state = self.denoise(
             noisy_state=molecular_state1,
             tspan=self.tspan,
             cond=cond
         )
+
+        # # DEBUG PRINT
+        # print(f"Pocket State coming out of self.denoise in generate :\n{denoised_state.pocket}")
+
+        # DEBUG PRINT
+        if cond is not None:
+            print("Checking if pocket states remain unchanged throughout sampling...")
+            test1 = torch.allclose(cond['pocket_state'], molecular_state1.pocket)
+            test2 = torch.allclose(cond['pocket_state'], denoised_state.pocket)
+            test3 = torch.allclose(molecular_state1.pocket, denoised_state.pocket)
+            print(f"Test results:\n  cond vs initial: {test1}\n  cond vs denoised: {test2}\n  initial vs denoised: {test3}")
+            if test1 and test2 and test3:
+                print("✅ Pocket state remained constant throughout sampling!")
+            else:
+                print("❌ Pocket state changed during sampling!")
         
         # Apply final denoising if requested.
         if self.apply_denoise_at_end:
@@ -1230,6 +1252,9 @@ def test_conditional_molecular_samplers():
     # see if pocket remained unchanged:
     assert torch.allclose(samples['pocket_coords'], batch["pocket_coords"]), f"Pocket coords changed: \nSamples: {samples['pocket_coords']} \n Input {samples['pocket_coords']} "
     assert torch.allclose(samples['pocket_features'], batch["pocket_features"]), f"Pocket features changed: \nSamples: {samples['pocket_features']} \n Input {samples['pocket_features']} "
+
+    print(samples['pocket_mask'], batch["pocket_mask"])
+    print(samples['pocket_coords'][samples['pocket_mask']])
 
 
     

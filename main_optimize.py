@@ -120,7 +120,7 @@ HYPERPARAM_SPACES = {
     'num_sampling_steps': [200, 400], # [50, 100, 200, 300, 400],
     'joint_nf': [128, 256], #[32, 64, 128, 256],
     'hidden_nf': [64, 128], 
-    'n_layers': [4, 5],
+    'n_layers': [4, 5, 6],
     'edge_embedding_dim': [32, 64],
     'learning_rate': [1e-4, 5e-4],
     'batch_size': [16, 32]
@@ -301,7 +301,8 @@ def create_batches_from_dataset(dataset_path: str, config: Dict) -> List[Dict]:
             'pocket_features': batch.prot_features,
             'pocket_mask': batch.prot_coords_batch,
 
-            'batch_size': config['batch_size']
+            'batch_size': config['batch_size'],
+            'ids': batch.id
             # track COM for later addition in conditional sampling
             # 'pocket_com': com #torch.cat([batch.lig_coords, batch.prot_coords], dim=0).mean(dim=0, keepdim=True)
         }
@@ -553,7 +554,7 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
                     'batch/geometric_loss_total': metrics['geometric_loss_total'],
                     'batch/avg_sigma': metrics['avg_sigma'],
                     'batch/learning_rate': optimizer.param_groups[0]['lr'],
-                    'batch/cfg_pass_fraction': cfg_passes[1] / cfg_passes[0]
+                    'batch/cfg_pass_fraction': cfg_passes[1] / cfg_passes[0],
                     'epoch': epoch + 1,
                     'batch': batch_idx + 1
                 })
@@ -1365,6 +1366,8 @@ def main():
                     )
             t_sample_end = time.perf_counter()
             log_time("Sampling", t_sample_start, t_sample_end, use_warnings)
+
+            # FIXME why is there no build_mol_objects call here?
 
             for s in range(CONFIG['num_eval_samples']):
                 graph = Data(

@@ -674,7 +674,9 @@ class EGNNDynamics(nn.Module):
             
         Returns:
             Tuple of (ligand_output, pocket_output) representing predicted noise
-        """
+        """        
+        # # DEBUG PRINT
+        # print(f"TRaining: Pocket State AT EGNN Pass:\n{xh_residues}")
 
         x_atoms = xh_atoms[:, :self.n_dims].clone()
         h_atoms = xh_atoms[:, self.n_dims:].clone()
@@ -744,7 +746,7 @@ class EGNNDynamics(nn.Module):
 
         # decode atom and residue features
         h_final_atoms = self.atom_decoder(h_final[:len(mask_atoms)])
-        h_final_residues = self.residue_decoder(h_final[len(mask_atoms):])
+        h_final_residues = self.residue_decoder(h_final[len(mask_atoms):]) # TODO clarify if this has to stay. is does because we're still learning these embeddings, right?
 
         if torch.any(torch.isnan(vel)):
             if self.training:

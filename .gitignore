@@ -8,6 +8,7 @@ wandb/
 dataset*.pt
 datasets/
 *.pdf
+*.sdf
 logs/
 .vscode/
 
@@ -20,3 +21,4 @@ lkhd_results*/
 samples/
 combine_csvs.py
 *.xyz
+*bayesian.db*
