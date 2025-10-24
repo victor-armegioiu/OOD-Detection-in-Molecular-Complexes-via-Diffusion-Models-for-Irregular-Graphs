@@ -742,8 +742,8 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
 
         # Subtract pocket center of mass
         pocket_com = scatter_mean(pocket_coords_norm, pocket_mask, dim=0)
-        lig_coords_zero_pocket_com = lig_coords_norm - pocket_com
-        pocket_coords_zero_pocket_com = pocket_coords_norm - pocket_com
+        lig_coords_zero_pocket_com = lig_coords_norm - pocket_com[lig_mask]
+        pocket_coords_zero_pocket_com = pocket_coords_norm - pocket_com[pocket_mask]
 
 
         return lig_coords_zero_pocket_com, pocket_coords_zero_pocket_com, combined_mask

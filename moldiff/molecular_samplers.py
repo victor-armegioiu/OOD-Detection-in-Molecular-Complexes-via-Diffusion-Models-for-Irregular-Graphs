@@ -291,9 +291,18 @@ class MolecularSampler:
         
         # Create initial molecular state.
         molecular_state1 = self._create_initial_noisy_state()
+
         if cond is not None:
-            assert all([key in cond.keys() for key in ["pocket_state", "pocket_mask"]])
+            assert all([key in cond.keys() for key in ["pocket_state", "pocket_mask", "pocket_com"]])
+            # first shift the ligand noise into the pocket com
+            shift_to_pocket_com_lig = torch.cat([
+                cond["pocket_com"], 
+                torch.zeros((len(self.ligand_sizes), self.atom_nf))])[molecular_state1.ligand_mask]
+            ligand_noise_zero_com = molecular_state1.ligand + shift_to_pocket_com_lig
+
+            # second, attach the zero com pocket and ligand noise states
             molecular_state1 = molecular_state1._replace(
+                ligand=ligand_noise_zero_com,
                 pocket=cond["pocket_state"],
                 pocket_mask=cond["pocket_mask"]
             )
@@ -766,13 +775,17 @@ class ConditionalMolecularSdeSampler(MolecularSdeSampler):
 
         # normalize pocket coordinates
         normalized_pocket_coordinates = pocket_coords / self.scheme.coord_norm
+        # POCKET-COM
+        pocket_com = scatter_mean(normalized_pocket_coordinates, pocket_mask, dim=0)
+        normalized_pocket_coordinates_zero_com = normalized_pocket_coordinates - pocket_com[pocket_mask]
         # encode pocket features and normalize
         encoded_pocket_features = self._model.denoiser.residue_encoder(pocket_features)
         encoded_pocket_features = F.normalize(encoded_pocket_features, dim=-1) 
 
 
         # concat for initial encoded pocket state
-        pocket_state = torch.cat([normalized_pocket_coordinates, encoded_pocket_features], dim=1)
+        pocket_state = torch.cat([normalized_pocket_coordinates_zero_com, 
+                                  encoded_pocket_features], dim=1)
 
         assert pocket_state.shape[1] == self.n_dims + self.joint_nf, f"Feature dim mismatch in pocket conditioning init: got {pocket_state.shape[1]} but expected {self.n_dims + self.joint_nf}"
 
@@ -780,7 +793,8 @@ class ConditionalMolecularSdeSampler(MolecularSdeSampler):
         return {
             "pocket_state": pocket_state, 
             "pocket_mask": pocket_mask, 
-            "guidance_scale":guidance_scale
+            "guidance_scale":guidance_scale, 
+            "pocket_com": pocket_com
             }
 
     def _create_molecular_dynamics(self, cond: TensorMapping | None) -> MolecularSdeDynamics:
