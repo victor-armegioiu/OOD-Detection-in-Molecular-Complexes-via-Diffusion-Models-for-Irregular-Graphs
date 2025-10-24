@@ -1256,6 +1256,10 @@ def test_conditional_molecular_samplers():
     print("Generating samples...")
     # try:
     samples = sampler.generate(cond=cond)
+
+    # Add back POCKET-COM after sample generation
+    samples["ligand_coords"] += cond["pocket_com"][samples["ligand_mask"]]
+    samples["pocket_coords"] += cond["pocket_com"][samples["pocket_mask"]]
     
     print(f"Generated samples:")
     print(f"  Ligand coords: {samples['ligand_coords'].shape}")

@@ -300,6 +300,10 @@ def sample_molecules_conditionally(
     
     # Generate samples
     samples = sampler.generate(conditioning_batch)
+
+    # Add back POCKET-COM after sample generation
+    samples["ligand_coords"] += conditioning_batch["pocket_com"][samples["ligand_mask"]]
+    samples["pocket_coords"] += conditioning_batch["pocket_com"][samples["pocket_mask"]]
     
     print(f"\nGenerated molecules:")
     print(f"  Total ligand atoms: {samples['ligand_coords'].shape[0]}")
