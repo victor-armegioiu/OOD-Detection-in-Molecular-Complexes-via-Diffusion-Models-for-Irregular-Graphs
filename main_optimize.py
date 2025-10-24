@@ -301,7 +301,7 @@ def create_batches_from_dataset(dataset_path: str, config: Dict) -> List[Dict]:
             'pocket_features': batch.prot_features,
             'pocket_mask': batch.prot_coords_batch,
 
-            # 'batch_size': config['batch_size'],
+            'batch_size': config['batch_size'],
             'ids': batch.id
             # track COM for later addition in conditional sampling
             # 'pocket_com': com #torch.cat([batch.lig_coords, batch.prot_coords], dim=0).mean(dim=0, keepdim=True)

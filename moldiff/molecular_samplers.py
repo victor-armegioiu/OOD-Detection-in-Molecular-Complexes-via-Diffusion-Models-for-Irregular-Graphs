@@ -317,6 +317,10 @@ class MolecularSampler:
         # print(f"Pocket State going into self.denoise in generate :\n{molecular_state1.pocket}")
 
         
+        # # DEBUG PRINT
+        # print(f"Pocket State going into self.denoise in generate :\n{molecular_state1.pocket}")
+
+        
         # Denoise iteratively
         denoised_state = self.denoise(
             noisy_state=molecular_state1,
