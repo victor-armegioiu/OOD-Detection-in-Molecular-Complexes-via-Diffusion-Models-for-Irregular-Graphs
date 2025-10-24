@@ -8,6 +8,7 @@ wandb/
 dataset*.pt
 datasets/
 *.pdf
+*.sdf
 logs/
 .vscode/
 

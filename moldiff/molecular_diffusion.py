@@ -761,6 +761,9 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         xh_pocket_noisy = xh_pocket_clean.clone() # in pocket conditioning only embeddings are noised
         # xh_pocket_noisy[:, self.n_dims:] = xh_pocket_clean[:, self.n_dims:] + sigma_expanded_pocket * embedding_noise_pocket
 
+        # # DEBUG PRINT
+        # print(f"TRaining: Pocket State BEFORE EGNN Pass:\n{xh_pocket_noisy}")
+
         return xh_lig_noisy, xh_pocket_noisy
     
     def _calculate_loss_from_noisy_embeddings(
@@ -777,6 +780,10 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             true_residue_types
 
     ) -> MolecularLossResults:
+        
+        # # DEBUG PRINT
+        # print(f"Training: Pocket State AFTER EGNN Pass:\n{pred_output_pocket}")
+
         # TODO: clarify whether categorical loss on pocket embeddings stills applies, 
         # so far all I have changed is the coord loss of pocket to be zero
 
