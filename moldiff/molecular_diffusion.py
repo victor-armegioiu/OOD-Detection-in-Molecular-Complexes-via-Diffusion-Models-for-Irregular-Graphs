@@ -737,10 +737,16 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
     def _anchor_reference_frame(self, lig_coords_norm, pocket_coords_norm, lig_mask, pocket_mask):
         """Conditional modeling requires no COM removal"""
 
-        # Remove center of mass for translation invariance
+        # POCKET-COM
         combined_mask = torch.cat([lig_mask, pocket_mask], dim=0)
 
-        return lig_coords_norm, pocket_coords_norm, combined_mask
+        # Subtract pocket center of mass
+        pocket_com = scatter_mean(pocket_coords_norm, pocket_mask, dim=0)
+        lig_coords_zero_pocket_com = lig_coords_norm - pocket_com
+        pocket_coords_zero_pocket_com = pocket_coords_norm - pocket_com
+
+
+        return lig_coords_zero_pocket_com, pocket_coords_zero_pocket_com, combined_mask
 
 
 
