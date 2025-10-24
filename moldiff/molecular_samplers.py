@@ -20,6 +20,18 @@ Tensor = torch.Tensor
 TensorMapping = Mapping[str, Tensor]
 MolecularParams = Mapping[str, Any]
 
+def add_back_pocket_com(state, pc, n_dims):
+    
+    # add back the pocket com 
+    if state.ligand.dim() == 2:
+        state.ligand[:, :n_dims] += pc[state.ligand_mask]
+        state.pocket[:, :n_dims] += pc[state.pocket_mask]
+    else:  # [T, N, D]
+        T = state.ligand.shape[0]
+        state.ligand[:, :, :n_dims] += pc[state.ligand_mask].unsqueeze(0).expand(T, -1, -1)
+        state.pocket[:, :, :n_dims] += pc[state.pocket_mask].unsqueeze(0).expand(T, -1, -1)
+    return state
+
 
 # ********************
 # Molecular State and Protocols
@@ -294,15 +306,9 @@ class MolecularSampler:
 
         if cond is not None:
             assert all([key in cond.keys() for key in ["pocket_state", "pocket_mask", "pocket_com"]])
-            # first shift the ligand noise into the pocket com
-            shift_to_pocket_com_lig = torch.cat([
-                cond["pocket_com"], 
-                torch.zeros((len(self.ligand_sizes), self.atom_nf))])[molecular_state1.ligand_mask]
-            ligand_noise_zero_com = molecular_state1.ligand + shift_to_pocket_com_lig
 
             # second, attach the zero com pocket and ligand noise states
             molecular_state1 = molecular_state1._replace(
-                ligand=ligand_noise_zero_com,
                 pocket=cond["pocket_state"],
                 pocket_mask=cond["pocket_mask"]
             )
@@ -333,6 +339,8 @@ class MolecularSampler:
             else:
                 print("❌ Pocket state changed during sampling!")
         
+        
+        
         # Apply final denoising if requested.
         if self.apply_denoise_at_end:
             final_state = self._apply_final_denoise(denoised_state, cond)
@@ -349,9 +357,23 @@ class MolecularSampler:
                 )
             else:
                 denoised_state = final_state
+
+        # add back pocket com
+        if cond is not None and "pocket_com" in cond:
+            current_pocket_coms = scatter_mean(denoised_state.pocket[:, :self.n_dims], 
+                                               denoised_state.pocket_mask, dim = 0)
+            assert torch.allclose(current_pocket_coms, torch.zeros_like(current_pocket_coms), atol=1e-6), \
+                    "Pocket not zero-COM before add-back; check anchoring."
+            
+            denoised_state = add_back_pocket_com(
+                denoised_state, 
+                cond["pocket_com"], # shape [B, 3], in normalized units
+                self.n_dims)
         
         # Convert to molecular batch format.
-        return self._molecular_state_to_batch(denoised_state, discretize_features=True)
+        samples = self._molecular_state_to_batch(denoised_state, discretize_features=True)
+
+        return samples
     
     def denoise(
         self,
@@ -1256,10 +1278,6 @@ def test_conditional_molecular_samplers():
     print("Generating samples...")
     # try:
     samples = sampler.generate(cond=cond)
-
-    # Add back POCKET-COM after sample generation
-    samples["ligand_coords"] += cond["pocket_com"][samples["ligand_mask"]]
-    samples["pocket_coords"] += cond["pocket_com"][samples["pocket_mask"]]
     
     print(f"Generated samples:")
     print(f"  Ligand coords: {samples['ligand_coords'].shape}")
