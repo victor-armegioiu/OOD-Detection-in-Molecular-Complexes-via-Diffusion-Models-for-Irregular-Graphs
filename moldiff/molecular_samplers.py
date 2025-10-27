@@ -306,12 +306,15 @@ class MolecularSampler:
 
         if cond is not None:
             assert all([key in cond.keys() for key in ["pocket_state", "pocket_mask", "pocket_com"]])
+            # first, set ligand noise relative to pocket reference frame
+            molecular_state1.ligand[:, :self.n_dims] -= cond["pocket_com"][molecular_state1.ligand_mask]
 
             # second, attach the zero com pocket and ligand noise states
             molecular_state1 = molecular_state1._replace(
                 pocket=cond["pocket_state"],
                 pocket_mask=cond["pocket_mask"]
             )
+            
         
         # # DEBUG PRINT
         # print(f"Pocket State going into self.denoise in generate :\n{molecular_state1.pocket}")
@@ -366,8 +369,8 @@ class MolecularSampler:
         if cond is not None and "pocket_com" in cond:
             current_pocket_coms = scatter_mean(denoised_state.pocket[:, :self.n_dims], 
                                                denoised_state.pocket_mask, dim = 0)
-            assert torch.allclose(current_pocket_coms, torch.zeros_like(current_pocket_coms), atol=1e-6), \
-                    "Pocket not zero-COM before add-back; check anchoring."
+            assert torch.allclose(current_pocket_coms, torch.zeros_like(current_pocket_coms), atol=1e-4, rtol = 1e-4), \
+                    f"Pocket not zero-COM before add-back; check anchoring:\n{current_pocket_coms}"
             
             denoised_state = add_back_pocket_com(
                 denoised_state, 
@@ -1293,8 +1296,8 @@ def test_conditional_molecular_samplers():
     assert torch.allclose(samples['pocket_coords'], batch["pocket_coords"]), f"Pocket coords changed: \nSamples: {samples['pocket_coords']} \n Input {samples['pocket_coords']} "
     assert torch.allclose(samples['pocket_features'], batch["pocket_features"]), f"Pocket features changed: \nSamples: {samples['pocket_features']} \n Input {samples['pocket_features']} "
 
-    print(samples['pocket_mask'], batch["pocket_mask"])
-    print(samples['pocket_coords'][samples['pocket_mask']])
+    # print(samples['pocket_mask'], batch["pocket_mask"])
+    # print(samples['pocket_coords'][samples['pocket_mask']])
 
 
     

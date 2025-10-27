@@ -81,8 +81,8 @@ CONFIG = {
     'num_eval_samples': 50,
     'early_stopping_patience': 50,
     'cfg_training': False,
-    'cfg_p_uncond': 0.2,
-    'cfg_guidance_scale': 3,
+    'cfg_p_uncond': 0.0,
+    'cfg_guidance_scale': 0,
     
     # Diffusion parameters
     'sigma_max': 100.0,      # Maximum noise level

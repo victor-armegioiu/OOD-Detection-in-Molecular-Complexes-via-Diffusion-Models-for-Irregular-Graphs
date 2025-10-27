@@ -463,14 +463,14 @@ def make_mol_openbabel(positions, atom_types, atom_decoder):
     """
     atom_types = [atom_decoder[x] for x in atom_types]
 
-    print(atom_types)
+    # print(atom_types)
 
     with tempfile.NamedTemporaryFile(suffix=".xyz") as xyz_tmp, tempfile.NamedTemporaryFile(suffix=".sdf") as sdf_tmp:
         # Write xyz file with coordinates and atom types
         utils.write_xyz_file(positions, atom_types, xyz_tmp.name)
 
-        utils.write_xyz_file(positions, atom_types, "debug.xyz")
-        print(open("debug.xyz").read())
+        # utils.write_xyz_file(positions, atom_types, "debug.xyz")
+        # print(open("debug.xyz").read())
 
         # Convert xyz → sdf with OpenBabel (adds bonds)
         obConversion = openbabel.OBConversion()
