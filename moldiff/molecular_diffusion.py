@@ -261,6 +261,16 @@ class MolecularDenoisingModel:
     edge_embedding_dim: Optional[int] = 8
     update_pocket_coords: bool = True
     freeze_pocket_embeddings: bool = False
+    # these EGNN parameters have been ignored so far, do we understand their meaning?
+    attention: bool = False
+    tanh:bool = False
+    norm_constant: int = 0                  # this is probably handled independently by us
+    inv_sublayers: int = 2                  # layers of the equivariant block
+    sin_embedding: bool = False             # sin embedding for distances
+    edge_cutoff_ligand: float|None = None 
+    edge_cutoff_pocket: float|None = None 
+    edge_cutoff_interaction: float|None = None
+    reflection_equivariant: bool = True    # False would be SE(3) we're thus using E(3)
 
     # Loss weighting parameters
     coord_loss_weight: float = 1.0
@@ -311,6 +321,16 @@ class MolecularDenoisingModel:
             edge_embedding_dim=self.edge_embedding_dim,
             geometric_regularization=self.geometric_regularization,
             geom_loss_weight=self.geom_loss_weight,
+            # these EGNN parameters have been ignored so far, do we understand their meaning?
+            attention=self.attention,
+            tanh=self.tanh,
+            norm_constant=self.norm_constant,                # this is probably handled independently by us
+            inv_sublayers=self.inv_sublayers,                # layers of the equivariant block
+            sin_embedding=self.sin_embedding,            # sin embedding for distances
+            edge_cutoff_ligand=self.edge_cutoff_ligand, 
+            edge_cutoff_pocket=self.edge_cutoff_pocket, 
+            edge_cutoff_interaction=self.edge_cutoff_interaction,
+            reflection_equivariant=self.reflection_equivariant,    # False would be SE(3) we're thus using E(3)
         )
         # to inherit to conditional class
         if not self.update_pocket_coords: object.__setattr__(self, "egnn_dynamics_net", denoiser)

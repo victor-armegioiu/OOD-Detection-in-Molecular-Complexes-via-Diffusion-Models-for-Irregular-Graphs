@@ -63,6 +63,14 @@ CONFIG = {
     'train_dataset_path': DATA_PATH / 'dataset_cleansplit_train.pt',
     'eval_dataset_path': DATA_PATH / 'dataset_cleansplit_validation.pt',
 
+    # DiffSBDD params
+    # print(ckpt["hyper_parameters"]["batch_size"])
+    # 96
+    # >>> pprint(ckpt["hyper_parameters"]["egnn_params"])
+    # Namespace(device='cuda', edge_cutoff_ligand=None, edge_cutoff_pocket=5.0, edge_cutoff_interaction=5.0, reflection_equivariant=False, joint_nf=128, hidden_n
+    # f=256, n_layers=6, attention=True, tanh=True, norm_constant=1, inv_sublayers=1, sin_embedding=False, aggregation_method='sum', normalization_factor=100)
+
+
     # Model parameters
     'atom_nf': 10,           
     'residue_nf': 21,         
@@ -70,7 +78,16 @@ CONFIG = {
     'n_layers': 4, # 4           
     'joint_nf': 256,          
     'hidden_nf': 128, # 256         
-    'edge_embedding_dim': 32, # 64 
+    'edge_embedding_dim': 32, # 64
+    'attention': False, 
+    'tanh': False, 
+    'norm_constant': 0,
+    'inv_sublayers': 2,
+    'sin_embedding': False,
+    'edge_cutoff_ligand': None,
+    'edge_cutoff_pocket': None, 
+    'edge_cutoff_interaction': None,
+    'reflection_equivariant': True,
     
     # Training parameters
     'num_epochs': 500,
@@ -117,13 +134,22 @@ CONFIG = {
 
 # Hyperparameter search spaces
 HYPERPARAM_SPACES = {
-    'num_sampling_steps': [200, 400], # [50, 100, 200, 300, 400],
-    'joint_nf': [128, 256], #[32, 64, 128, 256],
-    'hidden_nf': [64, 128], 
-    'n_layers': [4, 5, 6],
+    'num_sampling_steps': [400, 600], # [50, 100, 200, 300, 400],
+    'joint_nf': [128, 256, 512], #[32, 64, 128, 256],
+    'hidden_nf': [64, 128, 256], 
+    'n_layers': [4, 6],
     'edge_embedding_dim': [32, 64],
     'learning_rate': [1e-4, 5e-4],
-    'batch_size': [16, 32]
+    'batch_size': [16, 32, 64], 
+    'attention': [False, True],
+    'tanh': [False, True],
+    # 'norm_constant': 0,
+    'inv_sublayers': [1, 2, 3],
+    'sin_embedding': [False, True],
+    # 'edge_cutoff_ligand': [None, 5.0, 8.0],
+    'edge_cutoff_pocket': [None, 5.0, 8.0], 
+    'edge_cutoff_interaction': [None, 5.0, 8.0],
+    'reflection_equivariant': [False, True]
 }
 
 def set_random_seeds(seed: int):
@@ -155,6 +181,7 @@ def parse_arguments():
     # Basic run options
     parser.add_argument('--mode', choices=['single', 'grid', 'random', 'bayesian'], default='single',
         help='Run mode: single training run or hyperparameter optimization')
+    parser.add_argument('--custom_wandb_prefix', default='', help='Custom string to identify the run (appended to wandb name)')
     
     # Dataset options
     parser.add_argument('--train_dataset', default=DATA_PATH / 'dataset_cleansplit_train.pt', help='Path to training dataset')
@@ -167,6 +194,15 @@ def parse_arguments():
     parser.add_argument('--hidden_nf', type=int, help='Hidden layer size')
     parser.add_argument('--n_layers', type=int, help='Number of EGNN layers')
     parser.add_argument('--edge_embedding_dim', type=int, help='Edge feature dimension')
+    parser.add_argument('--attention', action='store_true', help='Use attention mechanism')
+    parser.add_argument('--tanh', action='store_true', help='Use tanh activation')
+    parser.add_argument('--norm_constant', type=int, help='Normalization constant')
+    parser.add_argument('--inv_sublayers', type=int, help='Number of invariant sublayers')
+    parser.add_argument('--sin_embedding', action='store_true', help='Use sinusoidal embeddings')
+    parser.add_argument('--edge_cutoff_ligand', type=float, help='Edge cutoff for ligand')
+    parser.add_argument('--edge_cutoff_pocket', type=float, help='Edge cutoff for pocket')
+    parser.add_argument('--edge_cutoff_interaction', type=float, help='Edge cutoff for interactions')
+    parser.add_argument('--reflection_equivariant', action='store_true', help='Use reflection equivariant model')
     
     # Training parameters
     parser.add_argument('--learning_rate', type=float, help='Learning rate')
@@ -206,13 +242,17 @@ def parse_arguments():
 
     # Debugging
     parser.add_argument('--use_warnings', action='store_true', help='Enable warnings for debugging')
+
     
     return parser.parse_args()
 
 
 def update_config_from_args(config: Dict, args) -> Dict:
     """Update configuration with command line arguments"""
-    
+
+    # Update wandb prefix
+    if args.custom_wandb_prefix is not None:
+        config['custom_wandb_prefix'] = args.custom_wandb_prefix
     # Update dataset paths
     if args.train_dataset is not None:
         config['train_dataset_path'] = args.train_dataset
@@ -233,6 +273,25 @@ def update_config_from_args(config: Dict, args) -> Dict:
         config['n_layers'] = args.n_layers
     if args.edge_embedding_dim is not None:
         config['edge_embedding_dim'] = args.edge_embedding_dim
+    if args.attention is not None:
+        config['attention'] = args.attention
+    if args.tanh is not None:
+        config['tanh'] = args.tanh
+    if args.norm_constant is not None:
+        config['norm_constant'] = args.norm_constant
+    if args.inv_sublayers is not None:
+        config['inv_sublayers'] = args.inv_sublayers
+    if args.sin_embedding is not None:
+        config['sin_embedding'] = args.sin_embedding
+    if args.edge_cutoff_ligand is not None:
+        config['edge_cutoff_ligand'] = args.edge_cutoff_ligand
+    if args.edge_cutoff_pocket is not None:
+        config['edge_cutoff_pocket'] = args.edge_cutoff_pocket
+    if args.edge_cutoff_interaction is not None:
+        config['edge_cutoff_interaction'] = args.edge_cutoff_interaction
+    if args.reflection_equivariant is not None:
+        config['reflection_equivariant'] = args.reflection_equivariant
+    
     
     # Update training parameters
     if args.learning_rate is not None:
@@ -252,7 +311,13 @@ def update_config_from_args(config: Dict, args) -> Dict:
     if args.cfg_p_uncond is not None:
         config['cfg_p_uncond'] = args.cfg_p_uncond
     if args.cfg_guidance_scale is not None:
-        config['cfg_guidance_scale'] = args.cfg_guidance_scale
+        # safety valve to ensure that guidance scale is zero if cfg_training is false
+        if not config['cfg_training']:
+            config['cfg_guidance_scale'] = 0
+            warnings.warn("cfg_guidance_scale forced to zero because cfg_training was set to zero")
+        else:
+            config['cfg_guidance_scale'] = args.cfg_guidance_scale
+    
     
     # Update sampling parameters
     if args.num_sampling_steps is not None:
@@ -1302,9 +1367,9 @@ def main():
             # --- Setup ---
             t_setup_start = time.perf_counter()
             if isinstance(CONFIG['train_dataset_path'], str):
-                run_id = f"{datetime.now().strftime('%m%d_%H%M%S')}_{CONFIG['train_dataset_path'].split('.')[0]}"
+                run_id = CONFIG.get("custom_wandb_prefix", "") + f"{datetime.now().strftime('%m%d_%H%M%S')}_{CONFIG['train_dataset_path'].split('.')[0]}"
             elif isinstance(CONFIG['train_dataset_path'], Path): 
-                run_id = f"{datetime.now().strftime('%m%d_%H%M%S')}_{CONFIG['train_dataset_path'].stem}"
+                run_id = CONFIG.get("custom_wandb_prefix", "") +f"{datetime.now().strftime('%m%d_%H%M%S')}_{CONFIG['train_dataset_path'].stem}"
             else:
                 raise TypeError("Unknown train_dataset_path type")
 
