@@ -3,6 +3,8 @@ import json
 import warnings
 import tempfile
 from openbabel import openbabel
+from Dataset import PDBbind_Dataset
+
 from rdkit import Chem
 from rdkit.Chem.rdForceFieldHelpers import UFFOptimizeMolecule, UFFHasAllMoleculeParams
 from rdkit.Chem import rdMolDescriptors
@@ -85,6 +87,56 @@ def load_checkpoint(checkpoint_path: str) -> MolecularDenoisingModel:
     return model
 
 
+def load_pocket_data_from_dataset(dataset_path: str, num_samples: int, model: MolecularDenoisingModel):
+    """
+    Load real pocket data from dataset to use as conditioning
+    Returns pocket_data dict and corresponding ligand_sizes
+    """
+    dataset = torch.load(dataset_path)
+    
+    # Sample random complexes from dataset
+    indices = np.random.choice(len(dataset), size=num_samples, replace=False)
+    
+    all_pocket_coords = []
+    all_pocket_features = []
+    all_pocket_masks = []
+    ligand_sizes = []
+    
+    for i, idx in enumerate(indices):
+        data_point = dataset[idx]
+        
+        # Get pocket information
+        pocket_coords = data_point.prot_coords.cuda()
+        pocket_features = data_point.prot_features.cuda()
+        
+        # Create batch mask for this pocket (all atoms belong to batch index i)
+        pocket_mask = torch.full((len(pocket_coords),), i, dtype=torch.long, device='cuda')
+        
+        all_pocket_coords.append(pocket_coords)
+        all_pocket_features.append(pocket_features)
+        all_pocket_masks.append(pocket_mask)
+        
+        # Get ligand size from the original complex (for generating similar-sized ligands)
+        ligand_sizes.append(len(data_point.lig_coords))
+    
+    # Concatenate into batch format
+    pocket_coords = torch.cat(all_pocket_coords, dim=0)
+    pocket_features = torch.cat(all_pocket_features, dim=0)
+    pocket_mask = torch.cat(all_pocket_masks, dim=0)
+    
+    # Convert pocket features to embeddings using the model's encoder
+    with torch.no_grad():
+        pocket_embeddings = model.denoiser.egnn_dynamics.residue_encoder(pocket_features)
+        pocket_embeddings = F.normalize(pocket_embeddings, dim=-1)
+    
+    pocket_data = {
+        'coords': pocket_coords,
+        'embeddings': pocket_embeddings,
+        'pocket_mask': pocket_mask
+    }
+    
+    return pocket_data, ligand_sizes
+
 def compare_distributions(dist1, dist2):
     """
     Compare two probability distributions using KL and JS divergence.
@@ -148,33 +200,37 @@ def save_samples_to_graphs(samples: list[Data], num_samples: int, save_path: str
         torch.save(graph, save_path.replace(".pt", f"_graph_{i}.pt"))
 
 
-def sample_molecules(model: MolecularDenoisingModel, 
-            num_steps: int = 50, 
-            schedule_type: str = "exponential", 
-            num_samples: int = 3
-            ):
-
-    """Generate new molecules using the trained model"""
+def sample_molecules(model: MolecularDenoisingModel,
+                    dataset_path: str, 
+                    num_steps: int = 50, 
+                    schedule_type: str = "exponential", 
+                    num_samples: int = 3):
+    """Generate new molecules using the trained model with real pocket conditioning"""
     
     print(f"\n{'='*60}")
-    print("SAMPLING NEW MOLECULES")
+    print("SAMPLING NEW MOLECULES (CONDITIONAL)")
     print(f"{'='*60}")
 
-    # Create sampler
-    ligand_sizes, pocket_sizes = sample_lig_pocket_sizes(num_samples)
+    # Load real pockets from dataset
+    pocket_data, ligand_sizes = load_pocket_data_from_dataset(
+        dataset_path=dataset_path,
+        num_samples=num_samples,
+        model=model
+    )
+    
     print(f"Ligand sizes: {ligand_sizes}")
-    print(f"Pocket sizes: {pocket_sizes}")
+    print(f"Pocket sizes: {[len(pocket_data['pocket_mask'][pocket_data['pocket_mask']==i]) for i in range(num_samples)]}")
     
     sampler = create_molecular_sampler_from_model(
         model=model,
         ligand_sizes=ligand_sizes,
-        pocket_sizes=pocket_sizes,
+        pocket_data=pocket_data,
         num_steps=num_steps,
         schedule_type=schedule_type,
         return_full_paths=False
     )
     
-    print("Sampling unconditional molecules...")
+    print("Sampling molecules conditioned on real binding pockets...")
     print(f"Using {num_steps} sampling steps...")
     
     # Generate samples
@@ -518,26 +574,64 @@ def evaluate_mols(mols):
     return summary
 
 
+def test_sample_molecules():
+    """Test the sample_molecules function with real data"""
+    
+    print("Testing sample_molecules function...")
+    
+    # Create a simple test model
+    model = MolecularDenoisingModel(
+        atom_nf=10,
+        residue_nf=21,
+        joint_nf=16,
+        hidden_nf=64,
+        n_layers=3
+    )
+    model.initialize()
+    
+    # Test the function
+    dataset_path = 'cleansplit_ood_train_combined.pt'
+    
+    try:
+        samples = sample_molecules(
+            model=model,
+            dataset_path=dataset_path,
+            num_steps=10,
+            num_samples=2
+        )
+        
+        print("\n✅ sample_molecules() executed successfully!")
+        print(f"  Returned keys: {samples.keys()}")
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", required=True, type=str)
-    parser.add_argument("--num_steps", type=int, default=25)
-    parser.add_argument("--n_samples", type=int, default=3)
-    args = parser.parse_args()
+    import torch.nn.functional as F
+    test_sample_molecules()
+
+# if __name__ == '__main__':
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument("--model_path", required=True, type=str)
+#     parser.add_argument("--num_steps", type=int, default=25)
+#     parser.add_argument("--n_samples", type=int, default=10)
+#     args = parser.parse_args()
     
-    model = load_checkpoint(args.model_path)
-    samples = sample_molecules(model, num_steps=args.num_steps, num_samples=args.n_samples)
+#     model = load_checkpoint(args.model_path)
+#     samples = sample_molecules(model, num_steps=args.num_steps, num_samples=args.n_samples)
 
-    molecules = build_mol_objects(samples)
+#     molecules = build_mol_objects(samples)
 
-    for key, value in evaluate_mols(molecules).items():
-        print(f'{key}: {value}')
+#     for key, value in evaluate_mols(molecules).items():
+#         print(f'{key}: {value}')
 
-    utils.write_sdf_file(sdf_path='samples/0730_110059_bayesian_trial_1_epoch_599.sdf', molecules=molecules)
+#     utils.write_sdf_file(sdf_path='samples/0730_110059_bayesian_trial_1_epoch_599.sdf', molecules=molecules)
     
-    save_samples_to_graphs(samples, args.n_samples, args.model_path)
+#     save_samples_to_graphs(samples, args.n_samples, args.model_path)
 
 
 # # Save the samples to a json file, making tensors serializable
