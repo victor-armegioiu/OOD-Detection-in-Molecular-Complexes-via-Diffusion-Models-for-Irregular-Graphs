@@ -849,7 +849,7 @@ class PreconditionedEGNNDynamics(nn.Module):
         t = c_noise.unsqueeze(1)  # [batch_size, 1]
         
         # Forward through base EGNN (pass through target data for geometric loss)
-        f_ligand, f_pocket = self.egnn_dynamics(
+        f_ligand, _ = self.egnn_dynamics(
             xh_atoms_scaled, xh_residues_scaled, t, mask_atoms, mask_residues,
             target_atoms=target_atoms, target_residues=target_residues
         )
@@ -857,26 +857,18 @@ class PreconditionedEGNNDynamics(nn.Module):
         # Split EGNN output into coordinates and logits
         coords_pred_lig = f_ligand[:, :self.egnn_dynamics.n_dims]  # [N_lig, 3]
         logits_pred_lig = f_ligand[:, self.egnn_dynamics.n_dims:]  # [N_lig, atom_nf]
-        coords_pred_pocket = f_pocket[:, :self.egnn_dynamics.n_dims]  # [N_pocket, 3]
-        logits_pred_pocket = f_pocket[:, self.egnn_dynamics.n_dims:]  # [N_pocket, residue_nf]
-        
+       
         # Apply preconditioning to coordinates only (skip connection + output scaling)
         coords_out_lig = coords_lig.clone()
-        coords_out_pocket = coords_pocket.clone()
         
         for i, batch_idx in enumerate(torch.unique(mask_atoms)):
             atom_mask = mask_atoms == batch_idx
             coords_out_lig[atom_mask] = c_skip[i] * coords_lig[atom_mask] + c_out[i] * coords_pred_lig[atom_mask]
-            
-        for i, batch_idx in enumerate(torch.unique(mask_residues)):
-            residue_mask = mask_residues == batch_idx
-            coords_out_pocket[residue_mask] = c_skip[i] * coords_pocket[residue_mask] + c_out[i] * coords_pred_pocket[residue_mask]
         
         # Combine preconditioned coordinates with raw logits (no preconditioning for classification)
         ligand_out = torch.cat([coords_out_lig, logits_pred_lig], dim=1)
-        pocket_out = torch.cat([coords_out_pocket, logits_pred_pocket], dim=1)
         
-        return ligand_out, pocket_out
+        return ligand_out, None
 
     @property
     def last_geometric_loss(self):
