@@ -22,3 +22,4 @@ samples/
 combine_csvs.py
 *.xyz
 *bayesian.db*
+example_dataset/

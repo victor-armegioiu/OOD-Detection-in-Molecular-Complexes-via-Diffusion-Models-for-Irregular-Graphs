@@ -202,7 +202,7 @@ def parse_arguments():
     parser.add_argument('--edge_cutoff_ligand', type=float, help='Edge cutoff for ligand')
     parser.add_argument('--edge_cutoff_pocket', type=float, help='Edge cutoff for pocket')
     parser.add_argument('--edge_cutoff_interaction', type=float, help='Edge cutoff for interactions')
-    parser.add_argument('--reflection_equivariant', action='store_true', help='Use reflection equivariant model')
+    parser.add_argument('--not_reflection_equivariant', action='store_false', help='Use reflection equivariant model')
     
     # Training parameters
     parser.add_argument('--learning_rate', type=float, help='Learning rate')
@@ -289,8 +289,8 @@ def update_config_from_args(config: Dict, args) -> Dict:
         config['edge_cutoff_pocket'] = args.edge_cutoff_pocket
     if args.edge_cutoff_interaction is not None:
         config['edge_cutoff_interaction'] = args.edge_cutoff_interaction
-    if args.reflection_equivariant is not None:
-        config['reflection_equivariant'] = args.reflection_equivariant
+    if args.not_reflection_equivariant is not None:
+        config['reflection_equivariant'] = args.not_reflection_equivariant
     
     
     # Update training parameters

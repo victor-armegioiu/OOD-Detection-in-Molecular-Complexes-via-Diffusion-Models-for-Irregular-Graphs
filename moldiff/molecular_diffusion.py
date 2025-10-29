@@ -859,7 +859,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             pred_coords_lig,
             pred_coords_pocket,
             pred_logits_lig,
-            pred_logits_pocket,
+            true_residue_types, # instead of predicted return true (no need to predict pocket)
         )
 
     

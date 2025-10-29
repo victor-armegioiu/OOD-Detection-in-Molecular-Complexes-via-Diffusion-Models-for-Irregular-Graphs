@@ -122,7 +122,7 @@ class MolecularEulerMaruyamaStep:
                 noise_pocket[:, :self.n_dims]
             ], dim=0)
             combined_mask = torch.cat([molecular_state.ligand_mask, molecular_state.pocket_mask])
-            noise_coords_centered = self.remove_mean_batch(noise_coords_combined, combined_mask)
+            noise_coords_centered = remove_mean_batch(noise_coords_combined, combined_mask)
             
             noise_lig[:, :self.n_dims] = noise_coords_centered[:len(molecular_state.ligand)]
             noise_pocket[:, :self.n_dims] = noise_coords_centered[len(molecular_state.ligand):]
