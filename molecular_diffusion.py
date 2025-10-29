@@ -374,9 +374,9 @@ class MolecularDenoisingModel:
         # Sample noise levels
         sigma = self.noise_sampling(shape=(batch_size,))  # [batch_size]
         
-        # Generate Gaussian noise for the entire state
+        # Generate Gaussian noise for the LIGAND ONLY.
         noise_lig = torch.randn_like(xh_lig_clean)
-        noise_pocket = torch.randn_like(xh_pocket_clean)
+        noise_pocket = torch.zeros_like(xh_pocket_clean)
         
         # Make coordinate noise COM-free (but not embedding noise)
         noise_coords_combined = torch.cat([noise_lig[:, :self.n_dims], noise_pocket[:, :self.n_dims]], dim=0)
@@ -384,59 +384,36 @@ class MolecularDenoisingModel:
         noise_lig[:, :self.n_dims] = noise_coords_centered[:len(lig_coords)]
         noise_pocket[:, :self.n_dims] = noise_coords_centered[len(lig_coords):]
         
-        # Add noise
+        # Add noise ON LIGAND ONLY.
         sigma_expanded_lig = sigma[lig_mask].unsqueeze(1)  # [N_lig, 1]
         sigma_expanded_pocket = sigma[pocket_mask].unsqueeze(1)  # [N_pocket, 1]
         
         xh_lig_noisy = xh_lig_clean + sigma_expanded_lig * noise_lig
-        xh_pocket_noisy = xh_pocket_clean + sigma_expanded_pocket * noise_pocket
         
-        
-        # Forward pass through denoiser - outputs coordinates + logits
-        # print('In train:')
-        # print('Sigma shape:', sigma.shape)
-        # print('xh_lig_noisy shape:', xh_lig_noisy.shape)
-        # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
-        # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
-        # print('lig_mask', lig_mask.shape)
-        # print('pocket_mask', pocket_mask.shape)
-        
-        pred_output_lig, pred_output_pocket = self.denoiser(
-            xh_lig_noisy, xh_pocket_noisy, sigma, lig_mask, pocket_mask,
+        pred_output_lig, _ = self.denoiser(
+            xh_lig_noisy, xh_pocket_clean, sigma, lig_mask, pocket_mask,
             target_atoms=lig_coords_centered, target_residues=pocket_coords_centered,
         )
         
         # Split predictions: coordinates + logits
         pred_coords_lig = pred_output_lig[:, :self.n_dims]              # [N_lig, 3]
         pred_logits_lig = pred_output_lig[:, self.n_dims:]              # [N_lig, atom_nf] - LOGITS
-        pred_coords_pocket = pred_output_pocket[:, :self.n_dims]        # [N_pocket, 3]  
-        pred_logits_pocket = pred_output_pocket[:, self.n_dims:]        # [N_pocket, residue_nf] - LOGITS
         
         # Loss weighting
         weights = self.noise_weighting(sigma)  # [batch_size]
         weights_lig = weights[lig_mask].unsqueeze(1)  # [N_lig, 1]
-        weights_pocket = weights[pocket_mask].unsqueeze(1)  # [N_pocket, 1]
         
         # Coordinate loss: L2 between predicted and clean coordinates
         clean_coords_lig = xh_lig_clean[:, :self.n_dims]
-        clean_coords_pocket = xh_pocket_clean[:, :self.n_dims]
         
         coord_loss_lig = torch.mean(weights_lig * (pred_coords_lig - clean_coords_lig) ** 2)
-        coord_loss_pocket = torch.mean(weights_pocket * (pred_coords_pocket - clean_coords_pocket) ** 2)
-        coord_loss = coord_loss_lig + coord_loss_pocket
+        coord_loss = coord_loss_lig
         
         # Categorical loss: Cross-entropy between logits and true atom types
         ce_loss_lig = F.cross_entropy(pred_logits_lig, true_atom_types, reduction='none')
-        ce_loss_pocket = F.cross_entropy(pred_logits_pocket, true_residue_types, reduction='none')
-        
-        # Weight categorical loss by noise level (like coordinates)
-        # categorical_loss_lig = torch.mean(weights[lig_mask] * ce_loss_lig)
-        # categorical_loss_pocket = torch.mean(weights[pocket_mask] * ce_loss_pocket)
-        # categorical_loss = categorical_loss_lig + categorical_loss_pocket
 
         categorical_loss_lig = ce_loss_lig.mean()
-        categorical_loss_pocket = ce_loss_pocket.mean()
-        categorical_loss = categorical_loss_lig + categorical_loss_pocket
+        categorical_loss = categorical_loss_lig 
         geometric_loss = self.denoiser.last_geometric_loss
         
         # Combine losses
@@ -452,15 +429,11 @@ class MolecularDenoisingModel:
             "coord_loss": coord_loss.item(),
             "categorical_loss": categorical_loss.item(),
             "coord_loss_ligand": coord_loss_lig.item(),
-            "coord_loss_pocket": coord_loss_pocket.item(),
             "categorical_loss_ligand": categorical_loss_lig.item(),
-            "categorical_loss_pocket": categorical_loss_pocket.item(),
             "geometric_loss_total": geometric_loss.item(),
             "avg_sigma": sigma.mean().item(),
             "max_sigma": sigma.max().item(),
-            "coord_pred_scale": torch.cat([pred_coords_lig, pred_coords_pocket]).abs().mean().item(),
             "atom_accuracy": (torch.argmax(pred_logits_lig, dim=-1) == true_atom_types).float().mean().item(),
-            "residue_accuracy": (torch.argmax(pred_logits_pocket, dim=-1) == true_residue_types).float().mean().item()
         }
         return total_loss, metrics
 
@@ -518,7 +491,7 @@ class MolecularDenoisingModel:
             
             # Add noise at this level
             noise_lig = torch.randn_like(xh_lig_clean)
-            noise_pocket = torch.randn_like(xh_pocket_clean)
+            noise_pocket = torch.zeros_like(xh_pocket_clean)
             
             # COM-free noise for coordinates only
             noise_coords_combined = torch.cat([noise_lig[:, :self.n_dims], noise_pocket[:, :self.n_dims]], dim=0)
@@ -527,7 +500,7 @@ class MolecularDenoisingModel:
             noise_pocket[:, :self.n_dims] = noise_coords_centered[len(lig_coords):]
             
             xh_lig_noisy = xh_lig_clean + sigma_val * noise_lig
-            xh_pocket_noisy = xh_pocket_clean + sigma_val * noise_pocket
+            xh_pocket_noisy = xh_pocket_clean
             
             # Create sigma tensor for this evaluation (broadcast to batch_size)
             sigma_batch = sigma_val
@@ -544,40 +517,33 @@ class MolecularDenoisingModel:
             
             # Denoise
             with torch.no_grad():
-                pred_output_lig, pred_output_pocket = self.denoiser(
-                    xh_lig_noisy, xh_pocket_noisy, sigma_batch, lig_mask, pocket_mask
+                pred_output_lig, _ = self.denoiser(
+                    xh_lig_noisy, xh_pocket_clean, sigma_batch, lig_mask, pocket_mask
                 )
             
             
             # Split predictions: coordinates + logits
             pred_coords_lig = pred_output_lig[:, :self.n_dims]              # [N_lig, 3]
             pred_logits_lig = pred_output_lig[:, self.n_dims:]              # [N_lig, atom_nf] - LOGITS
-            pred_coords_pocket = pred_output_pocket[:, :self.n_dims]        # [N_pocket, 3]
-            pred_logits_pocket = pred_output_pocket[:, self.n_dims:]        # [N_pocket, residue_nf] - LOGITS
             
             # Compute losses
             clean_coords_lig = xh_lig_clean[:, :self.n_dims]
-            clean_coords_pocket = xh_pocket_clean[:, :self.n_dims]
             
             # Coordinate loss: L2
             coord_loss_lig = torch.mean((pred_coords_lig - clean_coords_lig) ** 2)
-            coord_loss_pocket = torch.mean((pred_coords_pocket - clean_coords_pocket) ** 2)
-            coord_loss = coord_loss_lig + coord_loss_pocket
+            coord_loss = coord_loss_lig
             
             # Categorical loss: Cross-entropy on logits
             categorical_loss_lig = F.cross_entropy(pred_logits_lig, true_atom_types)
-            categorical_loss_pocket = F.cross_entropy(pred_logits_pocket, true_residue_types)
-            categorical_loss = categorical_loss_lig + categorical_loss_pocket
+            categorical_loss = categorical_loss_lig 
             
             # Accuracy metrics
             atom_accuracy = (torch.argmax(pred_logits_lig, dim=-1) == true_atom_types).float().mean()
-            residue_accuracy = (torch.argmax(pred_logits_pocket, dim=-1) == true_residue_types).float().mean()
             
             eval_losses[f"coord_loss_lvl{i}"] = coord_loss.item()
             eval_losses[f"categorical_loss_lvl{i}"] = categorical_loss.item()
             eval_losses[f"total_loss_lvl{i}"] = coord_loss.item() + categorical_loss.item()
             eval_losses[f"atom_accuracy_lvl{i}"] = atom_accuracy.item()
-            eval_losses[f"residue_accuracy_lvl{i}"] = residue_accuracy.item()
         
         return eval_losses
 
@@ -635,7 +601,6 @@ def test_molecular_diffusion():
     print(f"Coord Loss: {metrics['coord_loss']:.4f}")
     print(f"Categorical Loss: {metrics['categorical_loss']:.4f}")
     print(f"Sigma range: [{metrics['avg_sigma']:.3f}, {metrics['max_sigma']:.3f}]")
-    print(f"Coord prediction scale: {metrics['coord_pred_scale']:.3f}")
     
     # Test evaluation
     eval_metrics = model.eval_fn(batch)
