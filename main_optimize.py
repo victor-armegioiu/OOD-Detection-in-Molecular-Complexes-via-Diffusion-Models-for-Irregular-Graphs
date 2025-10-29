@@ -659,7 +659,7 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
             # Sampling-based losses
             save_path = config['checkpoint_path'].replace(".pt", f"_epoch_{epoch + 1}.pt")
             save_checkpoint(model, config, save_path, optimizer=optimizer, scheduler=scheduler, scaler=scaler, epoch=epoch, best_metrics=best_metrics)
-            loaded_model = load_checkpoint(save_path)
+            loaded_model =  (save_path)
 
             if not config["update_pocket_coords"]:
                 sample_loader = eval_data[0] # TODO should be replaced by a test dataset

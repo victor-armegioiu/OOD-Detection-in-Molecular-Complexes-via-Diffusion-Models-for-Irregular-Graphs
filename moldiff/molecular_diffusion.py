@@ -678,7 +678,10 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         # # freeze pocket encoder to lookup embeddings if using pocket conditioning
         # for param in self.denoiser.residue_encoder.parameters():
         #         param.requires_grad = False
-  
+    def initialize(self):
+        """Initialize model weights"""
+        print(f"✅ Initialized ConditionalMolecularDenoisingModel with {sum(p.numel() for p in self.denoiser.parameters())} parameters")
+    
     def null_residue_loss_fn(self, batch: dict):
         """
         CDCD-style loss function for null residue class for CFG: noise embeddings, predict logits, use cross-entropy
