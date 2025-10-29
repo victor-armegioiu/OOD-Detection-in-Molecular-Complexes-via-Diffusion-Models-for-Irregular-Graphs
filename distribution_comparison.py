@@ -8,8 +8,9 @@ visually and statistically. It provides:
 - Pairwise distribution differences (KL divergence, Wasserstein distance)
 - Summary statistics in the plot
 - Optional if error dictionary is provided, it will plot the metric vs the error values
-- Optional preprocessing: dataset merging, clipping, outlier normalization, and range normalization
+- Optional preprocessing: dataset merging, outlier removal, robust scaling, range normalization, and asinh scaling
 - Optional export: save processed data as CSV file with value-label pairs
+- Optional heatmap visualization: 2D density plots showing metric vs error distributions
 """
 
 import os
@@ -41,28 +42,23 @@ def parse_arguments():
     parser.add_argument('--metric', type=str, required=True, help='Metric to compare')
 
     # Export options
-    parser.add_argument('--save_plot', '-s', 
-                        help='Path to save the comparison plot')
-    parser.add_argument('--export', 
-                        help='Path to export processed data as CSV file')
-    parser.add_argument('--figsize', nargs=2, type=int, default=[20, 16], 
-                        help='Figure size as [width, height]')
+    parser.add_argument('--save_plot', '-s', help='Path to save the comparison plot')
+    parser.add_argument('--export', help='Path to export processed data as CSV file')
+    parser.add_argument('--figsize', nargs=2, type=int, default=[20, 16], help='Figure size as [width, height]')
 
     # Preprocessing options
-    parser.add_argument('--clip_percentiles', nargs=2, type=float, 
-                        help='Clip data to specified percentiles (e.g., 1 99 for 1st to 99th percentile)')
-    parser.add_argument('--cut_outliers', action='store_true',
-                        help='Cut outliers instead of clipping them')
     parser.add_argument('--remove_outliers', action='store_true', help='Remove outliers using IQR method')
     parser.add_argument('--robust_scaling', action='store_true', help='Normalize outliers using robust scaling (brings outliers closer to main distribution)')
-    parser.add_argument('--normalize_range', nargs=2, type=float,
-                        help='Normalize entire distributions to specified range (e.g., 0 1 for [0,1] range)')
+    parser.add_argument('--normalize', action='store_true', help='Normalize entire distributions to [-1,0] range')
+    parser.add_argument('--asinh_scaling', action='store_true', help='Apply global asinh scaling to all distributions (preserves sign)')
+    
     parser.add_argument('--merge_patterns', nargs='+', type=str,
                         help='Patterns to merge datasets (e.g., train validation will merge datasets containing these words)')
     parser.add_argument('--error_dict', type=str, default=None,
                         help='Path to the error distribution file mapping IDs to error values')
     parser.add_argument('--plot_heatmaps', action='store_true',
                         help='Create individual heatmap plots for each distribution')
+
 
     
     return parser.parse_args()
@@ -74,31 +70,29 @@ class DistributionComparator:
     def __init__(self, 
                 directory_path: str, 
                 metric: str,
-                clip_percentiles: Optional[Tuple[float, float]] = None, 
                 remove_outliers: bool = False,
-                cut_outliers: bool = False,
                 robust_scaling: bool = False,
-                normalize_range: Optional[Tuple[float, float]] = None,
-                merge_patterns: Optional[List[str]] = None):
+                normalize: bool = False,
+                merge_patterns: Optional[List[str]] = None,
+                asinh_scaling: bool = False):
         """
         Initialize the comparator with a directory path.
         
         Args:
             directory_path: Path to directory containing .json files
-            clip_percentiles: Tuple of (lower_percentile, upper_percentile) for clipping, e.g., (1, 99)
-            cut_outliers: Whether to cut outliers instead of clipping them
+            metric: Metric to compare
+            remove_outliers: Whether to remove outliers using IQR method
             robust_scaling: Whether to normalize outliers using robust scaling
-            normalize_range: Tuple of (min_val, max_val) to normalize distributions to, e.g., (0, 1)
+            normalize: Whether to normalize entire distributions to [-1,0] range
+            asinh_scaling: Whether to apply global asinh scaling to all distributions (preserves sign)
             merge_patterns: List of patterns to merge datasets (e.g., ['train', 'validation'] will merge datasets containing these words)
         """
 
         self.directory_path = Path(directory_path)
         self.metric = metric
-        self.clip_percentiles = clip_percentiles
-        self.cut_outliers = cut_outliers
         self.remove_outliers = remove_outliers
         self.robust_scaling = robust_scaling
-        self.normalize_range = normalize_range
+        self.normalize = normalize
         self.merge_patterns = merge_patterns or []
         self.distributions = {}
         self.distributions_ids = {}  # Store distribution IDs aligned with distributions
@@ -106,198 +100,31 @@ class DistributionComparator:
         self.original_distributions = {}  # Store original data for reference
         self.metrics = {}
         self.pairwise_metrics = {}
+        self.asinh_scaling = asinh_scaling
+        # Ordering preference for displays (boxplots, heatmaps)
+        # First, any name containing these substrings (in order), then the rest
+        self.order_priority = ['train', 'val', 'casf2016']
+
+        self.global_min = None
+        self.global_max = None
+        self.global_median = None
+        self.global_q1 = None
+        self.global_q3 = None
 
         print(f"\nComparing distributions in {self.directory_path}")
         print(f"  Metric: {self.metric}")
-        print(f"  Clip percentiles: {self.clip_percentiles}")
-        print(f"  Cut outliers: {self.cut_outliers}")
+        print(f"  Remove outliers: {self.remove_outliers}")
         print(f"  Robust scaling: {self.robust_scaling}")
-        print(f"  Normalize range: {self.normalize_range}")
+        print(f"  Normalize: {self.normalize}")
         print(f"  Merge patterns: {self.merge_patterns}")
+        print(f"  Asinh scaling: {self.asinh_scaling}")
+        print(f"  Display order priority: {self.order_priority}")
 
-        
-    def preprocess_distribution(self, data: np.ndarray, ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Preprocess a single distribution with clipping and/or normalization.
-        Args:
-            data: Input distribution data
-            ids: Input distribution IDs (must be same length as data)
-        Returns:
-            Tuple of (processed_data, processed_ids)
-        """
-        if len(data) != len(ids):
-            raise ValueError(f"Data and IDs must have the same length: {len(data)} vs {len(ids)}")
-            
-        processed_data = data.copy()
-        processed_ids = ids.copy()
-        
-
-        # Step 1: Removing the outliers with IQR method
-        if self.remove_outliers:
-            median = np.median(processed_data)    
-            q75, q25 = np.percentile(processed_data, [75, 25])
-            iqr = q75 - q25
     
-            if iqr > 0:  # Avoid division by zero
-                # Define outlier bounds (1.5 * IQR rule)
-                lower_bound = q25 - 1.5 * iqr
-                upper_bound = q75 + 1.5 * iqr
-                print(f"  Outlier bounds: [{lower_bound:.2e}, {upper_bound:.2e}]")
-
-                if self.cut_outliers:
-                    # CUTTING THE OUTLIERS - need to remove corresponding IDs too
-                    valid_mask = (processed_data < upper_bound) & (processed_data > lower_bound)
-                    processed_data = processed_data[valid_mask]
-                    processed_ids = processed_ids[valid_mask]
-                    print(f"  Cut off outliers outside the range [{lower_bound:.2e}, {upper_bound:.2e}]")
-                else:
-                    # CLIPPING THE OUTLIERS
-                    processed_data = np.clip(processed_data, lower_bound, upper_bound)
-                    print(f"  Clipped to [{lower_bound}, {upper_bound}]")
-            else:
-                print(f"  No outliers removed")
-
-
-        # Step 2: Apply robust scaling
-        if self.robust_scaling:
-            # Use median and IQR for robust scaling
-            median = np.median(processed_data)
-            q75, q25 = np.percentile(processed_data, [75, 25])
-            iqr = q75 - q25
-            
-            if iqr > 0:  # Avoid division by zero
-                # Define bounds
-                lower_bound = q25 - 0.5 * iqr
-                upper_bound = q75 + 0.5 * iqr
-                
-                mask = (processed_data < lower_bound) | (processed_data > upper_bound)
-                indices = np.where(mask)[0]
-                
-                if len(indices) > 0:
-                    # Normalize outliers by bringing them closer to the main distribution
-                    # Use a sigmoid-like transformation to smoothly bring outliers in
-                    data_to_scale = processed_data[mask]
-                    
-                    # Calculate how far outliers are from bounds
-                    distances = np.where(data_to_scale < lower_bound, 
-                                       lower_bound - data_to_scale,
-                                       data_to_scale - upper_bound)
-                    
-                    # Apply a smooth transformation to bring outliers closer
-                    # Use a factor that reduces the distance by 99%
-                    reduction_factor = 0.1
-                    new_distances = distances * reduction_factor
-                    
-                    # Apply the transformation
-                    processed_data[mask] = np.where(
-                        data_to_scale < lower_bound,
-                        lower_bound - new_distances,
-                        upper_bound + new_distances
-                    )
-                    print(f"  Normalized {len(indices)} outliers using robust scaling")
-
-
-        # Step 3: Normalize entire distribution to specified range (after clipping)
-        if self.normalize_range is not None:
-            target_min, target_max = self.normalize_range
-            data_min = np.min(processed_data)
-            data_max = np.max(processed_data)
-            
-            if data_max > data_min:  # Avoid division by zero
-                # Min-max normalization to target range
-                processed_data = (processed_data - data_min) / (data_max - data_min) * (target_max - target_min) + target_min
-                print(f"  Normalized entire distribution to range [{target_min}, {target_max}]")
-            else:
-                print(f"  Warning: Cannot normalize - all values are identical ({data_min})")
-        
-        return processed_data, processed_ids
-    
-
-    def _merge_datasets_by_patterns(self, loaded_data: Dict[str, np.ndarray], loaded_ids: Dict[str, np.ndarray]) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
-        """
-        Merge datasets based on specified patterns.
-        
-        Args:
-            loaded_data: Dictionary of loaded dataset data
-            loaded_ids: Dictionary of loaded dataset IDs
-            
-        Returns:
-            Tuple of (merged_data, merged_ids) dictionaries
-        """
-        if not self.merge_patterns:
-            return loaded_data, loaded_ids
-        
-        merged_data = {}
-        merged_ids = {}
-        datasets_to_merge = []
-        datasets_to_keep = []
-        
-        # Find all datasets that match any of the patterns
-        for dataset_name, data in loaded_data.items():
-            matches_pattern = any(pattern.lower() in dataset_name.lower() for pattern in self.merge_patterns)
-            if matches_pattern:
-                datasets_to_merge.append((dataset_name, data, loaded_ids[dataset_name]))
-            else:
-                merged_data[dataset_name] = data
-                merged_ids[dataset_name] = loaded_ids[dataset_name]
-        
-        # Merge all matching datasets into one
-        if len(datasets_to_merge) > 1:
-            merged_name = self.merge_patterns[0]
-            merged_values = []
-            merged_id_values = []
-            original_names = []
-            
-            for dataset_name, data, ids in datasets_to_merge:
-                merged_values.append(data)
-                merged_id_values.append(ids)
-                original_names.append(dataset_name)
-            
-            # Concatenate all data and IDs
-            merged_data[merged_name] = np.concatenate(merged_values)
-            merged_ids[merged_name] = np.concatenate(merged_id_values)
-            print(f"  Merged datasets {original_names} into '{merged_name}' ({len(merged_data[merged_name])} total values)")
-        else:
-            return loaded_data, loaded_ids
-        
-        return merged_data, merged_ids
-
-
-    def export_processed_data(self, export_path: str) -> None:
-        """
-        Export processed values and their dataset membership to a CSV file.
-        
-        Args:
-            export_path: Path to save the exported data
-        """
-        if not self.distributions:
-            raise ValueError("No distributions loaded. Call load_distributions() first.")
-        
-        # Prepare data for export
-        export_data = []
-        
-        for dataset_name, data in self.distributions.items():
-            # Add each value with its dataset label
-            for value in data:
-                export_data.append([value, dataset_name])
-        
-        # Convert to DataFrame for easy export
-        df = pd.DataFrame(export_data, columns=['value', 'label'])
-        
-        # Export to CSV file
-        df.to_csv(export_path, index=False)
-        print(f"Exported {len(export_data)} values to: {export_path}")
-        
-        # Print summary of exported data
-        print(f"\nExport summary:")
-        for dataset_name, data in self.distributions.items():
-            print(f"  {dataset_name}: {len(data)} values")
-
-
-    def load_distributions(self) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    def _load_distributions(self) -> None:
         """
         Load all .json files from the directory and apply preprocessing.
-        Returns: Tuple of (distributions, distribution_ids) dictionaries
+        Applies individual outlier removal, then global preprocessing (asinh scaling, robust scaling, normalization).
         """
         if not self.directory_path.exists():
             raise FileNotFoundError(f"Directory {self.directory_path} does not exist")
@@ -346,27 +173,312 @@ class DistributionComparator:
             raise ValueError("No valid distributions could be loaded")
             
         # Apply merging patterns and sort for consistent ordering
-        self.distributions, self.distributions_ids = self._merge_datasets_by_patterns(loaded_distributions, loaded_distributions_ids)
+        self.distributions, self.distributions_ids = self._merge_distributions_by_patterns(loaded_distributions, loaded_distributions_ids)
         self.distributions = dict(sorted(self.distributions.items()))
         self.distributions_ids = dict(sorted(self.distributions_ids.items()))
-        
-        # Store original distributions for reference
+            
+        # Apply preprocessing to distributions individually
         for name, data in self.distributions.items():
             self.original_distributions[name] = data.copy()
-            
-        # Apply preprocessing to all distributions
-        for name, data in self.distributions.items():
             print(f"Processing {name}...")
-            processed_data, processed_ids = self.preprocess_distribution(data, self.distributions_ids[name])
+            processed_data, processed_ids = self._preprocess_distribution(data, self.distributions_ids[name])
             self.distributions[name] = processed_data
             self.distributions_ids[name] = processed_ids
             print(f"  ✓ {name}: {len(processed_data)} values, "
                   f"range [{processed_data.min():.3f}, {processed_data.max():.3f}]")
-        
-        return self.distributions, self.distributions_ids
-    
 
-    def load_error_distribution(self, error_dict: str) -> None:
+        print(f"\nLoaded {len(self.distributions)} distributions")
+        for key, value in self.distributions.items():
+            print(f"  {key}: {value.shape}")
+
+        # Compute global metrics
+        self._compute_global_metrics()
+            
+        # Apply global preprocessing
+        self._apply_global_preprocessing()
+
+
+    def _reorder_for_display(self) -> None:
+        """
+        Reorder `self.distributions` and `self.distributions_ids` so that entries
+        whose names contain substrings in `self.order_priority` appear first (in the
+        same order), followed by all remaining entries in their current order.
+        """
+        if not self.distributions or not self.order_priority:
+            return
+
+        def build_ordered_keys(keys: List[str], priority: List[str]) -> List[str]:
+            ordered: List[str] = []
+            lower_keys = {k: k.lower() for k in keys}
+            # Add priority matches in order, without duplicates
+            for p in priority:
+                p_lower = p.lower()
+                for k in keys:
+                    if p_lower in lower_keys[k] and k not in ordered:
+                        ordered.append(k)
+            # Append remaining keys preserving current order
+            for k in keys:
+                if k not in ordered:
+                    ordered.append(k)
+            return ordered
+
+        current_keys = list(self.distributions.keys())
+        ordered_keys = build_ordered_keys(current_keys, self.order_priority)
+
+        # Rebuild dicts in the new order
+        self.distributions = {k: self.distributions[k] for k in ordered_keys}
+        self.distributions_ids = {k: self.distributions_ids[k] for k in ordered_keys}
+
+
+    def _preprocess_distribution(self, data: np.ndarray, ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Preprocess a single distribution with outlier removal only.
+        Robust scaling, range normalization, and asinh scaling are applied globally after all distributions are loaded.
+        Args:
+            data: Input distribution data
+            ids: Input distribution IDs (must be same length as data)
+        Returns:
+            Tuple of (processed_data, processed_ids)
+        """
+        if len(data) != len(ids):
+            raise ValueError(f"Data and IDs must have the same length: {len(data)} vs {len(ids)}")
+            
+        processed_data = data.copy()
+        processed_ids = ids.copy()
+        
+
+        # Step 1: Removing the outliers with IQR method
+        if self.remove_outliers:
+            median = np.median(processed_data)    
+            q75, q25 = np.percentile(processed_data, [75, 25])
+            iqr = q75 - q25
+    
+            if iqr > 0:  # Avoid division by zero
+                # Define outlier bounds (1.5 * IQR rule)
+                lower_bound = q25 - 1.5 * iqr
+                upper_bound = q75 + 1.5 * iqr
+                print(f"  Outlier bounds: [{lower_bound:.2e}, {upper_bound:.2e}]")
+
+                # CUTTING THE OUTLIERS - need to remove corresponding IDs too
+                valid_mask = (processed_data < upper_bound) & (processed_data > lower_bound)
+                processed_data = processed_data[valid_mask]
+                processed_ids = processed_ids[valid_mask]
+                print(f"  Cut off outliers outside the range [{lower_bound:.2e}, {upper_bound:.2e}]")
+
+            else:
+                print(f"  No outliers removed")
+        return processed_data, processed_ids
+
+
+    def _compute_global_metrics(self) -> None:
+        """
+        Compute global statistics (min, max, median, Q1, Q3) across all distributions.
+        Updates self.global_min, self.global_max, self.global_median, self.global_q1, self.global_q3.
+        """
+        if not self.distributions:
+            return
+            
+        # Concatenate all distribution data
+        all_data = np.concatenate([data for data in self.distributions.values()])
+        
+        # Compute global statistics
+        self.global_min = np.min(all_data)
+        self.global_max = np.max(all_data)
+        self.global_median = np.median(all_data)
+        self.global_q1 = np.percentile(all_data, 25)
+        self.global_q3 = np.percentile(all_data, 75)
+        self.global_90 = np.percentile(all_data, 90)
+        self.global_10 = np.percentile(all_data, 10)
+        
+        print(f"\nGlobal statistics:")
+        print(f"  Min: {self.global_min:.2e}")
+        print(f"  Max: {self.global_max:.2e}")
+        print(f"  Median: {self.global_median:.2e}")
+        print(f"  Q1: {self.global_q1:.2e}")
+        print(f"  Q3: {self.global_q3:.2e}")
+
+
+    def _apply_global_preprocessing(self) -> None:
+        """
+        Apply global preprocessing to all distributions based on global statistics to maintain comparability.
+        Includes: asinh scaling, robust scaling, and range normalization (in that order).
+        """
+        if not self.distributions:
+            return
+            
+        # Apply global asinh scaling if requested
+        if self.asinh_scaling:
+            print(f"\nApplying global asinh scaling...")
+            # Use positive scale based on absolute global median to preserve sign
+            c = abs(self.global_median) if self.global_median is not None else 1.0
+            if c == 0:
+                c = 1.0
+            for name, data in self.distributions.items():
+                original_min, original_max = np.min(data), np.max(data)
+                transformed = np.arcsinh(data / c)
+                self.distributions[name] = transformed
+                new_min, new_max = np.min(transformed), np.max(transformed)
+                print(f"    {name}: asinh scaled [{original_min:.2e}, {original_max:.2e}] -> [{new_min:.2e}, {new_max:.2e}] (c={c:.2e})")
+                
+            # Recompute global metrics after asinh scaling
+            print(f"  Recomputing global metrics after asinh scaling...")
+            self._compute_global_metrics()
+        
+        # Apply global robust scaling if requested
+        if self.robust_scaling:
+            print(f"\nApplying global robust scaling...")
+            # Use global median and IQR for robust scaling
+            global_iqr = self.global_q3 - self.global_q1
+            
+            if global_iqr > 0:
+                # Define global bounds
+                lower_bound = self.global_q1 - 1.0 * global_iqr
+                upper_bound = self.global_q3 + 1.0 * global_iqr
+                print(f"    Global bounds: [{lower_bound:.2e}, {upper_bound:.2e}]")
+
+                for name, data in self.distributions.items():
+                    original_min, original_max = np.min(data), np.max(data)
+                    mask = (data < lower_bound) | (data > upper_bound)
+                    indices = np.where(mask)[0]
+                    
+                    if len(indices) > 0:
+                        # Normalize outliers by bringing them closer to the main distribution
+                        data_to_scale = data[mask]
+                        
+                        # Calculate how far outliers are from bounds
+                        distances = np.where(data_to_scale < lower_bound, 
+                                           lower_bound - data_to_scale,
+                                           data_to_scale - upper_bound)
+                        
+                        # Apply a smooth transformation to bring outliers closer
+                        reduction_factor = 0.05
+                        new_distances = distances * reduction_factor
+                        
+                        # Apply the transformation (modify the distribution directly)
+                        scaled_data = np.where(
+                            data_to_scale < lower_bound,
+                            lower_bound - new_distances,
+                            upper_bound + new_distances
+                        )
+                        self.distributions[name][mask] = scaled_data
+                        new_min, new_max = np.min(self.distributions[name]), np.max(self.distributions[name])
+                        print(f"    {name}: Normalized {len(indices)} outliers, range [{original_min:.2e}, {original_max:.2e}] -> [{new_min:.2e}, {new_max:.2e}]")
+                    
+                    else:
+                        print(f"    {name}: No outliers found")
+                 
+            else:
+                print(f"    Warning: Global IQR is zero, skipping robust scaling")
+            
+            # Recompute global metrics after robust scaling
+            print(f"  Recomputing global metrics after robust scaling...")
+            self._compute_global_metrics()
+        
+
+        # Apply global range normalization if requested
+        if self.normalize:
+            print(f"  Applying global range normalization...")
+            target_min = -1 
+            target_max = 0
+            
+            if self.global_max > self.global_min:  # Avoid division by zero
+                # Min-max normalization to target range using global min/max
+                for name, data in self.distributions.items():
+                    original_min, original_max = np.min(data), np.max(data)
+                    self.distributions[name] = (data - self.global_min) / (self.global_max - self.global_min) * (target_max - target_min) + target_min
+                    new_min, new_max = np.min(self.distributions[name]), np.max(self.distributions[name])
+                    print(f"    {name}: [{original_min:.2e}, {original_max:.2e}] -> [{new_min:.2e}, {new_max:.2e}]")
+                print(f"    Normalized all distributions to range [{target_min}, {target_max}] using global min/max")
+                
+                # Recompute global metrics after range normalization
+                print(f"  Recomputing global metrics after range normalization...")
+                self._compute_global_metrics()
+            else:
+                print(f"    Warning: Cannot normalize - all values are identical ({self.global_min})")
+        
+
+    def _merge_distributions_by_patterns(self, loaded_data: Dict[str, np.ndarray], loaded_ids: Dict[str, np.ndarray]) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+        """
+        Merge distributions based on specified patterns.
+        
+        Args:
+            loaded_data: Dictionary of loaded dataset data
+            loaded_ids: Dictionary of loaded dataset IDs
+            
+        Returns:
+            Tuple of (merged_data, merged_ids) dictionaries
+        """
+        if not self.merge_patterns:
+            return loaded_data, loaded_ids
+        
+        merged_data = {}
+        merged_ids = {}
+        datasets_to_merge = []
+        datasets_to_keep = []
+        
+        # Find all datasets that match any of the patterns
+        for dataset_name, data in loaded_data.items():
+            matches_pattern = any(pattern.lower() in dataset_name.lower() for pattern in self.merge_patterns)
+            if matches_pattern:
+                datasets_to_merge.append((dataset_name, data, loaded_ids[dataset_name]))
+            else:
+                merged_data[dataset_name] = data
+                merged_ids[dataset_name] = loaded_ids[dataset_name]
+        
+        # Merge all matching datasets into one
+        if len(datasets_to_merge) > 1:
+            merged_name = self.merge_patterns[0]
+            merged_values = []
+            merged_id_values = []
+            original_names = []
+            
+            for dataset_name, data, ids in datasets_to_merge:
+                merged_values.append(data)
+                merged_id_values.append(ids)
+                original_names.append(dataset_name)
+            
+            # Concatenate all data and IDs
+            merged_data[merged_name] = np.concatenate(merged_values)
+            merged_ids[merged_name] = np.concatenate(merged_id_values)
+            print(f"  Merged datasets {original_names} into '{merged_name}' ({len(merged_data[merged_name])} total values)")
+        else:
+            return loaded_data, loaded_ids
+        
+        return merged_data, merged_ids
+
+
+    def _export_processed_data(self, export_path: str) -> None:
+        """
+        Export processed values and their dataset membership to a CSV file.
+        
+        Args:
+            export_path: Path to save the exported data
+        """
+        if not self.distributions:
+            raise ValueError("No distributions loaded. Call _load_distributions() first.")
+        
+        # Prepare data for export
+        export_data = []
+        
+        for dataset_name, data in self.distributions.items():
+            # Add each value with its dataset label
+            for value in data:
+                export_data.append([value, dataset_name])
+        
+        # Convert to DataFrame for easy export
+        df = pd.DataFrame(export_data, columns=['value', 'label'])
+        
+        # Export to CSV file
+        df.to_csv(export_path, index=False)
+        print(f"Exported {len(export_data)} values to: {export_path}")
+        
+        # Print summary of exported data
+        print(f"\nExport summary:")
+        for dataset_name, data in self.distributions.items():
+            print(f"  {dataset_name}: {len(data)} values")
+
+
+    def _load_error_distribution(self, error_dict: str) -> None:
         """
         Load the error distribution from a file.
         """
@@ -391,7 +503,8 @@ class DistributionComparator:
         else:
             raise ValueError("No tensor data found in dictionary")
     
-    def compute_individual_metrics(self) -> Dict[str, Dict]:
+
+    def _compute_individual_metrics(self) -> Dict[str, Dict]:
         """
         Compute statistical metrics for each distribution.
         
@@ -414,7 +527,8 @@ class DistributionComparator:
             }
         return self.metrics
     
-    def compute_pairwise_metrics(self) -> Dict[str, Dict]:
+
+    def _compute_pairwise_metrics(self) -> Dict[str, Dict]:
         """
         Compute pairwise differences between distributions.
         
@@ -477,7 +591,7 @@ class DistributionComparator:
             figsize: Figure size as (width, height)
         """
         if not self.distributions:
-            raise ValueError("No distributions loaded. Call load_distributions() first.")
+            raise ValueError("No distributions loaded. Call _load_distributions() first.")
         
         # Create figure with subplots
         fig = plt.figure(figsize=figsize)
@@ -583,9 +697,9 @@ class DistributionComparator:
             patch.set_facecolor(color)
             patch.set_alpha(0.7)
         
-        # ax4.set_ylabel('Value')
-        ax4.set_ylabel('Value (log scale)')
-        ax4.set_yscale('symlog')
+        ax4.set_ylabel('Value')
+        # ax4.set_ylabel('Value (log scale)')
+        # ax4.set_yscale('symlog')
         ax4.set_title(f'Distribution Summary (Box Plot) - {self.metric}', fontsize=14, fontweight='bold')
         ax4.grid(True, alpha=0.3)
         
@@ -600,10 +714,14 @@ class DistributionComparator:
         preprocessing_info = []
         if self.merge_patterns:
             preprocessing_info.append(f"Merged: {', '.join(self.merge_patterns)}")
-        if self.clip_percentiles is not None:
-            preprocessing_info.append(f"Clipped: {self.clip_percentiles[0]}-{self.clip_percentiles[1]}th percentile")
-        if self.normalize_range is not None:
-            preprocessing_info.append(f"Range: [{self.normalize_range[0]}, {self.normalize_range[1]}]")
+        if self.remove_outliers:
+            preprocessing_info.append("Outliers removed")
+        if self.robust_scaling:
+            preprocessing_info.append("Robust scaling")
+        if self.asinh_scaling:
+            preprocessing_info.append("Asinh scaling")
+        if self.normalize:
+            preprocessing_info.append("Normalized to [-1,0] range")
 
         if preprocessing_info:
             title_parts.append(f"Preprocessing: {', '.join(preprocessing_info)}")
@@ -612,7 +730,6 @@ class DistributionComparator:
         
         # Save plot if path provided
         if save_path:
-            if self.normalize_range: save_path = save_path.replace('.png', '_norm.png')
             plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
             print(f"Plot saved to: {save_path}")
         
@@ -628,10 +745,10 @@ class DistributionComparator:
         Each distribution uses a distinct marker and color with transparency for overlap visibility.
         """
         if not self.error_values:
-            raise ValueError("No error distribution loaded. Call load_error_distribution() first.")
+            raise ValueError("No error distribution loaded. Call _load_error_distribution() first.")
         
         if not self.distributions or not self.distributions_ids:
-            raise ValueError("No distributions loaded. Call load_distributions() first.")
+            raise ValueError("No distributions loaded. Call _load_distributions() first.")
         
         # Create the plot
         fig, ax = plt.subplots(figsize=figsize)
@@ -711,23 +828,26 @@ class DistributionComparator:
         preprocessing_info = []
         if self.merge_patterns:
             preprocessing_info.append(f"Merged: {', '.join(self.merge_patterns)}")
-        if self.clip_percentiles is not None:
-            preprocessing_info.append(f"Clipped: {self.clip_percentiles[0]}-{self.clip_percentiles[1]}th percentile")
-        if self.normalize_range is not None:
-            preprocessing_info.append(f"Range: [{self.normalize_range[0]}, {self.normalize_range[1]}]")
+        if self.remove_outliers:
+            preprocessing_info.append("Outliers removed")
+        if self.robust_scaling:
+            preprocessing_info.append("Robust scaling")
+        if self.asinh_scaling:
+            preprocessing_info.append("Asinh scaling")
+        if self.normalize:
+            preprocessing_info.append("Normalized to [-1,0] range")
         if preprocessing_info:
             title_parts.append(f"Preprocessing: {', '.join(preprocessing_info)}")
         fig.suptitle('\n'.join(title_parts), fontsize=16, fontweight='bold', y=0.98)
         
         # Save plot if path provided
         if save_path:
-            if self.normalize_range:
-                save_path = save_path.replace('.png', '_norm.png')
             plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
-            print(f"Metric vs Error scatter plot saved to: {save_path}")
+            print(f"Metric-error scatter plot saved to: {save_path}")
         
         plt.tight_layout()
         plt.show()
+
 
     def plot_metric_vs_error(self, save_path: Optional[str] = None, 
                                     figsize: Tuple[int, int] = (16, 12)) -> None:
@@ -735,10 +855,10 @@ class DistributionComparator:
         Create a density plot of the metric vs. error showing distributional positioning.
         """
         if not self.error_values:
-            raise ValueError("No error distribution loaded. Call load_error_distribution() first.")
+            raise ValueError("No error distribution loaded. Call _load_error_distribution() first.")
         
         if not self.distributions or not self.distributions_ids:
-            raise ValueError("No distributions loaded. Call load_distributions() first.")
+            raise ValueError("No distributions loaded. Call _load_distributions() first.")
         
         # Create the plot
         fig, ax = plt.subplots(figsize=figsize)
@@ -849,10 +969,14 @@ class DistributionComparator:
         preprocessing_info = []
         if self.merge_patterns:
             preprocessing_info.append(f"Merged: {', '.join(self.merge_patterns)}")
-        if self.clip_percentiles is not None:
-            preprocessing_info.append(f"Clipped: {self.clip_percentiles[0]}-{self.clip_percentiles[1]}th percentile")
-        if self.normalize_range is not None:
-            preprocessing_info.append(f"Range: [{self.normalize_range[0]}, {self.normalize_range[1]}]")
+        if self.remove_outliers:
+            preprocessing_info.append("Outliers removed")
+        if self.robust_scaling:
+            preprocessing_info.append("Robust scaling")
+        if self.asinh_scaling:
+            preprocessing_info.append("Asinh scaling")
+        if self.normalize:
+            preprocessing_info.append("Normalized to [-1,0] range")
 
         if preprocessing_info:
             title_parts.append(f"Preprocessing: {', '.join(preprocessing_info)}")
@@ -861,8 +985,6 @@ class DistributionComparator:
         
         # Save plot if path provided
         if save_path:
-            if self.normalize_range: 
-                save_path = save_path.replace('.png', '_norm.png')
             plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
             print(f"Metric vs Error plot saved to: {save_path}")
         
@@ -870,19 +992,34 @@ class DistributionComparator:
         plt.show()
 
 
-    def plot_heatmaps(self, save_path: Optional[str] = None, 
-                     figsize: Tuple[int, int] = (12, 8)) -> None:
+    def plot_heatmaps(self, 
+                      save_path: Optional[str] = None, 
+                      figsize: Tuple[int, int] = (12, 8),
+                      n_bins: int = 10,
+                      error_range = (0, 2.5),
+                      metric_range = None
+                      ) -> None:
         """
         Create individual heatmap plots for each distribution showing metric vs error density.
-        Uses the same outlier filtering strategy to focus on the main body of distributions.
         Each distribution gets its own subplot with a 2D histogram heatmap.
+        Uses globally preprocessed data (asinh scaling, robust scaling, normalization if enabled).
+        Args:
+            save_path: Path to save the heatmap plot
+            figsize: Figure size as (width, height)
+            n_bins: Number of bins for histogram (default: 10)
+            error_range: Y-axis range for error values (default: (0, 4))
+            metric_range: X-axis range for metric values (default: uses global min/max)
         """
         if not self.error_values:
-            raise ValueError("No error distribution loaded. Call load_error_distribution() first.")
+            raise ValueError("No error distribution loaded. Call _load_error_distribution() first.")
         
         if not self.distributions or not self.distributions_ids:
-            raise ValueError("No distributions loaded. Call load_distributions() first.")
-        
+            raise ValueError("No distributions loaded. Call _load_distributions() first.")
+
+        if metric_range is None:
+            metric_range = (self.global_min, self.global_max)
+            print(f"Global metric range for heatmaps: [{metric_range[0]:.2e}, {metric_range[1]:.2e}]")
+
         # Calculate grid layout for subplots
         n_distributions = len(self.distributions)
         n_cols = min(3, n_distributions)  # Max 3 columns
@@ -896,21 +1033,7 @@ class DistributionComparator:
             axes = axes if isinstance(axes, list) else [axes]
         else:
             axes = axes.flatten()
-        
-        def remove_outliers_2d(x: np.ndarray, y: np.ndarray, factor: float = 1.5) -> Tuple[np.ndarray, np.ndarray]:
-            # """Remove outliers using IQR method for 2D data."""
-            # q1_x, q3_x = np.percentile(x, [25, 75])
-            # q1_y, q3_y = np.percentile(y, [25, 75])
-            # iqr_x = q3_x - q1_x
-            # iqr_y = q3_y - q1_y
-            # lower_x = q1_x - factor * iqr_x
-            # upper_x = q3_x + factor * iqr_x
-            # lower_y = q1_y - factor * iqr_y
-            # upper_y = q3_y + factor * iqr_y
-            # mask = ((x >= lower_x) & (x <= upper_x) & (y >= lower_y) & (y <= upper_y))
-            # return x[mask], y[mask]
-            return x, y
-        
+
         for idx, (name, metric_data) in enumerate(self.distributions.items()):
             ax = axes[idx]
             
@@ -918,61 +1041,45 @@ class DistributionComparator:
 
             # Get corresponding IDs and error values
             ids = self.distributions_ids[name]
-            for id_val in ids[:10]:
-                if id_val in self.error_values:
-                    print(f"    {id_val}: {self.error_values[id_val]}")
             
             error_data = []
             metric_data_filtered = []
             for i, id_val in enumerate(ids):
                 if id_val in self.error_values:
-                    # Use absolute error values like in other functions
-                    error_data.append(np.abs(self.error_values[id_val]))
+                    error_data.append(np.abs(self.error_values[id_val])) # Absolute error values
                     metric_data_filtered.append(metric_data[i])
-
-
             
             if not error_data:
                 ax.text(0.5, 0.5, f'No error values\nfound for {name}', 
                        ha='center', va='center', transform=ax.transAxes, fontsize=12)
                 ax.set_title(f'{name} - No Data', fontweight='bold')
-                ax.set_xlim(0, 1)  # Fixed x-axis limits
-                ax.set_ylim(0, 6)  # Fixed y-axis limits
+                ax.set_xlim(np.min(metric_data), 0)  # Fixed x-axis limits
+                ax.set_ylim(0, 5)  # Fixed y-axis limits
                 continue
 
-            # Calculate the RMSD of the error data
+
             rmsd = np.sqrt(np.mean(np.square(error_data)))
             print(f"  RMSD: {rmsd}")
-
             error_data = np.array(error_data)
-            metric_data_filtered = np.array(metric_data_filtered)
+            metric_data = np.array(metric_data_filtered)
             
-            # Focus on the main body by removing outliers
-            metric_clean, error_clean = remove_outliers_2d(metric_data_filtered, error_data)
-            
-            if len(metric_clean) < 5:
-                ax.text(0.5, 0.5, f'Insufficient data\nfor {name}\n({len(metric_clean)} points)', 
-                       ha='center', va='center', transform=ax.transAxes, fontsize=10)
-                ax.set_title(f'{name} - Insufficient Data', fontweight='bold')
-                ax.set_xlim(0, 1)  # Fixed x-axis limits
-                ax.set_ylim(0, 6)  # Fixed y-axis limits
-                continue
+            # Data is already globally transformed if enabled; use as-is
+            print(f"  Range of metric data: [{np.min(metric_data):.2e}, {np.max(metric_data):.2e}]")
             
             # Create 2D histogram for heatmap
             try:
                 # Define fixed bins for all heatmaps to ensure comparability
-                n_bins = 30
-                x_bins = np.linspace(0, 1, n_bins + 1)  # Fixed x-range: 0 to 1
-                y_bins = np.linspace(0, 6, n_bins + 1)  # Fixed y-range: 0 to 6
+                x_bins = np.linspace(metric_range[0], metric_range[1], n_bins + 1)
+                y_bins = np.linspace(error_range[0], error_range[1], n_bins + 1)
                 
                 # Create 2D histogram with fixed bins
-                hist, x_edges, y_edges = np.histogram2d(metric_clean, error_clean, 
-                                                      bins=[x_bins, y_bins], density=True)
+                hist, x_edges, y_edges = np.histogram2d(metric_data, error_data, 
+                                                    bins=[x_bins, y_bins], density=True)
                 
                 # Create heatmap with fixed extent
                 im = ax.imshow(hist.T, origin='lower', aspect='auto', 
-                              extent=[0, 1, 0, 6],  # Fixed extent for all heatmaps
-                              cmap='viridis', interpolation='bilinear')
+                            extent=[metric_range[0], metric_range[1], error_range[0], error_range[1]],
+                            cmap='viridis', interpolation='bilinear')
                 
                 # Add colorbar for this subplot
                 cbar = plt.colorbar(im, ax=ax, shrink=0.8)
@@ -981,17 +1088,18 @@ class DistributionComparator:
                 # Customize subplot
                 ax.set_xlabel(f'{self.metric}', fontsize=10, fontweight='bold')
                 ax.set_ylabel('Error Value', fontsize=10, fontweight='bold')
-                ax.set_title(f'{name}\n({len(metric_clean)} points)', fontsize=12, fontweight='bold')
-                ax.set_xlim(0, 1)  # Fixed x-axis limits
-                ax.set_ylim(0, 6)  # Fixed y-axis limits
+                ax.set_title(f'{name}\n({len(metric_data)} points)', fontsize=12, fontweight='bold')
+                ax.set_xlim(metric_range[0], metric_range[1])  # Fixed x-axis limits
+                ax.set_ylim(error_range[0], error_range[1])  # Fixed y-axis limits
                 ax.grid(True, alpha=0.3)
                 
             except Exception as e:
                 ax.text(0.5, 0.5, f'Error creating\nheatmap for {name}:\n{str(e)[:50]}...', 
-                       ha='center', va='center', transform=ax.transAxes, fontsize=9)
+                    ha='center', va='center', transform=ax.transAxes, fontsize=9)
                 ax.set_title(f'{name} - Error', fontweight='bold')
-                ax.set_xlim(0, 1)  # Fixed x-axis limits
-                ax.set_ylim(0, 6)  # Fixed y-axis limits
+                ax.set_xlim(metric_range[0], metric_range[1])  # Fixed x-axis limits
+                ax.set_ylim(error_range[0], error_range[1])  # Fixed y-axis limits
+            
         
         # Hide unused subplots
         for idx in range(n_distributions, len(axes)):
@@ -1004,10 +1112,14 @@ class DistributionComparator:
         preprocessing_info = []
         if self.merge_patterns:
             preprocessing_info.append(f"Merged: {', '.join(self.merge_patterns)}")
-        if self.clip_percentiles is not None:
-            preprocessing_info.append(f"Clipped: {self.clip_percentiles[0]}-{self.clip_percentiles[1]}th percentile")
-        if self.normalize_range is not None:
-            preprocessing_info.append(f"Range: [{self.normalize_range[0]}, {self.normalize_range[1]}]")
+        if self.remove_outliers:
+            preprocessing_info.append("Outliers removed")
+        if self.robust_scaling:
+            preprocessing_info.append("Robust scaling")
+        if self.asinh_scaling:
+            preprocessing_info.append("Asinh scaling")
+        if self.normalize:
+            preprocessing_info.append("Normalized to [-1,0] range")
         if preprocessing_info:
             title_parts.append(f"Preprocessing: {', '.join(preprocessing_info)}")
         
@@ -1015,8 +1127,6 @@ class DistributionComparator:
         
         # Save plot if path provided
         if save_path:
-            if self.normalize_range:
-                save_path = save_path.replace('.png', '_norm.png')
             plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
             print(f"Heatmap plots saved to: {save_path}")
         
@@ -1040,14 +1150,24 @@ class DistributionComparator:
             print(f"✓ Dataset merging: Merged datasets containing patterns {self.merge_patterns}")
         else:
             print("✗ No dataset merging applied")
-            
-        if self.clip_percentiles is not None:
-            print(f"✓ Clipping: {self.clip_percentiles[0]}th to {self.clip_percentiles[1]}th percentiles")
-        else:
-            print("✗ No clipping applied")
 
-        if self.normalize_range is not None:
-            print(f"✓ Range normalization: Normalized to [{self.normalize_range[0]}, {self.normalize_range[1]}]")
+        if self.remove_outliers:
+            print(f"✓ Outliers removed using IQR method")
+        else:
+            print("✗ No outliers removed")
+            
+        if self.robust_scaling:
+            print(f"✓ Robust scaling: Applied global robust scaling to outliers")
+        else:
+            print("✗ No robust scaling applied")
+            
+        if self.asinh_scaling:
+            print(f"✓ Asinh scaling: Applied global asinh transformation (preserves sign)")
+        else:
+            print("✗ No asinh scaling applied")
+            
+        if self.normalize:
+            print(f"✓ Range normalization: Normalized to [-1,0] range")
         else:
             print("✗ No range normalization applied")
         
@@ -1088,89 +1208,61 @@ def main():
 
     args = parse_arguments()
 
-    try:
-        # Parse clip percentiles if provided
-        clip_percentiles = None
-        if args.clip_percentiles:
-            if len(args.clip_percentiles) != 2:
-                raise ValueError("clip_percentiles must specify exactly 2 values (lower, upper)")
-            lower, upper = args.clip_percentiles
-            if not (0 <= lower < upper <= 100):
-                raise ValueError("clip_percentiles must be between 0 and 100, with lower < upper")
-            clip_percentiles = (lower, upper)
-
-        # Parse normalization range if provided
-        normalize_range = None
-        if args.normalize_range:
-            if len(args.normalize_range) != 2:
-                raise ValueError("normalize_range must specify exactly 2 values (min, max)")
-            min_val, max_val = args.normalize_range
-            if min_val >= max_val:
-                raise ValueError("normalize_range min value must be less than max value")
-            normalize_range = (min_val, max_val)
-
-        # Initialize comparator with preprocessing options
-        comparator = DistributionComparator(
-            args.directory, 
-            metric=args.metric,
-            clip_percentiles=clip_percentiles,
-            remove_outliers=args.remove_outliers,
-            cut_outliers=args.cut_outliers,
-            robust_scaling=args.robust_scaling,
-            normalize_range=normalize_range,
-            merge_patterns=args.merge_patterns
+    # Initialize comparator with preprocessing options
+    comparator = DistributionComparator(
+        args.directory, 
+        metric=args.metric,
+        remove_outliers=args.remove_outliers,
+        robust_scaling=args.robust_scaling,
+        normalize = args.normalize,
+        merge_patterns=args.merge_patterns,
+        asinh_scaling=args.asinh_scaling
+    )
+    
+    # Load distributions and preprocess them
+    print("Loading distributions...")
+    comparator._load_distributions()
+    
+    # Compute metrics
+    print("\nComputing individual metrics...")
+    comparator._compute_individual_metrics()
+    
+    print("Computing pairwise metrics...")
+    comparator._compute_pairwise_metrics()
+    
+    # Export data if requested
+    if args.export:
+        print("\nExporting processed data...")
+        comparator._export_processed_data(args.export)
+    
+    # Create plot
+    if args.save_plot:
+        print("Creating comparison plot...")
+        comparator.create_comparison_plot(
+            save_path=os.path.join(args.directory, 'distcomp_' + args.save_plot),
+            figsize=tuple(args.figsize)
         )
-        
-        # Load distributions and preprocess them
-        print("Loading distributions...")
-        distributions, distribution_ids = comparator.load_distributions()
-        print(f"Loaded {len(distributions)} distributions")
-        for key, value in distributions.items():
-            print(f"  {key}: {value.shape}")
-        print(f"Loaded {len(distribution_ids)} distribution IDs")
-        for key, value in distribution_ids.items():
-            print(f"  {key}: {value.shape}")
-        
-        # Compute metrics
-        print("\nComputing individual metrics...")
-        comparator.compute_individual_metrics()
-        
-        print("Computing pairwise metrics...")
-        comparator.compute_pairwise_metrics()
-        
-        # Export data if requested
-        if args.export:
-            print("\nExporting processed data...")
-            comparator.export_processed_data(args.export)
-        
-        # Create plot
-        if args.save_plot:
-            print("Creating comparison plot...")
-            comparator.create_comparison_plot(
-                save_path=os.path.join(args.directory, 'distcomp_' + args.save_plot),
-                figsize=tuple(args.figsize)
+        if args.error_dict:
+            print("Loading error distribution...")
+            comparator._load_error_distribution(args.error_dict)
+            comparator.plot_metric_vs_error_scatter(
+                save_path=os.path.join(args.directory, 'error_vs_' + args.save_plot),
             )
-            if args.error_dict:
-                print("Loading error distribution...")
-                comparator.load_error_distribution(args.error_dict)
-                comparator.plot_metric_vs_error_scatter(
-                    save_path=os.path.join(args.directory, 'error_vs_' + args.save_plot),
-                )
-                
-                # Create heatmaps if requested
-                if args.plot_heatmaps:
-                    print("Creating individual heatmap plots...")
-                    comparator.plot_heatmaps(
-                        save_path=os.path.join(args.directory, 'heatmaps_' + args.save_plot),
-                        figsize=(12, 8)
-                )
-        
-        # Print summary
-        comparator.print_summary()
-        
-    except Exception as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+
+
+            
+            # Create heatmaps if requested
+            if args.plot_heatmaps:
+                comparator._reorder_for_display()
+                print("\nCreating individual heatmap plots...")
+                comparator.plot_heatmaps(
+                    save_path=os.path.join(args.directory, 'heatmaps_' + args.save_plot),
+                    figsize=(12, 8),
+                    n_bins=10,
+            )
+    
+    # Print summary
+    comparator.print_summary()
 
 if __name__ == "__main__":
     main() 
