@@ -111,6 +111,9 @@ class DistributionComparator:
         self.global_q1 = None
         self.global_q3 = None
 
+        self.global_error_min = None
+        self.global_error_max = None
+
         print(f"\nComparing distributions in {self.directory_path}")
         print(f"  Metric: {self.metric}")
         print(f"  Remove outliers: {self.remove_outliers}")
@@ -484,6 +487,10 @@ class DistributionComparator:
         """
         with open(error_dict, 'r') as f:
             self.error_values = json.load(f)
+
+        self.global_error_min = np.min(list(self.error_values.values()))
+        self.global_error_max = np.max(list(self.error_values.values()))
+        print(f"Global error range: [{self.global_error_min:.2e}, {self.global_error_max:.2e}]")
         
         print(f"Loaded {len(self.error_values)} error values")
 
@@ -996,7 +1003,7 @@ class DistributionComparator:
                       save_path: Optional[str] = None, 
                       figsize: Tuple[int, int] = (12, 8),
                       n_bins: int = 10,
-                      error_range = (0, 2.5),
+                      error_range = None,
                       metric_range = None
                       ) -> None:
         """
@@ -1007,7 +1014,7 @@ class DistributionComparator:
             save_path: Path to save the heatmap plot
             figsize: Figure size as (width, height)
             n_bins: Number of bins for histogram (default: 10)
-            error_range: Y-axis range for error values (default: (0, 4))
+            error_range: Y-axis range for error values
             metric_range: X-axis range for metric values (default: uses global min/max)
         """
         if not self.error_values:
@@ -1019,6 +1026,10 @@ class DistributionComparator:
         if metric_range is None:
             metric_range = (self.global_min, self.global_max)
             print(f"Global metric range for heatmaps: [{metric_range[0]:.2e}, {metric_range[1]:.2e}]")
+
+        if error_range is None:
+            error_range = (self.global_error_min, self.global_error_max)
+            print(f"Global error range for heatmaps: [{error_range[0]:.2e}, {error_range[1]:.2e}]")
 
         # Calculate grid layout for subplots
         n_distributions = len(self.distributions)
