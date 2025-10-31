@@ -75,19 +75,19 @@ CONFIG = {
     'atom_nf': 10,           
     'residue_nf': 21,         
     'n_dims': 3,             
-    'n_layers': 4, # 4           
+    'n_layers': 6, # 4           
     'joint_nf': 256,          
-    'hidden_nf': 128, # 256         
-    'edge_embedding_dim': 32, # 64
-    'attention': False, 
-    'tanh': False, 
+    'hidden_nf': 512, # 256         
+    'edge_embedding_dim': 64, # 64
+    'attention': True, 
+    'tanh': True, 
     'norm_constant': 0,
     'inv_sublayers': 2,
     'sin_embedding': False,
     'edge_cutoff_ligand': None,
-    'edge_cutoff_pocket': None, 
-    'edge_cutoff_interaction': None,
-    'reflection_equivariant': True,
+    'edge_cutoff_pocket': 5, 
+    'edge_cutoff_interaction': 5,
+    'reflection_equivariant': False,
     
     # Training parameters
     'num_epochs': 500,
@@ -110,7 +110,7 @@ CONFIG = {
     'geom_loss_weight': 0.0,
     
     # Sampling parameters
-    'num_sampling_steps': 400,
+    'num_sampling_steps': 800,
     'schedule_type': "exponential",
     
     # I/O
