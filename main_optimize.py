@@ -76,9 +76,9 @@ CONFIG = {
     'residue_nf': 21,         
     'n_dims': 3,             
     'n_layers': 6, # 4           
-    'joint_nf': 256,          
-    'hidden_nf': 512, # 256         
-    'edge_embedding_dim': 64, # 64
+    'joint_nf': 128,          
+    'hidden_nf': 256, # 256         
+    'edge_embedding_dim': 32, # 64
     'attention': True, 
     'tanh': True, 
     'norm_constant': 0,

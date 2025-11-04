@@ -24,3 +24,4 @@ combine_csvs.py
 *bayesian.db*
 example_dataset/
 data_extracted_graphs/
+*.png
