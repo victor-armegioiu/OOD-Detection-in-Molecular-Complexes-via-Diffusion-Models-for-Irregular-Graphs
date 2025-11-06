@@ -1004,8 +1004,13 @@ def process_dataset(dataset, evaluator, device, dataset_name, output_path):
 
         for i in range(len(ligand_data)):
 
-            if batch.id[i] in all_metrics:
-                print(f"Molecule {batch.id[i]} already processed, skipping...")
+            # If the molecule data already exists (with a log likelihood that is not NaN nor Infinity), skip it
+            exists = batch.id[i] in all_metrics
+            has_likelihood = exists and 'log_likelihood' in all_metrics[batch.id[i]]
+            is_nan = has_likelihood and np.isnan(all_metrics[batch.id[i]]['log_likelihood'])
+            is_inf = has_likelihood and np.isinf(all_metrics[batch.id[i]]['log_likelihood'])
+            if exists and has_likelihood and not is_nan and not is_inf:
+                print(f"Molecule {batch.id[i]} already processed, skipping...", flush=True)
                 continue
 
             ligand_mask = torch.zeros(ligand_data[i].shape[0], dtype=torch.long, device=device)
@@ -1115,12 +1120,7 @@ def main(dataset_path, checkpoint_path, results_folder, num_steps, num_hutchinso
         num_hutchinson_samples=num_hutchinson_samples,
     )
     
-    # Determine save path
-    if start_idx is not None and stop_idx is not None:
-        output_filename = f'{name.replace(".pt", "")}_metrics_{start_idx}_{stop_idx}.json'
-    else:
-        output_filename = f'{name.replace(".pt", "")}_metrics.json'
-    
+    output_filename = f'{name.replace(".pt", "")}_metrics.json'
     output_path = os.path.join(results_folder, output_filename)
 
     # -----------------------------------------------------------

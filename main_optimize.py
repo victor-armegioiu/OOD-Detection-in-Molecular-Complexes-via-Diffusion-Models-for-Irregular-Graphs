@@ -484,6 +484,11 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
     if 'resume_checkpoint_path' in config and config['resume_checkpoint_path'] is not None:
         model, checkpoint_config, optimizer_state, scheduler_state, scaler_state, checkpoint_epoch, checkpoint_best_metrics = load_checkpoint_for_resume(config['resume_checkpoint_path'], config)
         
+        # Reinitialize optimizer with the same parameters as the checkpoint
+        optimizer = optim.AdamW(
+            model.denoiser.parameters(),
+            lr=config['learning_rate'])
+        
         # Load optimizer state if available
         if optimizer_state is not None:
             optimizer.load_state_dict(optimizer_state)
