@@ -1,5 +1,6 @@
 import torch
 import json
+import time
 import warnings
 import tempfile
 from openbabel import openbabel
@@ -299,7 +300,11 @@ def sample_molecules_conditionally(
     conditioning_batch = sampler._create_initial_conditioning_dict(pocket_batch = sample_batch, guidance_scale = guidance_scale)
     
     # Generate samples
+    # print("STARTING GENERATION PROCESS...")
+    start_time = time.time()
     samples = sampler.generate(conditioning_batch)
+    end_time = time.time()
+    print(f"GENERATION PROCESS COMPLETED in {end_time - start_time:.2f} SECONDS")
     
     print(f"\nGenerated molecules:")
     print(f"  Total ligand atoms: {samples['ligand_coords'].shape[0]}")

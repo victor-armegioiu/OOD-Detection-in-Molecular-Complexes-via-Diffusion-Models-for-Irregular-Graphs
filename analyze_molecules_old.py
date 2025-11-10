@@ -345,6 +345,12 @@ if __name__ == "__main__":
     # Initialize the class
     mp = MoleculeProperties()
 
+    # This code assumes that all samples of all models are in the same folder
+    # Idea give the folder, and the sample identifier, the rest will be done by code (arbitary number of models possible)
+    folder = "mini_example_dataset"
+    our_model_file_desc = "_samples"
+    their_model_file_desc = "_"
+
     # Read molecules from an SDF file
     sampled_mols = mp.get_list_from_sdf("1a1e_our_model.sdf")
     sampled_mols_diffsbdd = mp.get_list_from_sdf("1a1e_mol.sdf")
@@ -352,7 +358,7 @@ if __name__ == "__main__":
 
     # Evaluate properties
     # Note: wrap single molecule list in another list to match expected format
-    print("=========Evaluate Ours ==========")
+    print("========= Evaluate Ours ==========")
     properties = mp.evaluate([sampled_mols])
     print("========= Evaluate DiffSBDD =========")
     properties_diffsbdd = mp.evaluate([sampled_mols_diffsbdd])

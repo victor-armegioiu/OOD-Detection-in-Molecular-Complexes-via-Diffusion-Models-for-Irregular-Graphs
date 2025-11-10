@@ -102,8 +102,8 @@ CONFIG = {
     'cfg_guidance_scale': 0,
     
     # Diffusion parameters
-    'sigma_max': 100.0,      # Maximum noise level
-    'sigma_min': 1e-4,      # Minimum noise level
+    'sigma_max': 80, # 100.0,      # Maximum noise level
+    'sigma_min': 2e-3, #1e-4,      # Minimum noise level -> raised to prevent instabilities
     'update_pocket_coords': True,  # Joint modeling
     'freeze_pocket_embeddings': False, # No CE loss on residue classes
     'geometric_regularization': False,
@@ -128,7 +128,7 @@ CONFIG = {
         'tags': ['molecular-diffusion', 'training'],
         'notes': 'Training run for molecular diffusion model',
         'log_model': False,
-        'log_gradients': False,  # Set to True to log gradient distributions
+        'log_gradients': True,  # Set to True to log gradient distributions
     }
 }
 
@@ -585,12 +585,24 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
                 # traditional loss
                 loss, metrics = model.loss_fn(batch)
 
+            # track ids that lead to exploding losses 
+            if not torch.isfinite(loss):
+                print(f"[SKIP] non-finite loss. ids={batch['ids']}, sigma={metrics.get('avg_sigma')}")
+                continue
+            if loss.item() > 1e3:  # tune threshold
+                with open(os.path.join(config['run_dir'], 'quarantine_ids.txt'), 'a') as f:
+                    f.write(f"## Epoch {epoch}, Loss: {loss.item()}, skipped ## \n")
+                    for _id in batch['ids']:
+                        f.write(f"{_id}\n")
+                        
+                continue
+
                     
             # Backward pass 
             loss.backward()
             
             # Clip gradients 
-            #torch.nn.utils.clip_grad_norm_(model.denoiser.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.denoiser.parameters(), max_norm=1.0)
             
             optimizer.step()
             epoch_losses.append(loss.item())

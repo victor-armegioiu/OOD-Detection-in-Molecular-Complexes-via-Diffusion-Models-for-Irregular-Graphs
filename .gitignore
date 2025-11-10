@@ -8,7 +8,11 @@ wandb/
 dataset*.pt
 datasets/
 *.pdf
+*.pdb
+*.csv
 *.sdf
+*.pkl*
+*.pt
 logs/
 .vscode/
 
@@ -24,5 +28,6 @@ combine_csvs.py
 *.xyz
 *bayesian.db*
 example_dataset/
+mini_example_dataset/
 data_extracted_graphs/
 *.png
