@@ -2,7 +2,7 @@
 Natural Extension Reference Frame (NERF)
 
 Exact implementation from: 
-https://github.com/LPDI-EPFL/DrugFlow/blob/main/src/data/nerf.py
+https://github.com/LPDI-EPFL/model/blob/main/src/data/nerf.py
 
 Inspiration for parallel reconstruction:
 https://github.com/EleutherAI/mp_nerf and references therein

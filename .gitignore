@@ -15,6 +15,7 @@ datasets/
 *.pt
 logs/
 .vscode/
+*.json
 
 optimization_runs/
 optimization_results/
@@ -31,3 +32,4 @@ example_dataset/
 mini_example_dataset/
 data_extracted_graphs/
 *.png
+mini_example_dataset_samples/

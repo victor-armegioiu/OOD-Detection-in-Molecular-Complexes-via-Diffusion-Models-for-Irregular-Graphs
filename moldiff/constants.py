@@ -5,13 +5,7 @@ COVALENT_RADII = {
     'P': 1.07, 'S': 1.05, 'Cl': 1.02, 'Br': 1.20, 'I': 1.39
 }
 
-bond_encoder = {
-    'SINGLE': 0,
-    'DOUBLE': 1,
-    'TRIPLE': 2,
-    'AROMATIC': 3,
-    'NONE': 4
-}
+bond_encoder = {'SINGLE': 0, 'DOUBLE': 1, 'TRIPLE': 2, 'AROMATIC': 3, 'NONE': 4}
 bond_decoder = ['SINGLE', 'DOUBLE', 'TRIPLE', 'AROMATIC', 'NONE']
 
 
@@ -887,7 +881,7 @@ pocket_to_ligand_size_mapping = {
 
 # --------------------------------------------------------------------------------------------------------
 # Dihedral angle orientation
-# https://github.com/LPDI-EPFL/DrugFlow/blob/main/src/constants.py
+# https://github.com/LPDI-EPFL/model/blob/main/src/constants.py
 # --------------------------------------------------------------------------------------------------------
 
 aa_atom_index = {

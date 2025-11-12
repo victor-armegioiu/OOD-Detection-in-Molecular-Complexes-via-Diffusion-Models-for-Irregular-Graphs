@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import warnings
 
 from pathlib import Path
 from typing import Collection, List, Dict, Type
@@ -37,7 +38,7 @@ def get_data_type(key: str, data_types: Dict[str, Type], default=float) -> Type:
 
 def convert_data_to_table(data: List[Dict], data_types: Dict[str, Type]) -> pd.DataFrame:
     """
-    Converts data from `evaluate_drugflow` to a detailed table
+    Converts data from `evaluate_model` to a detailed table
     """
     table = []
     for entry in data:
@@ -134,7 +135,7 @@ def collection_metrics(
     return col_table
 
 
-def evaluate_drugflow_subdir(
+def evaluate_model_subdir(
         in_dir: Path,
         evaluator: FullEvaluator,
         desc: str = None,
@@ -150,6 +151,7 @@ def evaluate_drugflow_subdir(
         if fname.endswith('_ligand.sdf') and not fname.startswith('.')
     ]
     if len(valid_files) == 0:
+        warnings.warn(f'No valid ligand files found in {in_dir}')
         return pd.DataFrame()
 
     upper_bound = max(valid_files) + 1
@@ -169,7 +171,7 @@ def evaluate_drugflow_subdir(
     return results
 
 
-def evaluate_drugflow(
+def evaluate_model(
         in_dir: Path,
         evaluator: FullEvaluator,
         n_samples: int = None,
@@ -184,6 +186,8 @@ def evaluate_drugflow(
     data = []
     total_number_of_subdirs = len([path for path in in_dir.glob("[!.]*") if os.path.isdir(path)])
     i = 0
+
+    # print(list(in_dir.glob("[!.]*")))
     for subdir in in_dir.glob("[!.]*"):
         if not os.path.isdir(subdir):
             continue
@@ -193,7 +197,7 @@ def evaluate_drugflow(
             continue
         
 
-        curr_data = evaluate_drugflow_subdir(
+        curr_data = evaluate_model_subdir(
             in_dir=subdir,
             evaluator=evaluator,
             desc=f'[{i}/{total_number_of_subdirs}] {str(subdir.name)}',
@@ -206,7 +210,7 @@ def evaluate_drugflow(
     return data
 
 
-def compute_all_metrics_drugflow(
+def compute_all_metrics_model(
         in_dir: Path,
         gnina_path: Path,
         reduce_path: Path = None,
@@ -218,7 +222,8 @@ def compute_all_metrics_drugflow(
         n_jobs: int = 1,
 ):
     evaluator = FullEvaluator(gnina=gnina_path, reduce=reduce_path, exclude_evaluators=exclude_evaluators)
-    data = evaluate_drugflow(in_dir=in_dir, evaluator=evaluator, n_samples=n_samples, job_id=job_id, n_jobs=n_jobs)
+    data = evaluate_model(in_dir=in_dir, evaluator=evaluator, n_samples=n_samples, job_id=job_id, n_jobs=n_jobs)
+    # print(data)
     table_detailed = convert_data_to_table(data, evaluator.dtypes)
     # print(table_detailed.shape)
     table_aggregated = aggregated_metrics(

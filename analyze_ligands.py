@@ -10,7 +10,7 @@ def main():
     #                 help="Path to the sbdd_metrics folder (added to PYTHONPATH).")
     ap.add_argument("--samples-dir", required=True,
                     help="Root with per-pocket subdirs containing *_ligand.sdf / *_pocket.pdb.")
-    ap.add_argument("--datadir", required=False, default=None,
+    ap.add_argument("--data-dir", required=False, default=None,
                     help="Directory containing train_smiles.npy.")
     ap.add_argument("--gnina", default="gnina",
                     help="Path to gnina executable or 'gnina' if on PATH.")
@@ -28,11 +28,11 @@ def main():
 
     # Import here so the path above is honored.
     # Adjust the import path if your repo structure differs:
-    from sbdd_metrics.evaluation import compute_all_metrics_drugflow
+    from sbdd_metrics.evaluation import compute_all_metrics_model
 
     # Parse simple args
     samples_dir = Path(args.samples_dir).resolve()
-    reference_smiles_path = Path(args.datadir).resolve() / "train_smiles.npy" if args.datadir else None
+    reference_smiles_path = Path(args.data_dir).resolve() / "train_smiles.npy" if args.data_dir else None
     reduce_path = args.reduce if args.reduce.strip() else None
 
     # n_samples: None means "all"
@@ -46,14 +46,18 @@ def main():
     if reduce_path is None and "gnina_docking" not in exclude:
         exclude.append("gnina_docking")  # auto-skip docking if reduce not provided
 
+    # # exclude = ["gnina_docking"]
+    # print(reduce_path)
+    # print(exclude)
+
     print("Evaluation...")
-    data, table_detailed, table_aggregated = compute_all_metrics_drugflow(
+    data, table_detailed, table_aggregated = compute_all_metrics_model(
         in_dir=samples_dir,
         gnina_path=args.gnina,
         reduce_path=reduce_path,
         reference_smiles_path=reference_smiles_path,
         n_samples=n_samples,
-        exclude_evaluators=exclude or None,
+        exclude_evaluators=exclude or [],
     )
 
     # Save outputs
@@ -66,7 +70,20 @@ def main():
 if __name__ == "__main__":
     main()
 
-    # information provided by evlauation obj is pkl and data is detailed table:
+    # ## decode folder naming 
+    # # Regex pattern to parse DiffSBDD / model folder names.
+    # # Returns a tuple of named groups containing:
+    # # - pocket_pdb:  4-letter PDB ID of the receptor pocket used for conditioning
+    # # - chain:       chain identifier of the receptor (e.g., 'A', 'B', etc.)
+    # # - lig_pdb:     4-letter PDB ID of the reference complex used to define the pocket
+    # # - lig_code:    3-letter ligand code of the reference ligand (used for pocket extraction, not input)
+    # # - iter:        optional iteration number (e.g., '2' in 'it2') for iterative refinement runs
+    # # - stage:       generation or postprocessing stage ('min', 'docked', etc.)
+    # # - index:       sample index or replicate ID (e.g., '0'–'99')
+    # pattern = r'(?P<pocket_pdb>\w{4})_(?P<chain>[A-Z])_rec_(?P<lig_pdb>\w{4})_(?P<lig_code>\w+)_lig_tt(?:_it(?P<iter>\d+))?_(?P<stage>\w+)_(?P<index>\d+)'
+
+
+    # ## information provided by evlauation obj is pkl and data is detailed table:
     # >>> set(data.columns) & set(obj[0].keys())
     # {'chembl_ring_systems.min_ring_freq_gt100_', 'gnina.cnn_score', 'posebusters.internal_steric_clash', 'posebusters.all', 'posebusters.all_atoms_connected', 'chembl_ring_systems.min_ring_freq_gt10_', 'clashes.clash_score_between', 'clashes.passed_clash_score_between', 'medchem.lipinski', 'medchem.size', 'posebusters.bond_angles', 'gnina.gnina_efficiency', 'representation.smiles', 'sample', 'clashes.clash_score_pockets', 'posebusters.protein-ligand_maximum_distance', 'medchem.valid', 'reos.all', 'posebusters.inchi_convertible', 'gnina.minimisation_rmsd', 'pdb_file', 'gnina.vina_score', 'posebusters.sanitization', 'reos.BMS', 'medchem.connected', 'gnina.vina_efficiency', 'reos.Inpharmatica', 'reos.SureChEMBL', 'sdf_file', 'posebusters.minimum_distance_to_inorganic_cofactors', 'clashes.passed_clash_score_ligands', 'reos.Glaxo', 'chembl_ring_systems.min_ring_smi', 'posebusters.mol_pred_loaded', 'posebusters.minimum_distance_to_organic_cofactors', 'reos.PAINS', 'posebusters.volume_overlap_with_protein', 'posebusters.internal_energy', 'posebusters.volume_overlap_with_organic_cofactors', 'chembl_ring_systems.min_ring_freq_gt0_', 'subdir', 'posebusters.volume_overlap_with_inorganic_cofactors', 'medchem.sa', 'clashes.passed_clash_score_pockets', 'posebusters.volume_overlap_with_waters', 'reos.Dundee', 'posebusters.bond_lengths', 'posebusters.minimum_distance_to_waters', 'posebusters.mol_cond_loaded', 'posebusters.double_bond_flatness', 'medchem.logp', 'medchem.n_rotatable_bonds', 'reos.MLSMR', 'energy.energy', 'posebusters.aromatic_ring_flatness', 'posebusters.minimum_distance_to_protein', 'reos.LINT', 'gnina.gnina_score', 'medchem.qed', 'clashes.clash_score_ligands'}
     # >>> len(set(data.columns) & set(obj[0].keys()))

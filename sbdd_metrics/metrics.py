@@ -1,6 +1,8 @@
 import multiprocessing
 import subprocess
 import tempfile
+import sys
+from pathlib import Path
 from abc import abstractmethod
 from collections import defaultdict
 from pathlib import Path
@@ -16,12 +18,20 @@ from posebusters.modules.distance_geometry import _get_bond_atom_indices, _get_a
 from rdkit import Chem, RDLogger
 from rdkit.Chem import Descriptors, Crippen, Lipinski, QED, KekulizeException, AtomKekulizeException
 from rdkit.Chem.rdForceFieldHelpers import UFFGetMoleculeForceField
-from scipy.spatial.distance import jensenshannon
 from tqdm import tqdm
 from useful_rdkit_utils import REOS, RingSystemLookup, get_min_ring_frequency, RingSystemFinder
 
+
+
+# replace `gems_module` and `desired_function` with the real names
 from .interactions import INTERACTION_LIST, prepare_ligand, read_protein, profile_detailed
 from .sascorer import calculateScore
+
+# # make ../../GEMS importable
+# _GEMS_DIR = Path(__file__).resolve().parents[2] / "GEMS"
+# sys.path.insert(0, str(_GEMS_DIR))
+# from GEMS_dataprep_workflow  import main as gems_dataprep
+# from
 
 def timeout_handler(signum, frame):
     raise TimeoutError('Timeout')
@@ -365,6 +375,37 @@ class GninaEvalulator(AbstractEvaluator):
     @property
     def _dtypes(self):
         return {'*': float}
+
+# # TODO finish the implementation if required
+# class GEMSEvaluator(AbstractEvaluator):
+#     ID = "gems"
+
+#     def __init__(self, gems_path):
+#         self.gems_path = gems_path # location of the GEMS module
+    
+#     def evaluate(self, data_path, save_path):
+
+
+#         # Run data prep if graph file with LLM embeddings doesn't exist
+#         if not save_path.exists():
+#             subprocess.run(
+#                 ["python", "GEMS_dataprep_workflow.py",
+#                 "--data_path", str(data_path),
+#                 "--save_path", str(save_path)],
+#                 cwd=self.gems_path,
+#                 check=True,
+#             )
+
+#         # Run inference
+#         subprocess.run(
+#             ["python", "inference.py",
+#             "--dataset_path", str(dataset_path / "example_dataset.pt")],
+#             cwd=self.gems_path,
+#             check=True,
+#         )
+    
+
+
 
 
 class MedChemEvaluator(AbstractEvaluator):
