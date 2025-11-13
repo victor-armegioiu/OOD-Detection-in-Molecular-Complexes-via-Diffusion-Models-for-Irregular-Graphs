@@ -145,6 +145,7 @@ if __name__ == "__main__":
 
     model = load_checkpoint(args.ckpt_path)
     os.makedirs(args.output_dir, exist_ok=True)
+    print(encoded_graphs)
     
     for graph_code in encoded_graphs: 
         print(f"Sampling {args.n_samples} Ligands for Pocket {graph_code}")

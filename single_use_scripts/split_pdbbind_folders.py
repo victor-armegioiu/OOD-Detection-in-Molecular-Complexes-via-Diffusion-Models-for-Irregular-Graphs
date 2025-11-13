@@ -3,8 +3,8 @@ import shutil
 from pathlib import Path
 
 # --- user inputs ---
-split_json = Path("training_validation_ids.json")           # your JSON file
-pdbbind_root = Path("..", "PDBbind")            # folder with all subfolders
+split_json = Path("single_use_scripts/training_validation_ids.json")           # your JSON file
+pdbbind_root = Path("..", "PDBbind_v2020")            # folder with all subfolders
 out_train = pdbbind_root.parent / "PDBbind_train"
 out_valid = pdbbind_root.parent / "PDBbind_valid"
 

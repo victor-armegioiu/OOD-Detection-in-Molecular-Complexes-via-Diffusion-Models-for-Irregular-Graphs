@@ -594,6 +594,9 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
                     f.write(f"## Epoch {epoch}, Loss: {loss.item()}, skipped ## \n")
                     for _id in batch['ids']:
                         f.write(f"{_id}\n")
+                
+                # NOTE don't take grads to next epoch?
+                optimizer.zero_grad(set_to_none=True)
                         
                 continue
 
