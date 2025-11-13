@@ -7,10 +7,13 @@ wandb/
 *.txt
 *.pt
 
+export/
 datasets/
 optimization_runs/
 optimization_results/
 GEMS_errors*/
+similarity_metrics*/
+similarity_filtering/
 training_runs/
 diffsbdd_stuff/
 lkhd_results*/
