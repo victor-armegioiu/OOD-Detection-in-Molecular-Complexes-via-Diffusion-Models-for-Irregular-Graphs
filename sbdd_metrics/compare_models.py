@@ -28,7 +28,7 @@ def collect_metric_files(base_dir: Union[str, Path]) -> Dict[str, List[str]]:
             continue
 
         files: List[str] = []
-        for p in metrics_dir.rglob("*"):
+        for p in metrics_dir.iterdir(): #rglob("*"):
             if p.is_file() and p.suffix.lower() in {".csv", ".pkl"}:
                 files.append(p.relative_to(base).as_posix())
 
@@ -161,12 +161,14 @@ def stack_and_save_metrics(base_dir: Union[str, Path],
                 try:
                     df_agg = _read(agg_path)
                     agg_dict = _process_aggregated(df_agg)
+                    print("Included File: ", agg_path)
                 except Exception:
                     agg_dict = {}
             if dist_path is not None and dist_path.exists():
                 try:
                     df_dist = _read(dist_path)
                     dist_dict = _process_distances(df_dist)
+                    print("Included File: ", dist_path)
                 except Exception:
                     dist_dict = {}
 
@@ -204,9 +206,10 @@ def main():
     args = parser.parse_args()
 
     mapping = collect_metric_files(args.base_dir)
+    # print(mapping)
     combined_df = stack_and_save_metrics(args.base_dir, mapping, args.base_dir)
 
-    print(combined_df)
+    print("Stacked DataFrame saved at ", args.base_dir)
     
     
     

@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 import os
 import moldiff.utils as utils
 from rdkit.Chem import SDWriter
@@ -30,6 +31,11 @@ def sample_molecule_given_graph(graph_path: str,
     # Create directory for this pocket's samples
     pocket_output_dir = os.path.join(output_dir, pocket_code)
     os.makedirs(pocket_output_dir, exist_ok=True)
+    # try: 
+    #     os.makedirs(pocket_output_dir, exist_ok=False)
+    # except FileExistsError:
+    #     print(f"Output directory {pocket_output_dir} already exists. Skipping sampling for pocket {pocket_code}.")
+    #     return None
 
     # Copy the original pocket PDB file
     pocket_pdb_path = os.path.join(pocket_source, f"{pocket_code}.pdb")
@@ -104,59 +110,161 @@ def test_sample_molecule_given_graph(pdb_path: str = "data_extracted_graphs/1a1e
         n_samples=20
     )
     # print(samples)
+    
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Protein-Ligand Graph Encoder")
+    parser.add_argument("--protein_source", required=True, help="Protein file or directory with input PDB files")
+    parser.add_argument("--ligand_source", required=True, help="Ligand file or directory of ligand files")
+    parser.add_argument("--graph_dir", required=True, help="Optional output directory for saving graphs")
+    parser.add_argument("--output_dir", required=True, help="Output directory for saving generated molecules and copied pockets")
+    parser.add_argument("--ckpt_path",  default="/cluster/work/math/pbaertschi/molecular-diffusion/training_runs/RM_COM_DiffSBDD_config_1029_091048_datasets/dataset_pdbbind_train/checkpoint_epoch_580.pt")
+    parser.add_argument("--n_samples", type=int, default=20, help="Number of samples")
+    parser.add_argument("--job_id", type=int, default=0, help="Job ID for parallel processing")
+    parser.add_argument("--n_jobs", type=int, default=1, help="Total number of parallel jobs")
+    # parser.add_argument("--detect_lig_bonds_by_distance", type=lambda x: x.lower() == 'true', default=False, help="Detect ligand bonds by distance")
+    args = parser.parse_args()
+    return args
 
 if __name__ == "__main__":
     # _ = test_sample_molecule_given_graph()
-    def parse_args():
-        parser = argparse.ArgumentParser(description="Protein-Ligand Graph Encoder")
-        parser.add_argument("--protein_source", required=True, help="Protein file or directory with input PDB files")
-        parser.add_argument("--ligand_source", required=True, help="Ligand file or directory of ligand files")
-        parser.add_argument("--graph_dir", required=True, help="Optional output directory for saving graphs")
-        parser.add_argument("--output_dir", required=True, help="Output directory for saving generated molecules and copied pockets")
-        parser.add_argument("--ckpt_path",  default="/cluster/work/math/pbaertschi/molecular-diffusion/training_runs/RM_COM_DiffSBDD_config_1029_091048_datasets/dataset_pdbbind_train/checkpoint_epoch_580.pt")
-        parser.add_argument("--n_samples", type=int, default=20, help="Number of samples")
-        # parser.add_argument("--detect_lig_bonds_by_distance", type=lambda x: x.lower() == 'true', default=False, help="Detect ligand bonds by distance")
-        args = parser.parse_args()
-        return args
 
-    # instantiate parser
+    # --------------------------
+    # Parse arguments
+    # --------------------------
     args = parse_args()
     print(f"Using args: {args}")
 
-    # instantiate encoder
-    encoder = ProteinGraphEncoder(granularity="residue-level-fully-connected")
+    # --------------------------
+    # Instantiate encoder
+    # --------------------------
+    encoder = ProteinGraphEncoder(
+        granularity="residue-level-fully-connected"
+    )
 
-    # get protein ligand pairs and check if already encoded
-    protein_ligand_pairs = find_protein_ligand_pairs(args.protein_source, args.ligand_source)
-    # find pt files in graph dir
-    encoded_graphs = set([f.replace(".pt", "") for f in os.listdir(args.graph_dir) if f.endswith(".pt")])
-    protein_ligand_pairs = [pair for pair in protein_ligand_pairs if pair[0].split("/")[-1].replace(".pdb", "") not in encoded_graphs]
-    if len(protein_ligand_pairs) > 0:
+    # --------------------------
+    # List existing encoded graphs
+    # --------------------------
+    graph_dir = args.graph_dir
+    manifest_path = os.path.join(graph_dir, "fixed_processing_order_manifest.txt")
+
+    # Warning: All shards MUST see same folder structure
+    existing_pts = [
+        f.replace(".pt", "")
+        for f in os.listdir(graph_dir)
+        if f.endswith(".pt")
+    ]
+    existing_pts = sorted(np.unique(existing_pts))
+
+    # --------------------------
+    # Determine which protein-ligand pairs still need encoding
+    # --------------------------
+    protein_ligand_pairs = find_protein_ligand_pairs(
+        args.protein_source, args.ligand_source
+    )
+
+    missing_pairs = [
+        pair
+        for pair in protein_ligand_pairs
+        if pair[0].split("/")[-1].replace(".pdb", "") not in existing_pts
+    ]
+
+    # --------------------------
+    # Encode missing graphs (if any)
+    # --------------------------
+    if len(missing_pairs) > 0:
+        print(f"[INFO] Encoding {len(missing_pairs)} missing graph files...")
         encode_protein_ligand_pairs(
-            protein_ligand_pairs, 
-            encoder, 
-            args.graph_dir, 
-            True, 
-            False
+            missing_pairs,
+            encoder,
+            graph_dir,
+            detect_ligand_bonds=True,
+            remove_hydrogens=False,
         )
-        print("Encoded pdb files. Processing with sampling...")
+        print("[INFO] Finished encoding.")
     else:
-        print("All pbd files already encoded as graphs. Proceeding with sampling...")
+        print("[INFO] All PDB files already encoded.")
 
-    model = load_checkpoint(args.ckpt_path)
+    # --------------------------
+    # Create manifest file (AFTER encoding)
+    # --------------------------
+    if not os.path.exists(manifest_path):
+        print(f"[INFO] Creating manifest at: {manifest_path}")
+
+        pt_files = sorted([
+            os.path.join(graph_dir, f)
+            for f in os.listdir(graph_dir)
+            if f.endswith(".pt")
+        ])
+
+        with open(manifest_path, "w") as f:
+            for p in pt_files:
+                f.write(p + "\n")
+
+        print("[INFO] Manifest written.")
+    else:
+        print("[INFO] Found existing manifest:", manifest_path)
+
+    # --------------------------
+    # Load manifest consistently
+    # --------------------------
+    with open(manifest_path, "r") as f:
+        manifest_graph_paths = [line.strip() for line in f]
+
+    # Convert to graph codes
+    encoded_graphs = [
+        os.path.basename(p).replace(".pt", "")
+        for p in manifest_graph_paths
+    ]
+
+    print(f"[INFO] Total graphs found: {len(encoded_graphs)}")
+
+    # --------------------------
+    # Deterministic sharding
+    # --------------------------
+    chunks = np.array_split(encoded_graphs, args.n_jobs)
+    my_graphs = chunks[args.job_id]
+
+    print(f"[INFO][SHARD {args.job_id}] Assigned graphs: {len(my_graphs)}")
+
+    # --------------------------
+    # Load diffusion model
+    # --------------------------
+    print(f"[INFO] Loading checkpoint: {args.ckpt_path}")
+    for attempt in range(10):
+        try:
+            model = load_checkpoint(args.ckpt_path)
+            break
+        except Exception as e:
+            print(f"[WARN] CUDA init failed ({attempt+1}): {e}")
+    else:
+        raise RuntimeError("CUDA initialization failed after 10 attempts.")
+
     os.makedirs(args.output_dir, exist_ok=True)
-    print(encoded_graphs)
-    
-    for graph_code in encoded_graphs: 
-        print(f"Sampling {args.n_samples} Ligands for Pocket {graph_code}")
-        graph_path = f"{args.graph_dir}/{graph_code}.pt"
-        _ = sample_molecule_given_graph(
-            graph_path, 
-            model, 
-            output_dir=args.output_dir,
-            pocket_source=args.protein_source,
-            n_samples=args.n_samples,
-            num_steps=600,
-            schedule_type="exponential",
-            guidance_scale=0
-        )
+
+    # --------------------------
+    # MAIN SAMPLING LOOP
+    # --------------------------
+    for graph_code in my_graphs:
+        graph_path = os.path.join(graph_dir, f"{graph_code}.pt")
+
+        print(f"[SHARD {args.job_id}] Sampling for pocket: {graph_code}")
+
+        try:
+            _ = sample_molecule_given_graph(
+                graph_path=graph_path,
+                model=model,
+                output_dir=args.output_dir,
+                pocket_source=args.protein_source,
+                n_samples=args.n_samples,
+                num_steps=600,
+                schedule_type="exponential",
+                guidance_scale=0.0,
+            )
+
+        except Exception as e:
+            print(f"[ERROR][{graph_code}] {e}")
+            continue
+
+    print(f"[SHARD {args.job_id}] All assigned pockets processed.")
+

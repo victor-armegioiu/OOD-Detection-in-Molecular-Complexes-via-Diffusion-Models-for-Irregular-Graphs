@@ -97,6 +97,7 @@ CONFIG = {
     'eval_interval': 10,
     'num_eval_samples': 50,
     'early_stopping_patience': 50,
+    'weight_decay': 0,
     'cfg_training': False,
     'cfg_p_uncond': 0.0,
     'cfg_guidance_scale': 0,
@@ -210,6 +211,7 @@ def parse_arguments():
     parser.add_argument('--num_epochs', type=int, help='Number of training epochs')
     parser.add_argument('--eval_interval', type=int, help='Interval for evaluation')
     parser.add_argument('--early_stopping_patience', type=int, help='Patience for early stopping')
+    parser.add_argument('--weight_decay', type=float, help='Weight decay for AdamW optimizer')
     parser.add_argument('--use_scheduler', action='store_true', help='If the predefined learning rate scheduler should be used')
     parser.add_argument('--cfg_training', action='store_true', help='Enables classifier-free training')
     parser.add_argument('--cfg_p_uncond', type = float, help='Fraction of null residue training rounds')
@@ -306,6 +308,8 @@ def update_config_from_args(config: Dict, args) -> Dict:
         config['early_stopping_patience'] = args.early_stopping_patience
     if args.use_scheduler is not None:
         config['use_scheduler'] = args.use_scheduler
+    if args.weight_decay is not None: 
+        config['weight_decay'] = args.weight_decay
     if args.cfg_training is not None:
         config['cfg_training'] = args.cfg_training
     if args.cfg_p_uncond is not None:
@@ -468,7 +472,8 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
     # Setup optimizer
     optimizer = optim.AdamW(
         model.denoiser.parameters(),
-        lr=config['learning_rate'])
+        lr=config['learning_rate'], 
+        weight_decay=config['weight_decay'])
 
     # Setup scheduler
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.8) if config.get('use_scheduler', False) else None

@@ -101,6 +101,18 @@ def compute_discrete_distributions(smiles, name):
 
     return atom_distribution, bond_distribution
 
+# helper to flatten_distribution to make it compatible with PDBbind data
+def convert2int(s: str) -> int:
+    if isinstance(s, int):
+        return s
+    if s.isdigit():
+        # numeric-only → normal int
+        return int(s)
+    else:
+        # alphanumeric → base-36 int conversion
+        return int(s.lower(), 36)
+
+
 
 def flatten_distribution(data, name, table):
     aux = ['sample', 'sdf_file', 'pdb_file']
@@ -108,7 +120,7 @@ def flatten_distribution(data, name, table):
 
     sdf2sample2size = defaultdict(dict)
     for _, row in table.iterrows():
-        sdf2sample2size[row['sdf_file']][int(row['sample'])] = row['medchem.size']
+        sdf2sample2size[row['sdf_file']][convert2int(row['sample'])] = row['medchem.size']
 
     for item in tqdm(data, desc=name):
         if item['medchem.valid'] is not True:
@@ -120,7 +132,7 @@ def flatten_distribution(data, name, table):
         new_entries = {}
         for key, value in item.items():
             if key.startswith('interactions'):
-                size = sdf2sample2size.get(item['sdf_file'], dict()).get(int(item['sample']))
+                size = sdf2sample2size.get(item['sdf_file'], dict()).get(convert2int(item['sample']))
                 if size is not None:
                     new_entries[key + '.normalized'] = value / size
         item.update(new_entries)
@@ -168,6 +180,8 @@ if __name__ == '__main__':
     p.add_argument('--reference_smiles', type=str, default=None, help='Path to the .npy file with reference SMILES (optional)')
     p.add_argument('--trainingPDB_dir', type=str, required=False, default=None, help='trainingPDB data dir for computing distances between distributions')
     args = p.parse_args()
+
+
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
@@ -253,8 +267,16 @@ if __name__ == '__main__':
         ], key=lambda t: t[1], reverse=True)[:5]
         top_5_angles = [t[0] for t in angles]
 
+        print(top_5_bonds, top_5_angles)
+
         # Loading distributions of samples
         distributions, discrete_distributions = prepare_baseline_data(args.out_dir, 'samples')
+
+        # For debugging: save sample distributions
+        with open(Path(args.out_dir, 'samples_distributions.pkl'), 'wb') as f:
+            pickle.dump(distributions, f)
+        with open(Path(args.out_dir, 'samples_discrete_distributions.pkl'), 'wb') as f:
+            pickle.dump(discrete_distributions, f)
 
         # Computing distances between distributions
         distances = {'method': 'method',}

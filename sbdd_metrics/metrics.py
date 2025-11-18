@@ -784,7 +784,7 @@ class FullEvaluator(AbstractEvaluator):
 
 class AbstractCollectionEvaluator:
     ID = None
-    def __call__(self, smiles: Collection[str], timeout=300):
+    def __call__(self, smiles: Collection[str], timeout=3000):
         """
         Args:
             smiles (Collection[smiles]): input list of SMILES

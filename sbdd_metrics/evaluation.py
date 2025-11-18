@@ -145,20 +145,37 @@ def evaluate_model_subdir(
     Computes per-molecule metrics for a single directory of samples for one target
     """
     results = []
-    valid_files = [
-        int(fname.split('_')[0])
-        for fname in os.listdir(in_dir)
-        if fname.endswith('_ligand.sdf') and not fname.startswith('.')
-    ]
+    try: 
+        valid_files = [
+            int(fname.split('_')[0])
+            for fname in os.listdir(in_dir)
+            if fname.endswith('_ligand.sdf') and not fname.startswith('.')
+        ]
+        upper_bound = max(valid_files) + 1
+        if n_samples is not None:
+            upper_bound = min(upper_bound, n_samples)
+        # if this fails we're dealing with a 
+    except ValueError:
+        valid_files = [
+            fname.split("_")[0]
+            for fname in os.listdir(in_dir) 
+            if fname.endswith("_ligand.sdf") and not fname.startswith(".")
+        ]
+        assert len(valid_files) == 1, f"Unknown case: Found files {valid_files}"
+        upper_bound = 1 # valid_files[0]
+        
+
+        
+
+
+    print(f"Found valid file prefixes: {','.join([str(item) for item in valid_files])} in {in_dir}")
     if len(valid_files) == 0:
         warnings.warn(f'No valid ligand files found in {in_dir}')
         return pd.DataFrame()
 
-    upper_bound = max(valid_files) + 1
-    if n_samples is not None:
-        upper_bound = min(upper_bound, n_samples)
+    iterator = range(upper_bound) if isinstance(valid_files[0], int) else valid_files
 
-    for i in tqdm(range(upper_bound), desc=desc, file=sys.stdout):
+    for i in tqdm(iterator, desc=desc, file=sys.stdout):
         in_mol = Path(in_dir, f'{i}_ligand.sdf')
         in_prot = Path(in_dir, f'{i}_pocket.pdb')
         res = evaluator(in_mol, in_prot)
@@ -187,9 +204,11 @@ def evaluate_model(
     total_number_of_subdirs = len([path for path in in_dir.glob("[!.]*") if os.path.isdir(path)])
     i = 0
 
-    # print(list(in_dir.glob("[!.]*")))
+    print(f'All valid directories found are: {list(in_dir.glob("[!.]*"))}')
     for subdir in in_dir.glob("[!.]*"):
+
         if not os.path.isdir(subdir):
+            print(f"{subdir} skipped due to non-existence")
             continue
 
         i += 1
