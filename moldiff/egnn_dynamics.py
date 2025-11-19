@@ -17,6 +17,8 @@ import math
 from typing import NamedTuple
 from torch_scatter import scatter_mean
 
+from moldiff.constants import atom_encoder
+
 
 def unsorted_segment_sum(data, segment_ids, num_segments, normalization_factor, aggregation_method: str):
     """Custom PyTorch op to replicate TensorFlow's `unsorted_segment_sum`.
@@ -584,7 +586,8 @@ class EGNNDynamics(nn.Module):
                  edge_cutoff_ligand=None, edge_cutoff_pocket=None, 
                  edge_cutoff_interaction=None,
                  reflection_equivariant=True, edge_embedding_dim=None,
-                 geometric_regularization=False, geom_loss_weight=0.1):
+                 geometric_regularization=False, geom_loss_weight=0.1, 
+                 virtual_nodes_present=False, virtual_nodes_edgecut_probability_threshold=0.5):
         super().__init__()
         self.edge_cutoff_l = edge_cutoff_ligand
         self.edge_cutoff_p = edge_cutoff_pocket
@@ -593,6 +596,8 @@ class EGNNDynamics(nn.Module):
         self.geometric_regularization = geometric_regularization
         self.geom_loss_weight = geom_loss_weight
         self.freeze_pocket_embeddings = freeze_pocket_embeddings
+        self.virtual_nodes_present = virtual_nodes_present 
+        self.virtual_nodes_edgecut_probability_threshold = virtual_nodes_edgecut_probability_threshold
 
         self.atom_encoder = nn.Sequential(
             nn.Linear(atom_nf, 2 * atom_nf),
@@ -702,9 +707,17 @@ class EGNNDynamics(nn.Module):
                 h_time = t[mask]
             h = torch.cat([h, h_time], dim=1)
 
+
         # get edges of a complete graph
         edges = self.get_edges(mask_atoms, mask_residues, x_atoms, x_residues)
         assert torch.all(mask[edges[0]] == mask[edges[1]])
+
+        # if virtual nodes are present, remove edges to/from them
+        if self.virtual_nodes_present:
+            edges = self.remove_edges_fromto_virtual_nodes(
+                h_atoms, edges, probability_threshold=self.virtual_nodes_edgecut_probability_threshold, virtual_atom_encoder_index=-1
+                ) # assuming last feature col is virtual for testing
+           
 
         # Get edge types
         if self.edge_nf > 0:
@@ -784,6 +797,30 @@ class EGNNDynamics(nn.Module):
         edges = torch.stack(torch.where(adj), dim=0)
 
         return edges
+
+    def remove_edges_fromto_virtual_nodes(self, h_atoms, edges, probability_threshold=0.5, virtual_atom_encoder_index=atom_encoder["NONE"]):
+        # print("Edges before:\n", edges)
+        # assess which nodes are virtual with probability > 0.5
+        atom_logits =  self.atom_decoder(h_atoms)
+        # print("Logits\n", atom_logits)
+        atom_probs = F.softmax(atom_logits, dim=-1)
+        # print("Probs\n", atom_probs)
+        virtual_atom_mask = atom_probs[:, virtual_atom_encoder_index] > probability_threshold
+        virtual_atom_indices = torch.where(virtual_atom_mask)[0]
+        # print("Virtual atom indices:\n", virtual_atom_indices)
+        # cut all egdes to/from virtual nodes
+        edges_wo_virtual = []
+        for from_node, to_node in edges.T:
+            if from_node in virtual_atom_indices or to_node in virtual_atom_indices:
+                continue
+            edges_wo_virtual.append([from_node, to_node])
+        edges = torch.tensor(edges_wo_virtual, device=edges.device).T 
+        # print("Edges after:\n", edges)
+        assert all(idx not in edges.flatten() for idx in virtual_atom_indices), "Detected virtual idx in edges"
+
+        return edges
+    
+
     
     def null_residue_forward(self, xh_atoms, t, mask_atoms, target_atoms=None ) -> torch.Tensor:
         """
@@ -1336,6 +1373,9 @@ def test_egnn_dynamics_conditional():
     n_dims = 3
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     joint_nf = 8
+    virtual_atoms_present = True
+    virtual_nodes_edgecut_probability_threshold=0.2 # for testing random embeddings, otherwise 0.5
+    # n_virtual_atoms = 2
     
     # Create test data
     total_lig_atoms = 8
@@ -1371,7 +1411,9 @@ def test_egnn_dynamics_conditional():
         tanh=True,
         attention=True,
         geometric_regularization=True,
-        geom_loss_weight=0.1
+        geom_loss_weight=0.1, 
+        virtual_nodes_present=virtual_atoms_present, 
+        virtual_nodes_edgecut_probability_threshold=virtual_nodes_edgecut_probability_threshold
     )
 
     model = ConditionalPreconditionedEGNNDynamics(model)
@@ -1484,6 +1526,6 @@ def test_egnn_dynamics_null_residues():
 
 
 if __name__ == "__main__":
-    test_egnn_dynamics()
+    # test_egnn_dynamics()
     test_egnn_dynamics_conditional()
-    test_egnn_dynamics_null_residues()
+    # test_egnn_dynamics_null_residues()
