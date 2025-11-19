@@ -9,6 +9,8 @@ import numpy as np
 from typing import Callable, Tuple, Optional, Protocol, NamedTuple
 from torch_scatter import scatter_mean
 
+from moldiff.constants import atom_encoder
+
 from moldiff.egnn_dynamics import EGNNDynamics, PreconditionedEGNNDynamics, ConditionalPreconditionedEGNNDynamics
 
 Tensor = torch.Tensor
@@ -680,6 +682,130 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
     def initialize(self):
         """Initialize model weights"""
         print(f"✅ Initialized ConditionalMolecularDenoisingModel with {sum(p.numel() for p in self.denoiser.parameters())} parameters")
+
+    def loss_fn(self, batch: dict):
+        """
+        CDCD-style loss function: noise embeddings, predict logits, use cross-entropy
+        """
+
+        # Extract molecular data
+        lig_coords = batch["ligand_coords"].to(self.device)
+        lig_features = batch["ligand_features"].to(self.device)  # One-hot features
+        pocket_coords = batch["pocket_coords"].to(self.device)
+        pocket_features = batch["pocket_features"].to(self.device)  # One-hot features
+        lig_mask = batch["ligand_mask"].to(self.device)
+        pocket_mask = batch["pocket_mask"].to(self.device)
+        batch_size = len(torch.unique(torch.cat([lig_mask, pocket_mask])))
+
+        print('Feature before virtual nodes:\n', lig_features.shape, '\n', lig_coords.shape)
+        # print values ligand one as example
+
+        print('Ligand feature sample before virtual nodes:\n', lig_features)
+        print('Ligand coords sample before virtual nodes:\n', lig_coords)
+        # Add virtual atoms if specified
+        if self.n_max_virtual_nodes > 0:
+            lig_coords, lig_features, lig_mask = self.add_virtual_nodes_to_ligand(
+                lig_coords,
+                lig_features, 
+                lig_mask
+            )
+
+        print('Ligand feature sample after virtual nodes:\n', lig_features)
+        print('Ligand coords sample after virtual nodes:\n', lig_coords)
+        print('Feature after virtual nodes:\n', lig_features.shape, '\n', lig_coords.shape)
+
+        # Get true atom/residue type indices for cross-entropy loss
+        true_atom_types = torch.argmax(lig_features, dim=-1)  # [N_lig] - indices
+        true_residue_types = torch.argmax(pocket_features, dim=-1)  # [N_pocket] - indices
+
+        # Convert one-hot to embeddings using encoders (DIFFERENTIABLE!)
+        lig_embeddings_clean = self.denoiser.atom_encoder(lig_features.float())  # [N_lig, joint_nf]
+        pocket_embeddings_clean = self.denoiser.residue_encoder(pocket_features.float())  # [N_pocket, joint_nf]
+
+        # Normalize embeddings (CDCD style)
+        lig_embeddings_clean = F.normalize(lig_embeddings_clean, dim=-1)
+        pocket_embeddings_clean = F.normalize(pocket_embeddings_clean, dim=-1)
+
+        # Normalize coordinates
+        lig_coords_norm = lig_coords / self.scheme.coord_norm
+        pocket_coords_norm = pocket_coords / self.scheme.coord_norm
+
+        lig_coords_centered, pocket_coords_centered, combined_mask = self._anchor_reference_frame(
+            lig_coords_norm, 
+            pocket_coords_norm, 
+            lig_mask, 
+            pocket_mask
+        )
+        
+        # Concatenate coordinates and embeddings (NOT one-hot!)
+        xh_lig_clean = torch.cat([lig_coords_centered, lig_embeddings_clean], dim=1)  # [N_lig, 3 + joint_nf]
+        xh_pocket_clean = torch.cat([pocket_coords_centered, pocket_embeddings_clean], dim=1)  # [N_pocket, 3 + joint_nf]
+
+        # Sample noise levels
+        sigma = self.noise_sampling(shape=(batch_size,))  # [batch_size]
+
+        xh_lig_noisy, xh_pocket_noisy = self._noise_clean_embeddings(
+            xh_lig_clean, 
+            xh_pocket_clean, 
+            combined_mask, 
+            lig_coords, 
+            sigma, 
+            lig_mask, 
+            pocket_mask
+        )
+
+        # Forward pass through denoiser - outputs coordinates + logits
+        # print('In train:')
+        # print('Sigma shape:', sigma.shape)
+        # print('xh_lig_noisy shape:', xh_lig_noisy.shape)
+        # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
+        # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
+        # print('lig_mask', lig_mask.shape)
+        # print('pocket_mask', pocket_mask.shape)
+
+        pred_output_lig, pred_output_pocket = self.denoiser(
+            xh_lig_noisy.to(self.device),
+            xh_pocket_noisy.to(self.device),
+            sigma.to(self.device) if hasattr(sigma, "to") else sigma,
+            lig_mask,
+            pocket_mask,
+            target_atoms=lig_coords_centered,
+            target_residues=pocket_coords_centered,
+        )
+
+        losses = self._calculate_loss_from_noisy_embeddings(
+            pred_output_lig, 
+            pred_output_pocket, 
+            sigma, 
+            lig_mask, 
+            pocket_mask, 
+            batch_size, 
+            xh_lig_clean, 
+            xh_pocket_clean, 
+            true_atom_types, 
+            true_residue_types
+        )
+
+        # Metrics
+        metrics = {
+            "loss": losses.total_loss.item(),
+            "coord_loss": losses.coord_loss.item(),
+            "categorical_loss": losses.categorical_loss.item(),
+            "coord_loss_ligand": losses.coord_loss_lig.item(),
+            "coord_loss_pocket": losses.coord_loss_pocket.item(),
+            "categorical_loss_ligand": losses.categorical_loss_lig.item(),
+            "categorical_loss_pocket": losses.categorical_loss_pocket.item(),
+            "geometric_loss_total": losses.geometric_loss.item(),
+            "avg_sigma": sigma.mean().item(),
+            "max_sigma": sigma.max().item(),
+            "coord_pred_scale": torch.cat([losses.pred_coords_lig, losses.pred_coords_pocket]).abs().mean().item(),
+            "atom_accuracy": (torch.argmax(losses.pred_logits_lig, dim=-1) == true_atom_types).float().mean().item(),
+            "residue_accuracy": (torch.argmax(losses.pred_logits_pocket, dim=-1) == true_residue_types).float().mean().item(),
+            # debugging and testing:
+            "pred_residue_coords": pred_output_pocket[:, :self.n_dims], # to double check that coords stay constant
+            "input_residue_coords": xh_pocket_noisy[:, :self.n_dims],
+        }
+        return losses.total_loss, metrics
     
     def null_residue_loss_fn(self, batch: dict):
         """
@@ -754,6 +880,53 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             "residue_accuracy": float("nan"),
         }
         return losses.total_loss, metrics
+
+    def add_virtual_nodes_to_ligand(
+        self,
+        lig_coords,
+        lig_features, 
+        lig_mask
+        ):
+
+        """Adds virtual nodes to the ligand structure for conditioning"""
+        # first we have to pad the lig_features if input doesn't support virtual nodes
+        if lig_features.shape[1] < self.atom_nf:
+            padding_size = self.atom_nf - lig_features.shape[1]
+            padding = torch.zeros((lig_features.shape[0], padding_size), device=self.device)
+            lig_features = torch.cat([lig_features, padding], dim=1)
+            print(f"Padded lig_features to match atom_nf for virtual nodes by size {padding_size}")
+
+
+        n_ligs = lig_mask.max().item() + 1  # assuming lig_mask is 0-indexed
+        # sample virtual nodes uniform in U(0, Nmax)
+        n_virtual_nodes_per_lig = torch.randint(0, self.n_max_virtual_nodes + 1, (n_ligs,), device=self.device)  # [n_ligs]
+        # add the virtual nodes to the features and the coordinates: use encoder for features and COM for coords
+        lig_coms = scatter_mean(lig_coords, lig_mask, dim=0) # get the center of mass of the ligands
+
+        extended_lig_coords = []
+        extended_lig_features = []
+        extended_lig_mask = []
+        for i in lig_mask.unique():
+            n_virtual = n_virtual_nodes_per_lig[i]
+            if n_virtual > 0:
+                # get the indices of the current ligand
+                lig_indices = (lig_mask == i).nonzero(as_tuple=True)[0]
+                
+                # create virtual node coordinates around the COM
+                virtual_coords = lig_coms[i].unsqueeze(0).repeat(n_virtual, 1)  # small random noise around COM
+                # create virtual node features as defined in the constants encoder
+                try: 
+                    virtual_features = F.one_hot(torch.ones(n_virtual, dtype=torch.long, device=self.device) * atom_encoder['NONE'])
+                except KeyError:
+                    raise KeyError(f"Atom type 'NONE' not found in atom_encoder: {atom_encoder}")
+                    
+                # append to ligand coords and features
+                extended_lig_coords.append(torch.cat([lig_coords[lig_indices], virtual_coords], dim=0))
+                extended_lig_features.append(torch.cat([lig_features[lig_indices], virtual_features], dim=0))
+                # update ligand mask
+                extended_lig_mask.append(torch.full((len(lig_indices) + n_virtual,), i, device=self.device, dtype=lig_mask.dtype))
+        
+        return torch.cat(extended_lig_coords, dim=0), torch.cat(extended_lig_features, dim=0), torch.cat(extended_lig_mask, dim=0)
     
     
     def _anchor_reference_frame(self, lig_coords_norm, pocket_coords_norm, lig_mask, pocket_mask):
@@ -996,8 +1169,9 @@ def test_conditional_molecular_diffusion():
     # Create test batch (all on CUDA)
     device = "cuda"
     batch_size = 2
-    atom_nf = 5
+    atom_nf = 10
     residue_nf = 7
+    n_max_virtual_nodes = 10
 
     batch = {
         "ligand_coords": torch.randn(8, 3, device=device),
@@ -1017,7 +1191,7 @@ def test_conditional_molecular_diffusion():
     scheme = MolecularDiffusion.create_variance_exploding(sigma=sigma_schedule, categorical_temperature=1.0)
 
     model = ConditionalMolecularDenoisingModel(
-        atom_nf=atom_nf, 
+        atom_nf=atom_nf + 1 if n_max_virtual_nodes > 0 else atom_nf,  # account for virtual node type, 
         residue_nf=residue_nf, 
         joint_nf=8, 
         hidden_nf=32, 
@@ -1025,7 +1199,8 @@ def test_conditional_molecular_diffusion():
         scheme=scheme, 
         update_pocket_coords = False,
         coord_loss_weight=2.0, 
-        categorical_loss_weight=1.0)
+        categorical_loss_weight=1.0,
+        n_max_virtual_nodes = n_max_virtual_nodes)
 
     model.initialize()
 
@@ -1047,13 +1222,13 @@ def test_conditional_molecular_diffusion():
     assert torch.allclose(metrics["pred_residue_coords"], batch["pocket_coords"], atol=1e6, rtol=1e5), \
         f"Pocket coord drift by network:\n Input: {batch['pocket_coords']} \n Output: {metrics['pred_residue_coords']}"
 
-    print(f"--- Testing null residue loss ---")
-    loss, metrics = model.null_residue_loss_fn(batch)
-    print(f"Total Loss: {loss.item():.4f}")
-    print(f"Coord Loss: {metrics['coord_loss']:.4f}")
-    print(f"Categorical Loss: {metrics['categorical_loss']:.4f}")
-    print(f"Sigma range: [{metrics['avg_sigma']:.3f}, {metrics['max_sigma']:.3f}]")
-    print(f"Coord prediction scale: {metrics['coord_pred_scale']:.3f}")
+    # print(f"--- Testing null residue loss ---")
+    # loss, metrics = model.null_residue_loss_fn(batch)
+    # print(f"Total Loss: {loss.item():.4f}")
+    # print(f"Coord Loss: {metrics['coord_loss']:.4f}")
+    # print(f"Categorical Loss: {metrics['categorical_loss']:.4f}")
+    # print(f"Sigma range: [{metrics['avg_sigma']:.3f}, {metrics['max_sigma']:.3f}]")
+    # print(f"Coord prediction scale: {metrics['coord_pred_scale']:.3f}")
 
 
 
