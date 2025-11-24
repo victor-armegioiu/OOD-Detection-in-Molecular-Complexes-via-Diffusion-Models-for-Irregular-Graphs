@@ -737,7 +737,8 @@ class ConditionalMolecularSdeSampler(MolecularSdeSampler):
         n_dims: int = 3,
         atom_nf: int = 10,
         residue_nf: int = 20,
-        joint_nf: int = 16
+        joint_nf: int = 16, 
+        n_max_virtual_nodes: int = 0
     ):
         # initialize integrator that doesn't remove COM
         integrator = integrator or MolecularEulerMaruyama(
@@ -759,10 +760,14 @@ class ConditionalMolecularSdeSampler(MolecularSdeSampler):
             joint_nf=joint_nf,
             integrator=integrator
         )
-        # self._model
+        self.n_max_virtual_nodes = n_max_virtual_nodes
     
     def _create_initial_noisy_state(self) -> MolecularState:
         """Create initial noisy molecular state"""
+
+        if self.n_max_virtual_nodes > 0:
+            # add the virtual nodes that are expected to be removed in expectation to the size
+            self.ligand_sizes = torch.LongTensor(self.ligand_sizes, device=self.tspan.device) + self.n_max_virtual_nodes//2
         
         total_lig_atoms = sum(self.ligand_sizes)
         total_pocket_atoms = sum(self.pocket_sizes)
@@ -1150,7 +1155,8 @@ def create_molecular_sampler_from_model(
         n_dims=model.n_dims,
         atom_nf=model.atom_nf,
         residue_nf=model.residue_nf,
-        joint_nf=model.joint_nf
+        joint_nf=model.joint_nf, 
+        n_max_virtual_nodes=model.n_max_virtual_nodes
     )
     sampler._model = model
     
@@ -1259,7 +1265,9 @@ def test_conditional_molecular_samplers():
         joint_nf=8,
         hidden_nf=16,
         n_layers=1, 
-        update_pocket_coords=False
+        update_pocket_coords=False, 
+        n_max_virtual_nodes=12
+
     )
 
     model.initialize()

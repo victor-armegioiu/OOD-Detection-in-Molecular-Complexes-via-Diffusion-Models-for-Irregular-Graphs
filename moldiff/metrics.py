@@ -353,7 +353,7 @@ def evaluate_atom_aa_distributions(samples: list[Data]):
     # Divergence of atom distribution from training distribution
     ligand_features = samples['ligand_features'].cpu()
     atom_distribution = ligand_features.sum(dim=0)
-    training_atom_distribution = np.array([atom_freq_dist[atom] for atom in atom_decoder])
+    training_atom_distribution = np.array([atom_freq_dist[atom] for atom in atom_decoder if atom != "NONE"])
     atoms_dist_kl_divergence, atoms_dist_js_divergence = compare_distributions(atom_distribution.numpy(), training_atom_distribution)
 
     # Divergence of amino acid distribution from training distribution

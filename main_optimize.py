@@ -48,6 +48,8 @@ from moldiff.metrics import (
     build_mol_objects
 )
 
+from moldiff.constants import atom_encoder
+
 # Try to import optuna for Bayesian optimization
 try:
     import optuna
@@ -717,6 +719,29 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
                     schedule_type=config['schedule_type'],
                     num_samples=config['num_eval_samples']
                     )
+
+            # postprocess samples if virtual nodes are present
+            if config['n_max_virtual_nodes'] > 0:
+                # get indices of virtual atoms
+                no_virtual_atom_mask = torch.argmax(samples["ligand_features"], dim=-1) != atom_encoder["NONE"]
+                no_virtual_atom_idx = torch.where(no_virtual_atom_mask)[0]
+                # remove virtual atoms from samples
+                # for key in ["ligand_coords", "ligand_features", "ligand_mask"]:
+
+                samples["ligand_coords"] = samples["ligand_coords"][no_virtual_atom_idx, :]
+                samples["ligand_features"] = samples["ligand_features"][no_virtual_atom_idx, :-1] # correct one-hot encoding to pre-virtual node frame work
+                samples["ligand_mask"] = samples["ligand_mask"][no_virtual_atom_idx]
+
+
+                # calculate some virtual atom statistics
+                # print("Virtual Atom Mask:\n", no_virtual_atom_mask, "\n", ~no_virtual_atom_mask)
+                avg_number_removed_virtual_atoms = (~no_virtual_atom_mask).sum().item() / (samples["ligand_mask"].max() + 1).item()
+                avg_fraction_removed_virtual_atoms = (~no_virtual_atom_mask).float().mean().item()
+
+
+
+
+
             distribution_losses = evaluate_atom_aa_distributions(samples)
             eval_losses.update(distribution_losses)
 
@@ -743,6 +768,10 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
                 'ring_size_dist_kl_divergence': integrity_data['ring_size_dist_kl_divergence'],
                 'ring_size_dist_js_divergence': integrity_data['ring_size_dist_js_divergence'],
             }
+
+            if config['n_max_virtual_nodes'] > 0:
+                integrity_losses["avg_removed_virtual_atoms"] = avg_number_removed_virtual_atoms
+                integrity_losses["avg_fraction_of_atoms_removed"] = avg_fraction_removed_virtual_atoms
 
             eval_losses.update(integrity_losses)
             log("Eval losses:")

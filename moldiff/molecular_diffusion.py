@@ -697,22 +697,26 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         pocket_mask = batch["pocket_mask"].to(self.device)
         batch_size = len(torch.unique(torch.cat([lig_mask, pocket_mask])))
 
-        print('Feature before virtual nodes:\n', lig_features.shape, '\n', lig_coords.shape)
-        # print values ligand one as example
+        # print('Feature before virtual nodes:\n', lig_features.shape, '\n', lig_coords.shape)
+        # # print values ligand one as example
 
-        print('Ligand feature sample before virtual nodes:\n', lig_features)
-        print('Ligand coords sample before virtual nodes:\n', lig_coords)
+        # print('Ligand feature sample before virtual nodes:\n', lig_features)
+        # print('Ligand coords sample before virtual nodes:\n', lig_coords)
         # Add virtual atoms if specified
         if self.n_max_virtual_nodes > 0:
-            lig_coords, lig_features, lig_mask = self.add_virtual_nodes_to_ligand(
+            lig_coords, lig_features, lig_mask, virtual_node_mask = self.add_virtual_nodes_to_ligand(
                 lig_coords,
                 lig_features, 
                 lig_mask
             )
 
-        print('Ligand feature sample after virtual nodes:\n', lig_features)
-        print('Ligand coords sample after virtual nodes:\n', lig_coords)
-        print('Feature after virtual nodes:\n', lig_features.shape, '\n', lig_coords.shape)
+        else: 
+            virtual_node_mask = torch.zeros(len(lig_mask), dtype=torch.bool, device=self.device)
+
+        # print(virtual_node_mask)
+        # print('Ligand feature sample after virtual nodes:\n', lig_features)
+        # print('Ligand coords sample after virtual nodes:\n', lig_coords)
+        # print('Feature after virtual nodes:\n', lig_features.shape, '\n', lig_coords.shape)
 
         # Get true atom/residue type indices for cross-entropy loss
         true_atom_types = torch.argmax(lig_features, dim=-1)  # [N_lig] - indices
@@ -751,7 +755,8 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             lig_coords, 
             sigma, 
             lig_mask, 
-            pocket_mask
+            pocket_mask, 
+            virtual_node_mask
         )
 
         # Forward pass through denoiser - outputs coordinates + logits
@@ -773,7 +778,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             target_residues=pocket_coords_centered,
         )
 
-        losses = self._calculate_loss_from_noisy_embeddings(
+        losses = self._calculate_loss_from_noisy_embeddings_cond(
             pred_output_lig, 
             pred_output_pocket, 
             sigma, 
@@ -783,7 +788,8 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             xh_lig_clean, 
             xh_pocket_clean, 
             true_atom_types, 
-            true_residue_types
+            true_residue_types, 
+            virtual_node_mask
         )
 
         # Metrics
@@ -881,6 +887,125 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         }
         return losses.total_loss, metrics
 
+
+    def eval_fn(self, batch: dict) -> dict:
+        """Evaluate denoising at multiple noise levels with proper loss breakdown"""
+
+        # Extract data
+        lig_coords = batch["ligand_coords"].to(self.device)
+        lig_features = batch["ligand_features"].to(self.device)  # One-hot features
+        pocket_coords = batch["pocket_coords"].to(self.device)
+        pocket_features = batch["pocket_features"].to(self.device)  # One-hot features
+        lig_mask = batch["ligand_mask"].to(self.device)
+        pocket_mask = batch["pocket_mask"].to(self.device)
+        batch_size = batch["batch_size"]
+
+
+        # add virtual nodes    
+        if self.n_max_virtual_nodes > 0:
+            lig_coords, lig_features, lig_mask, virtual_node_mask = self.add_virtual_nodes_to_ligand(
+                lig_coords,
+                lig_features, 
+                lig_mask
+            )
+
+        else: 
+            virtual_node_mask = torch.zeros(len(lig_mask), dtype=torch.bool, device=self.device)
+
+        # Get true categories for evaluation
+        true_atom_types = torch.argmax(lig_features, dim=-1)
+        true_residue_types = torch.argmax(pocket_features, dim=-1)
+
+        # Cache training quantiles.
+        if not hasattr(self, "_cached_sigma_levels"):
+            training_sigmas = self.noise_sampling(shape=(10000,))
+            sigma_levels = torch.quantile(training_sigmas, torch.tensor([0.1, 0.3, 0.5, 0.7, 0.9], device=self.device))
+            object.__setattr__(self, "_cached_sigma_levels", sigma_levels)
+        else:
+            sigma_levels = self._cached_sigma_levels
+
+        eval_losses = {}
+
+        for i, sigma_val in enumerate(sigma_levels):
+            # Convert one-hot to embeddings (same as training)
+            lig_embeddings_clean = self.denoiser.atom_encoder(lig_features.float())
+            pocket_embeddings_clean = self.denoiser.residue_encoder(pocket_features.float())
+
+            # Normalize embeddings (CDCD style)
+            lig_embeddings_clean = F.normalize(lig_embeddings_clean, dim=-1)
+            pocket_embeddings_clean = F.normalize(pocket_embeddings_clean, dim=-1)
+
+            # Normalize coordinates
+            lig_coords_norm = lig_coords / self.scheme.coord_norm
+            pocket_coords_norm = pocket_coords / self.scheme.coord_norm
+
+            lig_coords_centered, pocket_coords_centered, combined_mask = self._anchor_reference_frame(
+                lig_coords_norm, 
+                pocket_coords_norm, 
+                lig_mask, 
+                pocket_mask
+            )
+
+            # Concatenate coordinates and embeddings (NOT one-hot!)
+            xh_lig_clean = torch.cat([lig_coords_centered, lig_embeddings_clean], dim=1)
+            xh_pocket_clean = torch.cat([pocket_coords_centered, pocket_embeddings_clean], dim=1)
+
+            # Create sigma tensor for this evaluation (broadcast to batch_size)
+            sigma_batch = torch.full((batch_size, ), sigma_val, device = self.device)
+
+            xh_lig_noisy, xh_pocket_noisy = self._noise_clean_embeddings(
+                xh_lig_clean, 
+                xh_pocket_clean, 
+                combined_mask, 
+                lig_coords, 
+                sigma_batch, 
+                lig_mask, 
+                pocket_mask, 
+                virtual_node_mask
+            )
+
+
+
+            # print('In eval:')
+            # print('Noise level:', i, sigma_val)
+            # print('Sigma shape:', sigma_batch.shape)
+            # print('xh_lig_noisy shape:', xh_lig_noisy.shape)
+            # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
+            # print('xh_pocket_noisy shape:', xh_pocket_noisy.shape)
+            # print('lig_mask', lig_mask.shape)
+            # print('pocket_mask', pocket_mask.shape)
+
+            # Denoise
+            with torch.no_grad():
+                pred_output_lig, pred_output_pocket = self.denoiser(xh_lig_noisy, xh_pocket_noisy, sigma_batch, lig_mask, pocket_mask)
+
+            losses = self._calculate_loss_from_noisy_embeddings_cond(
+                pred_output_lig, 
+                pred_output_pocket, 
+                sigma_batch, 
+                lig_mask, 
+                pocket_mask, 
+                batch_size, 
+                xh_lig_clean, 
+                xh_pocket_clean, 
+                true_atom_types,
+                true_residue_types,
+                virtual_node_mask
+            )
+
+            # Accuracy metrics
+            atom_accuracy = (torch.argmax(losses.pred_logits_lig, dim=-1) == true_atom_types).float().mean()
+            residue_accuracy = (torch.argmax(losses.pred_logits_pocket, dim=-1) == true_residue_types).float().mean()
+
+            eval_losses[f"coord_loss_lvl{i}"] = losses.coord_loss.item()
+            eval_losses[f"categorical_loss_lvl{i}"] = losses.categorical_loss.item()
+            eval_losses[f"total_loss_lvl{i}"] = losses.coord_loss.item() + losses.categorical_loss.item()
+            eval_losses[f"atom_accuracy_lvl{i}"] = atom_accuracy.item()
+            eval_losses[f"residue_accuracy_lvl{i}"] = residue_accuracy.item()
+            eval_losses[f"avg_number_of_predicted_virtual_nodes"] = (sum(virtual_node_mask) / len(lig_mask)).item()
+
+        return eval_losses
+    
     def add_virtual_nodes_to_ligand(
         self,
         lig_coords,
@@ -894,7 +1019,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             padding_size = self.atom_nf - lig_features.shape[1]
             padding = torch.zeros((lig_features.shape[0], padding_size), device=self.device)
             lig_features = torch.cat([lig_features, padding], dim=1)
-            print(f"Padded lig_features to match atom_nf for virtual nodes by size {padding_size}")
+            # print(f"Padded lig_features to match atom_nf for virtual nodes by size {padding_size}")
 
 
         n_ligs = lig_mask.max().item() + 1  # assuming lig_mask is 0-indexed
@@ -906,6 +1031,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         extended_lig_coords = []
         extended_lig_features = []
         extended_lig_mask = []
+        virtual_node_mask =[]
         for i in lig_mask.unique():
             n_virtual = n_virtual_nodes_per_lig[i]
             if n_virtual > 0:
@@ -925,8 +1051,14 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
                 extended_lig_features.append(torch.cat([lig_features[lig_indices], virtual_features], dim=0))
                 # update ligand mask
                 extended_lig_mask.append(torch.full((len(lig_indices) + n_virtual,), i, device=self.device, dtype=lig_mask.dtype))
+                # update virtual node mask
+                virtual_node_mask.append(torch.cat([
+                    torch.zeros(len(lig_indices), dtype=torch.bool, device=self.device), 
+                    torch.ones(n_virtual, dtype=torch.bool, device=self.device)
+                    ]))
+                
         
-        return torch.cat(extended_lig_coords, dim=0), torch.cat(extended_lig_features, dim=0), torch.cat(extended_lig_mask, dim=0)
+        return torch.cat(extended_lig_coords, dim=0), torch.cat(extended_lig_features, dim=0), torch.cat(extended_lig_mask, dim=0), torch.cat(virtual_node_mask, dim=0)
     
     
     def _anchor_reference_frame(self, lig_coords_norm, pocket_coords_norm, lig_mask, pocket_mask):
@@ -945,7 +1077,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
 
 
 
-    def _noise_clean_embeddings(self, xh_lig_clean, xh_pocket_clean, combined_mask, lig_coords, sigma, lig_mask, pocket_mask) -> Tuple:
+    def _noise_clean_embeddings(self, xh_lig_clean, xh_pocket_clean, combined_mask, lig_coords, sigma, lig_mask, pocket_mask, virtual_node_mask) -> Tuple:
     
         # Generate Gaussian noise for the entire state
         noise_lig = torch.randn_like(xh_lig_clean, device=self.device)
@@ -956,6 +1088,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         # sigma_expanded_pocket = sigma[pocket_mask].unsqueeze(1)  # [N_pocket, 1]
 
         xh_lig_noisy = xh_lig_clean + sigma_expanded_lig * noise_lig
+        xh_lig_noisy[virtual_node_mask] = xh_lig_clean[virtual_node_mask] # virtual nodes should remain unnoised
         xh_pocket_noisy = xh_pocket_clean.clone() # in pocket conditioning only embeddings are noised
         # xh_pocket_noisy[:, self.n_dims:] = xh_pocket_clean[:, self.n_dims:] + sigma_expanded_pocket * embedding_noise_pocket
 
@@ -964,7 +1097,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
 
         return xh_lig_noisy, xh_pocket_noisy
     
-    def _calculate_loss_from_noisy_embeddings(
+    def _calculate_loss_from_noisy_embeddings_cond(
             self, 
             pred_output_lig, 
             pred_output_pocket, 
@@ -975,7 +1108,8 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             xh_lig_clean, 
             xh_pocket_clean, 
             true_atom_types, 
-            true_residue_types
+            true_residue_types, 
+            virtual_node_mask
 
     ) -> MolecularLossResults:
         
@@ -996,11 +1130,11 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         weights_lig = weights[lig_mask].unsqueeze(1)  # [N_lig, 1]
         # weights_pocket = weights[pocket_mask].unsqueeze(1) 
 
-        # Coordinate loss: L2 between predicted and clean coordinates
-        clean_coords_lig = xh_lig_clean[:, : self.n_dims]
+        # Coordinate loss: L2 between predicted and clean coordinates, but excluding virtual nodes
+        clean_coords_lig = xh_lig_clean[:, :self.n_dims]
         # clean_coords_pocket = xh_pocket_clean[:, : self.n_dims]
 
-        coord_loss_lig = torch.mean(weights_lig * (pred_coords_lig - clean_coords_lig) ** 2)
+        coord_loss_lig = torch.mean(weights_lig[~virtual_node_mask, :] * (pred_coords_lig[~virtual_node_mask, :] - clean_coords_lig[~virtual_node_mask, :]) ** 2)
         coord_loss_pocket = torch.zeros_like(coord_loss_lig) # torch.mean(weights_pocket * (pred_coords_pocket - clean_coords_pocket) ** 2)
         coord_loss = coord_loss_lig + coord_loss_pocket
 
