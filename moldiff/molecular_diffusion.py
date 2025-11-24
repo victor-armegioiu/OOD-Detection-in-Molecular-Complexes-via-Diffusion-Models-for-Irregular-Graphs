@@ -995,6 +995,14 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
 
             # Accuracy metrics
             atom_accuracy = (torch.argmax(losses.pred_logits_lig, dim=-1) == true_atom_types).float().mean()
+            virtual_mask = (true_atom_types == true_atom_types.max())
+            virtual_atom_accuracy = (
+                ((torch.argmax(losses.pred_logits_lig, dim=-1)[virtual_mask] == true_atom_types[virtual_mask]).float().mean()
+                if virtual_mask.any()
+                else torch.tensor(0.0))
+            )
+
+
             residue_accuracy = (torch.argmax(losses.pred_logits_pocket, dim=-1) == true_residue_types).float().mean()
 
             eval_losses[f"coord_loss_lvl{i}"] = losses.coord_loss.item()
@@ -1002,18 +1010,43 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             eval_losses[f"total_loss_lvl{i}"] = losses.coord_loss.item() + losses.categorical_loss.item()
             eval_losses[f"atom_accuracy_lvl{i}"] = atom_accuracy.item()
             eval_losses[f"residue_accuracy_lvl{i}"] = residue_accuracy.item()
-            eval_losses[f"avg_number_of_predicted_virtual_nodes"] = (sum(virtual_node_mask) / len(lig_mask)).item()
+            eval_losses[f"avg_fraction_of_sampled_virtual_nodes_lvl{i}"] = virtual_node_mask.float().mean().item()
+            eval_losses[f"virtual_atom_accuracy_lvl{i}"] = virtual_atom_accuracy.item()
 
         return eval_losses
     
+
+
     def add_virtual_nodes_to_ligand(
         self,
         lig_coords,
         lig_features, 
         lig_mask
-        ):
+    ):
+        """
+        Adds virtual nodes (class NONE) to ligand data.
+        Virtual nodes:
+            - have class index = atom_nf - 1
+            - have one-hot of dimension atom_nf
+            - have coords at ligand COM
+            - have no edges (handled outside this function)
+            - are excluded from coordinate regression via masks
+        """
 
-        """Adds virtual nodes to the ligand structure for conditioning"""
+        # asserts:
+
+        # atom_encoder["NONE"] must point to the LAST class
+        assert atom_encoder["NONE"] == self.atom_nf - 1, (
+            f"Virtual class 'NONE' index must be atom_nf - 1 = {self.atom_nf - 1}, "
+            f"but got atom_encoder['NONE'] = {atom_encoder['NONE']}"
+        )
+
+        # lig_features must never exceed atom_nf columns
+        assert lig_features.shape[1] <= self.atom_nf, (
+            f"lig_features has too many feature dimensions ({lig_features.shape[1]}) "
+            f"vs atom_nf = {self.atom_nf}."
+        )
+        
         # first we have to pad the lig_features if input doesn't support virtual nodes
         if lig_features.shape[1] < self.atom_nf:
             padding_size = self.atom_nf - lig_features.shape[1]
@@ -1033,32 +1066,49 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         extended_lig_mask = []
         virtual_node_mask =[]
         for i in lig_mask.unique():
+            # get the number of virtual nodes to add
             n_virtual = n_virtual_nodes_per_lig[i]
+            # get the indices of the current ligand
+            lig_indices = (lig_mask == i).nonzero(as_tuple=True)[0]
             if n_virtual > 0:
-                # get the indices of the current ligand
-                lig_indices = (lig_mask == i).nonzero(as_tuple=True)[0]
-                
+                   
                 # create virtual node coordinates around the COM
                 virtual_coords = lig_coms[i].unsqueeze(0).repeat(n_virtual, 1)  # small random noise around COM
                 # create virtual node features as defined in the constants encoder
                 try: 
-                    virtual_features = F.one_hot(torch.ones(n_virtual, dtype=torch.long, device=self.device) * atom_encoder['NONE'])
+                    virtual_features = F.one_hot(
+                        torch.ones(n_virtual, dtype=torch.long, device=self.device) * atom_encoder['NONE'], 
+                        num_classes = self.atom_nf)
                 except KeyError:
                     raise KeyError(f"Atom type 'NONE' not found in atom_encoder: {atom_encoder}")
                     
                 # append to ligand coords and features
-                extended_lig_coords.append(torch.cat([lig_coords[lig_indices], virtual_coords], dim=0))
-                extended_lig_features.append(torch.cat([lig_features[lig_indices], virtual_features], dim=0))
-                # update ligand mask
-                extended_lig_mask.append(torch.full((len(lig_indices) + n_virtual,), i, device=self.device, dtype=lig_mask.dtype))
+                coords_i = torch.cat([lig_coords[lig_indices], virtual_coords], dim=0)
+                features_i = torch.cat([lig_features[lig_indices], virtual_features], dim=0)
                 # update virtual node mask
-                virtual_node_mask.append(torch.cat([
+                mask_i = torch.cat([
                     torch.zeros(len(lig_indices), dtype=torch.bool, device=self.device), 
                     torch.ones(n_virtual, dtype=torch.bool, device=self.device)
-                    ]))
+                    ])
+            else: 
+                # still append real atoms with no virtuals
+                coords_i = lig_coords[lig_indices]
+                features_i = lig_features[lig_indices]
+                mask_i = torch.zeros(len(lig_indices), dtype=torch.bool, device=self.device)
+
+            # update returned tensors
+            extended_lig_coords.append(coords_i)
+            extended_lig_features.append(features_i)
+            extended_lig_mask.append(torch.full((len(coords_i),), i, device=self.device))
+            virtual_node_mask.append(mask_i)
                 
         
-        return torch.cat(extended_lig_coords, dim=0), torch.cat(extended_lig_features, dim=0), torch.cat(extended_lig_mask, dim=0), torch.cat(virtual_node_mask, dim=0)
+        return (
+            torch.cat(extended_lig_coords, dim=0),  
+            torch.cat(extended_lig_features, dim=0), 
+            torch.cat(extended_lig_mask, dim=0), 
+            torch.cat(virtual_node_mask, dim=0)
+        )
     
     
     def _anchor_reference_frame(self, lig_coords_norm, pocket_coords_norm, lig_mask, pocket_mask):
@@ -1088,7 +1138,8 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         # sigma_expanded_pocket = sigma[pocket_mask].unsqueeze(1)  # [N_pocket, 1]
 
         xh_lig_noisy = xh_lig_clean + sigma_expanded_lig * noise_lig
-        xh_lig_noisy[virtual_node_mask] = xh_lig_clean[virtual_node_mask] # virtual nodes should remain unnoised
+        # virtual nodes coordinates should remain unnoised as they don't contribute to the regression goal
+        xh_lig_noisy[virtual_node_mask, :self.n_dims] = xh_lig_clean[virtual_node_mask, :self.n_dims] 
         xh_pocket_noisy = xh_pocket_clean.clone() # in pocket conditioning only embeddings are noised
         # xh_pocket_noisy[:, self.n_dims:] = xh_pocket_clean[:, self.n_dims:] + sigma_expanded_pocket * embedding_noise_pocket
 
