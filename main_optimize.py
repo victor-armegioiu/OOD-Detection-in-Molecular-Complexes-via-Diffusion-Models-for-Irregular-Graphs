@@ -91,6 +91,7 @@ CONFIG = {
     'edge_cutoff_interaction': 5,
     'reflection_equivariant': False,
     'n_max_virtual_nodes': 0,  # no virtual nodes is default
+    'virtual_nodes_edgecut_probability_threshold':0.5,
     
     # Training parameters
     'num_epochs': 500,
@@ -208,6 +209,7 @@ def parse_arguments():
     parser.add_argument('--edge_cutoff_interaction', type=float, help='Edge cutoff for interactions')
     parser.add_argument('--reflection_equivariant',  type=lambda x: x.lower() == "true", help='Use SE(3) equivariant model')
     parser.add_argument('--n_max_virtual_nodes', type=int, help='Maximum number of virtual nodes (0 to disable)')
+    parser.add_argument('--virtual_nodes_edgecut_probability_threshold', type=float, help='Probability required of being a virtual nodes to be cut off from the GNN graph')
     
     # Training parameters
     parser.add_argument('--learning_rate', type=float, help='Learning rate')
@@ -299,6 +301,8 @@ def update_config_from_args(config: Dict, args) -> Dict:
         config['reflection_equivariant'] = args.reflection_equivariant
     if args.n_max_virtual_nodes is not None:
         config['n_max_virtual_nodes'] = args.n_max_virtual_nodes
+    if args.virtual_nodes_edgecut_probability_threshold is not None:
+        config['virtual_nodes_edgecut_probability_threshold'] = args.virtual_nodes_edgecut_probability_threshold
     
     
     # Update training parameters
@@ -895,6 +899,8 @@ def save_checkpoint(model: MolecularDenoisingModel, config: Dict, save_path: Non
             'edge_cutoff_pocket': model.edge_cutoff_pocket, 
             'edge_cutoff_interaction': model.edge_cutoff_interaction, 
             'reflection_equivariant': model.reflection_equivariant,
+            'n_max_virtual_nodes': model.n_max_virtual_nodes,  
+            'virtual_nodes_edgecut_probability_threshold':model.virtual_nodes_edgecut_probability_threshold,
             'scheme_params': {
                 'coord_norm': model.scheme.coord_norm,
                 'feature_norm': model.scheme.feature_norm,

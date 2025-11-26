@@ -288,6 +288,7 @@ class MolecularDenoisingModel:
 
     # Virtual Nodes for conditional sampling
     n_max_virtual_nodes: int = 0  # number of virtual nodes to add to pocket, 0 means no virtual nodes
+    virtual_nodes_edgecut_probability_threshold: float = 0.5
 
     # # Whether to condition on pocket structure or train on complex jointly
     # pocket_conditioning: bool = False  # Whether to condition on pocket structure (always True for now)
@@ -336,6 +337,9 @@ class MolecularDenoisingModel:
             edge_cutoff_pocket=self.edge_cutoff_pocket, 
             edge_cutoff_interaction=self.edge_cutoff_interaction,
             reflection_equivariant=self.reflection_equivariant,    # False would be SE(3) we're thus using E(3)
+            # virtual nodes framework
+            virtual_nodes_present=self.n_max_virtual_nodes > 0, 
+            virtual_nodes_edgecut_probability_threshold=self.virtual_nodes_edgecut_probability_threshold
         )
         # to inherit to conditional class
         if not self.update_pocket_coords: object.__setattr__(self, "egnn_dynamics_net", denoiser)
