@@ -51,6 +51,6 @@ for key in pkl_data2.keys():
 # ['geometry.C-H', 'geometry.C-C', 'geometry.C-N', 'geometry.C=C', 'geometry.H-N'] ['geometry.C-C-H', 'geometry.H-C-H', 'geometry.C-C=C', 'geometry.C-C-C', 'geometry.C-C-N']
 # 
 
-        
+
 
 

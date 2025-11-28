@@ -195,15 +195,15 @@ def parse_arguments():
     parser.add_argument('--hidden_nf', type=int, help='Hidden layer size')
     parser.add_argument('--n_layers', type=int, help='Number of EGNN layers')
     parser.add_argument('--edge_embedding_dim', type=int, help='Edge feature dimension')
-    parser.add_argument('--attention', action='store_true', help='Use attention mechanism')
-    parser.add_argument('--tanh', action='store_true', help='Use tanh activation')
+    parser.add_argument('--attention', type=lambda x: x.lower() == "true", help='Use attention mechanism')
+    parser.add_argument('--tanh',  type=lambda x: x.lower() == "true", help='Use tanh activation')
     parser.add_argument('--norm_constant', type=int, help='Normalization constant')
     parser.add_argument('--inv_sublayers', type=int, help='Number of invariant sublayers')
-    parser.add_argument('--sin_embedding', action='store_true', help='Use sinusoidal embeddings')
+    parser.add_argument('--sin_embedding',  type=lambda x: x.lower() == "true", help='Use sinusoidal embeddings')
     parser.add_argument('--edge_cutoff_ligand', type=float, help='Edge cutoff for ligand')
     parser.add_argument('--edge_cutoff_pocket', type=float, help='Edge cutoff for pocket')
     parser.add_argument('--edge_cutoff_interaction', type=float, help='Edge cutoff for interactions')
-    parser.add_argument('--not_reflection_equivariant', action='store_false', help='Use reflection equivariant model')
+    parser.add_argument('--reflection_equivariant',  type=lambda x: x.lower() == "true", help='Use SE(3) equivariant model')
     
     # Training parameters
     parser.add_argument('--learning_rate', type=float, help='Learning rate')
@@ -291,8 +291,8 @@ def update_config_from_args(config: Dict, args) -> Dict:
         config['edge_cutoff_pocket'] = args.edge_cutoff_pocket
     if args.edge_cutoff_interaction is not None:
         config['edge_cutoff_interaction'] = args.edge_cutoff_interaction
-    if args.not_reflection_equivariant is not None:
-        config['reflection_equivariant'] = args.not_reflection_equivariant
+    if args.reflection_equivariant is not None:
+        config['reflection_equivariant'] = args.reflection_equivariant
     
     
     # Update training parameters
@@ -438,7 +438,16 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         scheme=scheme,
         noise_sampling=noise_sampling,
         noise_weighting=noise_weighting, 
-        device=config["device"]
+        device=config["device"], 
+        attention=config['attention'], 
+        tanh=config['tanh'], 
+        norm_constant=config['norm_constant'],
+        inv_sublayers=config['inv_sublayers'],
+        sin_embedding=config['sin_embedding'],
+        edge_cutoff_ligand=config['edge_cutoff_ligand'],
+        edge_cutoff_pocket=config['edge_cutoff_pocket'], 
+        edge_cutoff_interaction=config['edge_cutoff_interaction'],
+        reflection_equivariant=config['reflection_equivariant']
     )
     
     model.initialize()
@@ -826,6 +835,9 @@ def evaluate_model(model: MolecularDenoisingModel, eval_data: List[Dict]) -> Dic
 
 def save_checkpoint(model: MolecularDenoisingModel, config: Dict, save_path: None, optimizer=None, scheduler=None, scaler=None, epoch=None, best_metrics=None):
     """Save model checkpoint with full reproducibility state"""
+        # Molecular structure parameters
+
+
     
     checkpoint = {
         'model_state_dict': model.denoiser.state_dict(),
@@ -839,6 +851,16 @@ def save_checkpoint(model: MolecularDenoisingModel, config: Dict, save_path: Non
             'n_layers': model.n_layers,
             'edge_embedding_dim': model.edge_embedding_dim,
             'update_pocket_coords': model.update_pocket_coords,
+            'freeze_pocket_embeddings': model.freeze_pocket_embeddings, 
+            'attention': model.attention, 
+            'tanh': model.tanh, 
+            'norm_constant': model.norm_constant,
+            'inv_sublayers': model.inv_sublayers, 
+            'sin_embedding': model.sin_embedding, 
+            'edge_cutoff_ligand': model.edge_cutoff_ligand, 
+            'edge_cutoff_pocket': model.edge_cutoff_pocket, 
+            'edge_cutoff_interaction': model.edge_cutoff_interaction, 
+            'reflection_equivariant': model.reflection_equivariant,
             'scheme_params': {
                 'coord_norm': model.scheme.coord_norm,
                 'feature_norm': model.scheme.feature_norm,

@@ -91,7 +91,17 @@ def load_checkpoint(checkpoint_path: str) -> MolecularDenoisingModel:
         update_pocket_coords=model_params['update_pocket_coords'],
         scheme=scheme,
         noise_sampling=noise_sampling,
-        noise_weighting=noise_weighting
+        noise_weighting=noise_weighting, 
+        freeze_pocket_embeddings=model_params['freeze_pocket_embeddings'],
+        attention=model_params['attention'],
+        tanh=model_params['tanh'],
+        norm_constant=model_params['norm_constant'],                  # this is probably handled independently by us
+        inv_sublayers=model_params['inv_sublayers'],                  # layers of the equivariant block
+        sin_embedding=model_params['sin_embedding'],             # sin embedding for distances
+        edge_cutoff_ligand=model_params['edge_cutoff_ligand'],  
+        edge_cutoff_pocket=model_params['edge_cutoff_pocket'],  
+        edge_cutoff_interaction=model_params['edge_cutoff_interaction'],
+        reflection_equivariant=model_params['reflection_equivariant']    # False would be SE(3) we're thus using E(3)
     )
     
     model.initialize()
