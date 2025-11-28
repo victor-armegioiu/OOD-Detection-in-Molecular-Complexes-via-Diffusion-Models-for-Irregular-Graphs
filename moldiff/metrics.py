@@ -101,7 +101,7 @@ def load_checkpoint(checkpoint_path: str) -> MolecularDenoisingModel:
         edge_cutoff_ligand=model_params['edge_cutoff_ligand'],  
         edge_cutoff_pocket=model_params['edge_cutoff_pocket'],  
         edge_cutoff_interaction=model_params['edge_cutoff_interaction'],
-        reflection_equivariant=model_params['reflection_equivariant']    # False would be SE(3) we're thus using E(3)
+        reflection_equivariant=model_params['reflection_equivariant'],    # False would be SE(3) we're thus using E(3)
         n_max_virtual_nodes=model_params['n_max_virtual_nodes'],  
         virtual_nodes_edgecut_probability_threshold=model_params['virtual_nodes_edgecut_probability_threshold'],
     )

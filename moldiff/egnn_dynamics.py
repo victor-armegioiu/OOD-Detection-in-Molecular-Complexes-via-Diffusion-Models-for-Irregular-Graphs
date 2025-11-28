@@ -712,11 +712,16 @@ class EGNNDynamics(nn.Module):
         edges = self.get_edges(mask_atoms, mask_residues, x_atoms, x_residues)
         assert torch.all(mask[edges[0]] == mask[edges[1]])
 
-        # if virtual nodes are present, remove edges to/from them
-        if self.virtual_nodes_present:
-            edges = self.remove_edges_fromto_virtual_nodes(
-                h_atoms, edges, probability_threshold=self.virtual_nodes_edgecut_probability_threshold, virtual_atom_encoder_index=-1
-                ) # assuming last feature col is virtual for testing
+        # if virtual nodes are present, remove edges to/from them: TODO decide wheter to prune edges at trainign time or not, but it doesn't make sense to do it base on probabilites predicted by the network itself
+        # if self.virtual_nodes_present:
+        #     edges = self.remove_edges_fromto_virtual_nodes(
+        #         h_atoms, edges, probability_threshold=self.virtual_nodes_edgecut_probability_threshold, virtual_atom_encoder_index=-1
+        #         ) # assuming last feature col is virtual for testing
+        # if self.training:
+        #     def remove_edges_fromto_virtual_nodes(self, virtual_mask, edges):
+        #         src, dst = edges
+        #         keep = ~(virtual_mask[src] | virtual_mask[dst])
+        #         return edges[:, keep]
            
 
         # Get edge types
