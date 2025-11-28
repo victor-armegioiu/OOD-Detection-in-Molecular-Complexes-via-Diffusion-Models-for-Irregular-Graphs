@@ -72,7 +72,7 @@ CONFIG = {
 
 
     # Model parameters
-    'atom_nf': 10,           
+    'atom_nf': 10,       # this remains the number of real atoms, no virtual none type!    
     'residue_nf': 21,         
     'n_dims': 3,             
     'n_layers': 6, # 4           
@@ -88,6 +88,7 @@ CONFIG = {
     'edge_cutoff_pocket': 5, 
     'edge_cutoff_interaction': 5,
     'reflection_equivariant': False,
+    'n_max_virtual_nodes': 0,  # no virtual nodes is default
     
     # Training parameters
     'num_epochs': 500,
@@ -204,6 +205,7 @@ def parse_arguments():
     parser.add_argument('--edge_cutoff_pocket', type=float, help='Edge cutoff for pocket')
     parser.add_argument('--edge_cutoff_interaction', type=float, help='Edge cutoff for interactions')
     parser.add_argument('--reflection_equivariant',  type=lambda x: x.lower() == "true", help='Use SE(3) equivariant model')
+    parser.add_argument('--n_max_virtual_nodes', type=int, help='Maximum number of virtual nodes (0 to disable)')
     
     # Training parameters
     parser.add_argument('--learning_rate', type=float, help='Learning rate')
@@ -293,6 +295,8 @@ def update_config_from_args(config: Dict, args) -> Dict:
         config['edge_cutoff_interaction'] = args.edge_cutoff_interaction
     if args.reflection_equivariant is not None:
         config['reflection_equivariant'] = args.reflection_equivariant
+    if args.n_max_virtual_nodes is not None:
+        config['n_max_virtual_nodes'] = args.n_max_virtual_nodes
     
     
     # Update training parameters
@@ -425,7 +429,7 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         noise_weighting=noise_weighting, 
         device=config["device"]
     ) if config['update_pocket_coords'] else ConditionalMolecularDenoisingModel(
-        atom_nf=config['atom_nf'],
+        atom_nf=config['atom_nf'] + 1 if config['n_max_virtual_nodes'] > 0 else config['atom_nf'], # increase embedding size if there are virtual nodes
         residue_nf=config['residue_nf'],
         n_dims=config['n_dims'],
         joint_nf=config['joint_nf'],
@@ -439,6 +443,7 @@ def create_molecular_model(config: Dict) -> MolecularDenoisingModel:
         noise_sampling=noise_sampling,
         noise_weighting=noise_weighting, 
         device=config["device"], 
+        n_max_virtual_nodes=config['n_max_virtual_nodes'], 
         attention=config['attention'], 
         tanh=config['tanh'], 
         norm_constant=config['norm_constant'],

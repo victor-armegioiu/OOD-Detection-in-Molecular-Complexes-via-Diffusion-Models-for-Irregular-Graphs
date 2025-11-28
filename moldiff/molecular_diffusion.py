@@ -284,6 +284,9 @@ class MolecularDenoisingModel:
     geom_loss_weight: float = 0.1
     device: str = DEVICE
 
+    # Virtual Nodes for conditional sampling
+    n_max_virtual_nodes: int = 0  # number of virtual nodes to add to pocket, 0 means no virtual nodes
+
     # # Whether to condition on pocket structure or train on complex jointly
     # pocket_conditioning: bool = False  # Whether to condition on pocket structure (always True for now)
 
@@ -662,22 +665,18 @@ class MolecularDenoisingModel:
 class ConditionalMolecularDenoisingModel(MolecularDenoisingModel): 
     
     def __post_init__(self):
-        """Initializes the noiser and denoiser components"""
+        """Initializes the noiser and denoiser components"""        
         super().__post_init__()
 
+        # check denoiser and attach to object
         assert not self.denoiser.egnn_dynamics.update_pocket_coords, \
         "Conditional Denoiser cannot be used with EGNN.update_pocket_coords = True"
 
-
         denoiser = ConditionalPreconditionedEGNNDynamics(self.egnn_dynamics_net)
-
-
         object.__setattr__(self, "denoiser", denoiser)
-        # TODO ask victor whether it even makes sense to freeze them (I would have to take from pretrained), 
-        # or if I can still learn them even though I don't freeze at all
-        # # freeze pocket encoder to lookup embeddings if using pocket conditioning
-        # for param in self.denoiser.residue_encoder.parameters():
-        #         param.requires_grad = False
+
+
+
     def initialize(self):
         """Initialize model weights"""
         print(f"✅ Initialized ConditionalMolecularDenoisingModel with {sum(p.numel() for p in self.denoiser.parameters())} parameters")
