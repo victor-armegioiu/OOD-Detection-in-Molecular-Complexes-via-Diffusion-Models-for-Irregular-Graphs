@@ -767,7 +767,7 @@ class ConditionalMolecularSdeSampler(MolecularSdeSampler):
 
         if self.n_max_virtual_nodes > 0:
             # add the virtual nodes that are expected to be removed in expectation to the size
-            self.ligand_sizes = torch.LongTensor(self.ligand_sizes, device=self.tspan.device) + self.n_max_virtual_nodes//2
+            self.ligand_sizes = torch.tensor(self.ligand_sizes, dtype=torch.long, device=self.tspan.device) + self.n_max_virtual_nodes//2
         
         total_lig_atoms = sum(self.ligand_sizes)
         total_pocket_atoms = sum(self.pocket_sizes)
