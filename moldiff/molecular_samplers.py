@@ -4,6 +4,7 @@ Molecular SDE Samplers
 Implements the same SDE sampling logic as the base framework but natively for molecular systems.
 Follows exact reverse SDE dynamics with automatic differentiation, all CUDA-optimized.
 """
+import wandb # remove after debug
 
 import torch
 import numpy as np
@@ -1044,6 +1045,20 @@ def create_molecular_denoiser_wrapper(
         # Convert logits to probabilities
         probs_lig = F.softmax(pred_logits_lig, dim=-1)             # [N_lig, atom_nf]
         # probs_pocket = F.softmax(pred_logits_pocket, dim=-1)       # [N_pocket, residue_nf]
+
+        # NOTE temporary debug
+        none_idx = -1 
+        p_none_mean = probs_lig[:, none_idx].mean().item()
+        p_none_max  = probs_lig[:, none_idx].max().item()
+
+        wandb.log(
+            {
+                "sampling/p_none_mean": p_none_mean,
+                "sampling/p_none_max":  p_none_max,
+                "sampling/sample_step_sigma": float(sigma if sigma.dim() == 0 else sigma[0]),
+            }
+        )
+
         
         # Get normalized embeddings from the model
         atom_embeddings = egnn_model.egnn_dynamics.atom_encoder(

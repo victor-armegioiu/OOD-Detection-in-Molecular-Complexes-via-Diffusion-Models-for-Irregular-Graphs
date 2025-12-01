@@ -1014,7 +1014,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             eval_losses[f"total_loss_lvl{i}"] = losses.coord_loss.item() + losses.categorical_loss.item()
             eval_losses[f"atom_accuracy_lvl{i}"] = atom_accuracy.item()
             eval_losses[f"residue_accuracy_lvl{i}"] = residue_accuracy.item()
-            eval_losses[f"avg_fraction_of_sampled_virtual_nodes_lvl{i}"] = virtual_node_mask.float().mean().item()
+            # eval_losses[f"avg_fraction_of_sampled_virtual_nodes_lvl{i}"] = virtual_node_mask.float().mean().item()
             eval_losses[f"virtual_atom_accuracy_lvl{i}"] = virtual_atom_accuracy.item()
 
         return eval_losses
