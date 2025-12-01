@@ -81,7 +81,7 @@ CONFIG = {
     'edge_embedding_dim': 32, # 64
     'attention': True, 
     'tanh': True, 
-    'norm_constant': 0,
+    'norm_constant': 1, # to avoid exploding losses
     'inv_sublayers': 2,
     'sin_embedding': False,
     'edge_cutoff_ligand': None,
