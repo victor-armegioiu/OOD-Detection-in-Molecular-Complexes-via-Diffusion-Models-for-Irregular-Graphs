@@ -1005,6 +1005,11 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
                 if virtual_mask.any()
                 else torch.tensor(0.0))
             )
+            virtual_atom_recall = (
+                virtual_mask[(torch.argmax(losses.pred_logits_lig, dim=-1) == true_atom_types.max())].float().mean()
+                 if virtual_mask.any() else torch.tensor(0.0)
+            )
+            
 
 
             residue_accuracy = (torch.argmax(losses.pred_logits_pocket, dim=-1) == true_residue_types).float().mean()
@@ -1016,6 +1021,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             eval_losses[f"residue_accuracy_lvl{i}"] = residue_accuracy.item()
             # eval_losses[f"avg_fraction_of_sampled_virtual_nodes_lvl{i}"] = virtual_node_mask.float().mean().item()
             eval_losses[f"virtual_atom_accuracy_lvl{i}"] = virtual_atom_accuracy.item()
+            eval_losses[f"virtual_atom_recall_lvl{i}"] = virtual_atom_recall.item()
 
         return eval_losses
     

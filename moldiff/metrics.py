@@ -346,16 +346,23 @@ def sample_molecules_conditionally(
 
 
 
-def evaluate_atom_aa_distributions(samples: list[Data]):
+def evaluate_atom_aa_distributions(samples: list[Data], n_max_virtual_atoms: None|int = None):
     """Evaluate the quality of sampled binding pockets
          - Jenson-Shannon divergence of atom distribution from training distribution
          - Jenson-Shannon divergence of amino acid distribution from training distribution
     """
 
+    if n_max_virtual_atoms is not None:
+        p_virtual = (n_max_virtual_atoms/2)/33.3 # expectation of the virtual uniform divided by mean ligand size -> E(virtual per avg lig)
+        # update the atom_freq_dist
+        atom_freq_dist_ = {atom: (1-p_virtual)*p for atom, p in atom_freq_dist.items()} | {"NONE": p_virtual}
+        training_atom_distribution = np.array([atom_freq_dist_[atom] for atom in atom_decoder])
+    else:
+        training_atom_distribution = np.array([atom_freq_dist[atom] for atom in atom_decoder if atom != "NONE"])
+    
     # Divergence of atom distribution from training distribution
     ligand_features = samples['ligand_features'].cpu()
     atom_distribution = ligand_features.sum(dim=0)
-    training_atom_distribution = np.array([atom_freq_dist[atom] for atom in atom_decoder if atom != "NONE"])
     atoms_dist_kl_divergence, atoms_dist_js_divergence = compare_distributions(atom_distribution.numpy(), training_atom_distribution)
 
     # Divergence of amino acid distribution from training distribution
