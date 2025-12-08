@@ -1047,17 +1047,17 @@ def create_molecular_denoiser_wrapper(
         # probs_pocket = F.softmax(pred_logits_pocket, dim=-1)       # [N_pocket, residue_nf]
 
         # NOTE temporary debug
-        none_idx = -1 
-        p_none_mean = probs_lig[:, none_idx].mean().item()
-        p_none_max  = probs_lig[:, none_idx].max().item()
+        # none_idx = -1 
+        # p_none_mean = probs_lig[:, none_idx].mean().item()
+        # p_none_max  = probs_lig[:, none_idx].max().item()
 
-        wandb.log(
-            {
-                "sampling/p_none_mean": p_none_mean,
-                "sampling/p_none_max":  p_none_max,
-                "sampling/sample_step_sigma": float(sigma if sigma.dim() == 0 else sigma[0]),
-            }
-        )
+        # wandb.log(
+        #     {
+        #         "sampling/p_none_mean": p_none_mean,
+        #         "sampling/p_none_max":  p_none_max,
+        #         "sampling/sample_step_sigma": float(sigma if sigma.dim() == 0 else sigma[0]),
+        #     }
+        # )
 
         
         # Get normalized embeddings from the model

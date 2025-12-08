@@ -728,7 +728,7 @@ def train_model(model: MolecularDenoisingModel | ConditionalMolecularDenoisingMo
             if config['n_max_virtual_nodes'] > 0:
                 
                 # assess distributions including virtuals
-                distribution_loss_virtual_ = evaluate_atom_aa_distributions(samples, n_max_virtual_nodes = config["n_max_virtual_nodes"])
+                distribution_loss_virtual_ = evaluate_atom_aa_distributions(samples, n_max_virtual_atoms = config["n_max_virtual_nodes"])
                 distribution_losses_virtual = {"atoms_wvirtual_dist_kl_divergence": distribution_loss_virtual_["atoms_dist_kl_divergence"], "atoms_wvirtual_dist_js_divergence": distribution_loss_virtual_["atoms_dist_js_divergence"]}
                 eval_losses.update(distribution_losses_virtual)
                 # get indices of virtual atoms

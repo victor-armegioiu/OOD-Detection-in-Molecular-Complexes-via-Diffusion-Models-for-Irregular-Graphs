@@ -711,7 +711,8 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             lig_coords, lig_features, lig_mask, virtual_node_mask = self.add_virtual_nodes_to_ligand(
                 lig_coords,
                 lig_features, 
-                lig_mask
+                lig_mask,
+                pocket_coords
             )
 
         else: 
@@ -910,7 +911,8 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             lig_coords, lig_features, lig_mask, virtual_node_mask = self.add_virtual_nodes_to_ligand(
                 lig_coords,
                 lig_features, 
-                lig_mask
+                lig_mask,
+                pocket_coords
             )
 
         else: 
@@ -1031,7 +1033,8 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         self,
         lig_coords,
         lig_features, 
-        lig_mask
+        lig_mask, 
+        pocket_coords
     ):
         """
         Adds virtual nodes (class NONE) to ligand data.
@@ -1081,9 +1084,20 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             # get the indices of the current ligand
             lig_indices = (lig_mask == i).nonzero(as_tuple=True)[0]
             if n_virtual > 0:
+
+                ############ experimental area #############
                    
                 # create virtual node coordinates around the COM
-                virtual_coords = lig_coms[i].unsqueeze(0).repeat(n_virtual, 1)  # small random noise around COM
+                # noise_control = 0.5
+                # virtual_coords_com = lig_coms[i].unsqueeze(0).repeat(n_virtual, 1) 
+                # virtual_coords = virtual_coords_com + noise_control * torch.randn_like(virtual_coords_com) # small random noise around COM
+
+                # steric clash simulation
+                virtual_coords = self._find_pocket_nodes_to_clash_with(lig_coms[i].unsqueeze(0), n_virtual, pocket_coords)
+
+
+                ############################################
+
                 # create virtual node features as defined in the constants encoder
                 try: 
                     virtual_features = F.one_hot(
@@ -1119,6 +1133,22 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             torch.cat(extended_lig_mask, dim=0), 
             torch.cat(virtual_node_mask, dim=0)
         )
+    
+    def _find_pocket_nodes_to_clash_with(self, com_lig, n_virtual_atoms, pocket_coords):
+        
+        assert com_lig.shape[1] == pocket_coords.shape[1]
+        # select the n_vritual_atom closest ca positions
+        # print("Lig COM and Pocket shape", com_lig.shape, pocket_coords.shape)
+        com_to_cas = torch.cdist(com_lig,pocket_coords).squeeze(0)
+        # print("Dist shape", com_to_cas.shape)
+        closest_ca_idx = torch.topk(com_to_cas, k=n_virtual_atoms, largest=False).indices
+        # print("Idx shape", closest_ca_idx.shape)
+        # calculate the distance to simlate a "crash"
+        distance_fraction_for_clash = 0.9
+        virtual_atom_positions = ((com_lig - pocket_coords[closest_ca_idx]) * distance_fraction_for_clash) + pocket_coords[closest_ca_idx]
+        # print(virtual_atom_positions.shape)
+
+        return virtual_atom_positions
     
     
     def _anchor_reference_frame(self, lig_coords_norm, pocket_coords_norm, lig_mask, pocket_mask):
