@@ -2,6 +2,7 @@ from pathlib import Path
 import subprocess
 import re
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pandas as pd
 from rdkit import Chem
@@ -10,6 +11,7 @@ import gemmi
 from posebusters.modules.intermolecular_distance import check_intermolecular_distance
 
 from tqdm import tqdm
+from typing import List, Dict
 
 def make_relative_path(path: Path, base: Path) -> Path:
     """
@@ -226,9 +228,6 @@ def build_all_dpocket_complexes(
 
 
 
-
-import os
-
 def run_dpocket_once(dpocket_input_path: Path, output_root: Path, prefix="dpout_all"):
     """
     Run dpocket only once and ensure the dpocket_input_path
@@ -278,16 +277,12 @@ def load_all_dpocket_descriptors(explicit_path: Path) -> pd.DataFrame:
 
     return df.set_index("pocket_id", drop=False)
 
-def evaluate_all_clashes_and_merge(
-    ours_root: Path,
-    dpocket_df: pd.DataFrame
-) -> pd.DataFrame:
+def evaluate_class_worker(pocket_dir: Path, dpocket_df: pd.DataFrame) -> List[Dict]:
+            
 
-    all_rows = []
-
-    for pocket_dir in tqdm(sorted(ours_root.iterdir())):
         if not pocket_dir.is_dir():
-            continue
+            print(f"[WARNING] returning None for {pocket_dir} with working directory {os.getcwd()}")
+            return 
 
         pocket_id = pocket_dir.name
 
@@ -298,10 +293,14 @@ def evaluate_all_clashes_and_merge(
         else:
             dp_desc = dpocket_df.loc[pocket_id].to_dict()
 
+        lig_rows = []
+
         # Evaluate all sample ligands
         for lig_file in sorted(pocket_dir.glob("*_ligand.sdf")):
+            # print(lig_file)
             m = re.match(r"(\d+)_ligand\.sdf", lig_file.name)
             if not m:
+                print(f"[WARN] Skipped {lig_file}: lacking regex match")
                 continue
             sample_idx = int(m.group(1))
             pocket_pdb = pocket_dir / f"{sample_idx}_pocket.pdb"
@@ -310,13 +309,17 @@ def evaluate_all_clashes_and_merge(
             pocket_mol = Chem.MolFromPDBFile(str(pocket_pdb), sanitize=False, removeHs=False)
 
             if ligand is None or pocket_mol is None:
+                print(f"[WARN] Skipped {lig_file}: failed ligand or pocket loading")
                 continue
 
             result = check_intermolecular_distance(mol_pred=ligand, mol_cond=pocket_mol)
             details = result["details"]
-            clashes = details[details["clash"]].copy()
+            clashes = details.copy() # details[details["clash"]].copy()
             if clashes.empty:
+                print(f"[INFO] No clashes detected in {lig_file}")
                 continue
+            else:
+                print(f"[INFO] Clash detected in {lig_file}")
 
             # annotate with gemmi
             atom_table = build_protein_atom_table_gemmi(pocket_pdb)
@@ -335,18 +338,34 @@ def evaluate_all_clashes_and_merge(
             if dp_desc is not None:
                 for k, v in dp_desc.items():
                     clashes[f"dpocket_{k}"] = v
+            
+            lig_rows.append(clashes)
+            
+        
+        return lig_rows
 
-            all_rows.append(clashes)
+def get_allowed_cpus(requested=None):
+    # CPUs granted by SLURM
+    total_cpus = os.cpu_count()
+    slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", total_cpus))
 
-    if not all_rows:
-        return pd.DataFrame()
+    if slurm_cpus is None:
+        raise RuntimeError("No CPUs available")
 
-    return pd.concat(all_rows, axis=0, ignore_index=True)
+    # Allow user to request fewer
+    if requested is None:
+        return slurm_cpus
+    
+    if requested > slurm_cpus:
+        print(f"[INFO] Number of parallel processes reduced to {slurm_cpus}")
+
+    return min(requested, slurm_cpus)
 
 def full_pipeline(
     ours_samples_root: Path,
     crossdocked_root: Path,
-    output_root: Path
+    output_root: Path, 
+    requested_workers: int|None = None # None uses max
 ):
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -371,25 +390,309 @@ def full_pipeline(
     # ---- Stage 3: load dpocket descriptor table ----
     dpocket_df = load_all_dpocket_descriptors(explicit_path)
 
-    # ---- Stage 4: evaluate all clashes ----
-    final_df = evaluate_all_clashes_and_merge(
-        ours_root=ours_samples_root,
-        dpocket_df=dpocket_df
-    )
+    # ---- Stage 4: evaluate all clashes in parellized ----
+    all_rows = []
+    pdb_paths = sorted(ours_samples_root.iterdir())
+    available_workers = get_allowed_cpus(requested_workers)
+        
+
+    with ProcessPoolExecutor(max_workers=available_workers) as pool:
+
+        futures = [pool.submit(evaluate_class_worker, p, dpocket_df) for p in pdb_paths]
+
+        for i, fut in tqdm(enumerate(as_completed(futures)), total=len(futures)):
+
+            try:
+                clash_result = fut.result()
+            except Exception as e:
+                print(f"[ERROR] processing path {pdb_paths[i]}:", e)
+            else:
+                all_rows.extend(clash_result)
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    final_df = pd.concat(all_rows, axis=0, ignore_index=True)
 
     final_df.to_csv(output_root / "full_clash_dpocket_merged.csv", index=False)
-    print("[OK] Final dataframe saved.")
+    print(f"[OK] Final dataframe saved in {output_root}.")
 
     return final_df
 
 
 
 if __name__ == "__main__":
+    # TODO increase dpocket radius so we're sure it detects entire pocket
+    # TODO filter the entries that fail earlier posebusters entry
     ours_root = Path("../benchmarks/ours/ours_samples/")
     crossdocked_root = Path("../benchmarks/processed_crossdocked/test/")
     out_root = Path("../benchmarks/processed_crossdocked/dpocket_test/")
 
-    final_df = full_pipeline(ours_root, crossdocked_root, out_root)
+    # final_df = full_pipeline(ours_root, crossdocked_root, out_root)
     # final_df.to_csv("clash_dpocket_annotated.csv", index=False)
-    print(final_df.head())
+    # print(final_df.head())
+
+    # develop the pipeline further by loading final df
+    final_df = pd.read_csv("../benchmarks/processed_crossdocked/dpocket_test/full_clash_dpocket_merged.csv")
+
+    # test whether final_df has invalid information
+
+    #######################################
+
+    # work on a copy if you want to be safe
+    df = final_df.copy()
+
+    def calc_means_classes(df, classes = ["protein_resname"]):
+        # ensure clash is boolean (it *should* already be)
+        df["clash"] = df["clash"].astype(bool)
+
+        # per-residue-class / resname stats
+        residue_stats = (
+            df
+            .groupby(classes)
+            .agg(
+                n_pairs      = ("clash", "size"),   # number of ligand–protein pairs
+                n_clashes    = ("clash", "sum"),    # number of pairs flagged as clash
+                clash_rate   = ("clash", "mean"),   # fraction of clashing pairs
+                mean_dist    = ("distance", "mean"),
+                mean_rel_dist= ("relative_distance", "mean"),
+                n_prot_atoms = ("protein_atom_id", "nunique"),
+                n_lig_atoms  = ("ligand_atom_id", "nunique"),
+            )
+            .sort_values(["clash_rate"], ascending=False)
+            # .sort_values(["protein_res_class", "clash_rate"], ascending=[True, False])
+        )
+
+        print(residue_stats.head(20))
+
+    def do_chi_and_cochran():
+        ## chi squared test ##
+        overall_clash_p = df["clash"].mean()
+        frequencies = (
+            df
+            .groupby(["protein_resname"])
+            .agg(
+                size = ("clash", "size"),
+                obs = ("clash", "sum") 
+            )
+        )
+        frequencies["exp"] = frequencies["size"] * overall_clash_p # TODO is this correct expected?
+        # print(frequencies)
+        from scipy.stats import chisquare
+        # https://docs.scipy.org/doc/scipy-1.16.1/reference/generated/scipy.stats.chisquare.html
+        test = chisquare(f_obs=frequencies["obs"].values, f_exp=frequencies["exp"].values) # TODO do I need to verify chi squ assumptions?
+        print(test)
+
+        ## cochrans q test ##
+        frequencies["none"] = frequencies["size"] - frequencies["obs"]
+
+        from statsmodels.stats.contingency_tables import cochrans_q
+        # https://www.statsmodels.org/dev/generated/statsmodels.stats.contingency_tables.cochrans_q.html
+        x = frequencies[["obs", "none"]].values.T
+        print(x.shape)
+        test2 = cochrans_q(frequencies[["obs", "none"]].values.T) # TODO is it okay that the classes are unevenly distirbuted?
+        print(test2)
+
+    ## anova and kruskal wallis ##
+    def kruskal_wallis_and_posthoc_dunn():
+        from scipy.stats import f_oneway, kruskal
+        # https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.f_oneway.html
+        # ANOVA assumes
+        # The samples are independent.
+        # Each sample is from a normally distributed population.
+        # The population standard deviations of the groups are all equal. This property is known as homoscedasticity.
+        # -> this is props not valid so we do KW
+
+        samples = [df[df["protein_resname"] == name]["relative_distance"].values for name in df["protein_resname"].unique()]
+        # test = f_oneway(*samples, equal_var = False)
+        test2 = kruskal(*samples)
+        print(test2)
+        # follow up KW with posthoc dunn
+        from scikit_posthocs import posthoc_dunn
+        # https://scikit-posthocs.readthedocs.io/en/latest/generated/scikit_posthocs.posthoc_dunn.html
+        test = posthoc_dunn(samples)
+        print(test)
+
+    ## learning to predict clashes ##
+    # prepare df -> explanatory vars
+    # categorical_columns = ["ligand_element", "protein_element", "protein_atom_name", "protein_resname", "protein_region", "protein_res_class", ]
+    # numerical_columns =  [f"dpocket_{s}" for s in ["pock_vol", "mean_as_solv_acc", "apol_as_prop", "mean_loc_hyd_dens", "hydrophobicity_score", "volume_score", "polarity_score", "charge_score", "flex", "prop_polar_atm", "as_density", "as_max_dst", "convex_hull_volume", "surf_pol_vdw14",	"surf_pol_vdw22",	"surf_apol_vdw14",	"surf_apol_vdw22",	"n_abpa"]]
+    # a subset for faster compute
+    categorical_columns = ["ligand_element", "protein_element", "protein_resname", "protein_region", "protein_res_class"]
+    numerical_columns =  [f"dpocket_{s}" for s in ["pock_vol", "mean_as_solv_acc"]]
+    # vars to be predicted
+    y_binary = "clash" # this is a bool
+    y_continuous = "relative_distance"
+
+    from sklearn.compose import ColumnTransformer
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+    from sklearn.linear_model import LogisticRegression, Lasso
+    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+    import pandas as pd
+    import numpy as np
+
+    # Preprocessor
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(), categorical_columns), # drop possible for logreg
+            ("num", MinMaxScaler(), numerical_columns),
+        ],
+        remainder="drop"
+    )
+
+    # # ---- BINARY TARGET ----
+    print("********** BINARY TARGET ****************")
+    X = df[categorical_columns + numerical_columns]
+    y_bin = df[y_binary].astype(int)
+    # print("P1")
+
+    log_reg = Pipeline([
+        ("prep", preprocessor),
+        ("clf", LogisticRegression(penalty="l1", solver="saga", max_iter=5000, n_jobs=-1))
+    ])
+    # print("P2")
+    rf_clf = Pipeline([
+        ("prep", preprocessor),
+        ("clf", RandomForestClassifier(n_estimators=300, random_state=0, n_jobs=-1))
+    ])
+    print("Start fitting binary LogReg")
+    log_reg.fit(X, y_bin)
+    print("Start fitting CLF RF")
+    rf_clf.fit(X, y_bin)
+
+    # Feature names after preprocessing
+    feat_names = (
+        log_reg.named_steps["prep"]
+        .get_feature_names_out()
+    )
+
+    # Coefficients (L1 logistic regression)
+    logreg_coefs = pd.Series(
+        log_reg.named_steps["clf"].coef_.ravel(),
+        index=feat_names
+    )
+
+    # RF feature importances
+    rf_clf_importances = pd.Series(
+        rf_clf.named_steps["clf"].feature_importances_,
+        index=feat_names
+    )
+
+    print("Random Forrest Feature Importances\n", rf_clf_importances)
+    print("===========================================================")
+    print("LogReg Coefficients\n", logreg_coefs)
+    
+    print("+++++++++++++++++++++++++++++++++++++++++++++")
+    print("********** CONTINUOUS TARGET ****************")
+    print("+++++++++++++++++++++++++++++++++++++++++++++")
+
+
+    # ---- CONTINUOUS TARGET ----
+    y_cont = df[y_continuous]
+
+    lasso_reg = Pipeline([
+        ("prep", preprocessor),
+        ("reg", Lasso(alpha=0.001, max_iter=5000))
+    ])
+
+    rf_reg = Pipeline([
+        ("prep", preprocessor),
+        ("reg", RandomForestRegressor(n_estimators=300, random_state=0))
+    ])
+
+    "Started fitting Regression"
+    lasso_reg.fit(X, y_cont)
+    "Started fitting RF Regression"
+    rf_reg.fit(X, y_cont)
+
+    # Coefficients (L1 regression)
+    lasso_coefs = pd.Series(
+        lasso_reg.named_steps["reg"].coef_,
+        index=feat_names
+    )
+
+    # RF regressor importances
+    rf_reg_importances = pd.Series(
+        rf_reg.named_steps["reg"].feature_importances_,
+        index=feat_names
+    )
+
+    print("Random Forrest Feature Importances\n", rf_reg_importances)
+    print("===========================================================")
+    print("LogReg Coefficients\n", lasso_coefs)
+
+
+
+
+    # import numpy as np
+    # def clash_matrix(
+    #     df: pd.DataFrame,
+    #     value: str = "clash",              # column to aggregate over
+    #     aggfunc = "mean",                  # e.g. "mean", "sum", "count"
+    #     protein_axis: str = "protein_element",  # or "protein_atom_name"
+    #     normalize: bool = False            # True -> row-normalize
+    # ) -> pd.DataFrame:
+    #     """
+    #     Build a ligand-type x protein-type matrix for clashes or any metric.
+    #     """
+    #     mat = df.pivot_table(
+    #         index="ligand_element",
+    #         columns=protein_axis,
+    #         values=value,
+    #         aggfunc=aggfunc,
+    #         fill_value=0.0,
+    #     )
+
+    #     if normalize:
+    #         # e.g. convert counts/sums into row-wise fractions
+    #         mat = mat.div(mat.sum(axis=1).replace(0, np.nan), axis=0)
+
+    #     return mat
+
+
+    # # examples:
+
+    # # 1) probability of clash for each (lig_elem, prot_elem) pair
+    # clash_prob_elem = clash_matrix(final_df, value="clash", aggfunc="mean",
+    #                             protein_axis="protein_element")
+
+    # # 2) total number of clashes for each (lig_elem, atom_name) pair
+    # n_clashes_name = clash_matrix(
+    #     final_df[final_df["clash"]],       # restrict to actual clashes if you want
+    #     value="clash",
+    #     aggfunc="sum",
+    #     protein_axis="protein_atom_name"
+    # )
+
+    # print(clash_prob_elem)
+    # print(n_clashes_name)
+
+    # # aggregate per sample
+    # per_sample = (
+    #     df
+    #     .groupby("sample_id")
+    #     .agg(
+    #         n_pairs    = ("clash", "size"),
+    #         n_clashes  = ("clash", "sum"),
+    #         clash_rate = ("clash", "mean"),
+    #         lig_vol    = ("dpocket_lig_vol", "first"),
+    #         pock_vol   = ("dpocket_pock_vol", "first"),
+    #     )
+    # )
+
+    # # sanity check
+    # # print(per_sample.head())
+
+    # # Pearson correlations
+    # pearson_corr = per_sample[["n_clashes", "clash_rate", "lig_vol", "pock_vol"]].corr(method="pearson")
+    # print("Pearson correlation:")
+    # print(pearson_corr)
+
+    # # Spearman (rank-based, in case things are non-linear / heavy-tailed)
+    # spearman_corr = per_sample[["n_clashes", "clash_rate", "lig_vol", "pock_vol"]].corr(method="spearman")
+    # print("Spearman correlation:")
+    # print(spearman_corr)
+
+
 
