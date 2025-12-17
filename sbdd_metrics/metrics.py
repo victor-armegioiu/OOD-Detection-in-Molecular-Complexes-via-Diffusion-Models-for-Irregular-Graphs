@@ -120,7 +120,7 @@ class AbstractEvaluator:
     @staticmethod
     def load_molecule(molecule):
         if isinstance(molecule, (str, Path)):
-            return Chem.SDMolSupplier(str(molecule), sanitize=False)[0]
+            return  
         return Chem.Mol(molecule)  # create copy to avoid overriding properties of the input molecule
     
     @staticmethod

@@ -2,8 +2,12 @@ from pathlib import Path
 import subprocess
 import re
 import os
+import shutil
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import traceback
+from typing import List, Dict
+from itertools import combinations
 
 import pandas as pd
 import numpy as np
@@ -14,15 +18,20 @@ from posebusters.modules.intermolecular_distance import check_intermolecular_dis
 from posebusters import PoseBusters
 
 from tqdm import tqdm
-from typing import List, Dict
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-from scipy.stats import chisquare, kruskal, f_oneway
+from scipy.stats import chisquare, kruskal, f_oneway, wasserstein_distance
 # https://docs.scipy.org/doc/scipy-1.16.1/reference/generated/scipy.stats.chisquare.html
 # https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.f_oneway.html
 from statsmodels.stats.contingency_tables import cochrans_q
 # https://www.statsmodels.org/dev/generated/statsmodels.stats.contingency_tables.cochrans_q.html
 from scikit_posthocs import posthoc_dunn
 # https://scikit-posthocs.readthedocs.io/en/latest/generated/scikit_posthocs.posthoc_dunn.html
+
+
+
+
 
 
 def make_relative_path(path: Path, base: Path) -> Path:
@@ -151,11 +160,6 @@ def build_dpocket_ready_complex(
 
     Returns path to the complex PDB.
     """
-    # if out_root is None:
-    #     out_root = crossdocked_root
-
-    # rec_pdb = crossdocked_root / f"{pocket_id}.pdb"
-    # lig_sdf = crossdocked_root / f"{pocket_id}.sdf"
 
     sample_id = lig_sdf.name.split("_")[0]
     pocket_id = lig_sdf.parent.name
@@ -235,59 +239,27 @@ def build_dpocket_ready_complex(
 
     return out_pdb
 
-# def build_all_dpocket_complexes(
-#     pocket_root: Path,
-#     output_root: Path,
-#     dpocket_input_path: Path
-# ):
-#     output_root.mkdir(parents=True, exist_ok=True)
-#     dpocket_lines = []
-
-#     for pdb_file in sorted(pocket_root.glob("*.pdb")):
-#         pocket_id = pdb_file.stem
-#         lig_sdf = pocket_root / f"{pocket_id}.sdf"
-#         if not lig_sdf.exists():
-#             print(f"[WARN] No ligand SDF for {pocket_id}")
-#             continue
-
-#         # Correct: CALL WITH out_root
-#         complex_pdb = output_root / f"{pocket_id}_complex_for_dpocket.pdb"
-
-#         complex_pdb = build_dpocket_ready_complex(
-#             pocket_root, pocket_id, out_root=output_root
-#         )
-#         # relative update for subprocess logic in dpocket later on
-#         complex_pdb_rel = make_relative_path(complex_pdb, output_root)
-    
-
-#         # extract ligand name
-#         parts = pocket_id.split("-")
-#         lig_resname = parts[4].upper() if len(parts) >= 5 else "LIG"
-
-#         dpocket_lines.append(f"{complex_pdb_rel}\t{lig_resname}")
-
-#     with open(dpocket_input_path, "w") as f:
-#         f.write("\n".join(dpocket_lines))
-
-#     print(f"[OK] Wrote dpocket master input: {dpocket_input_path}")
 
 
-
-def run_dpocket(dpocket_input_file: Path, dpocket_processing_dir: Path, prefix: str, dpocket_detection_radius:int = 4):
+def run_dpocket(dpocket_input_file: Path, dpocket_processing_dir: Path, dpocket_detection_radius:int = 4):
     """
     Run dpocket only once and ensure the dpocket_input_path
     is correctly referenced relative to output_root.
     """
-    explicit_out = dpocket_processing_dir / f"{prefix}_exp.txt"
 
-    # print(dpocket_input_path)
-    # print(output_root)
-    # print(explicit_out)
+    # print(f"[INFO] dpocket function received prefix {prefix}")
 
-    # # Skip if dpocket already ran
-    if explicit_out.exists():
-        print("[OK] dpocket results already exist, skipping.")
-        return
+
+    # explicit_out = dpocket_processing_dir / f"{prefix}_exp.txt"
+
+    # # print(dpocket_input_path)
+    # # print(output_root)
+    # # print(explicit_out)
+
+    # # # Skip if dpocket already ran
+    # if explicit_out.exists():
+    #     print("[OK] dpocket results already exist, skipping.")
+    #     return
 
     # Compute the path relative to output_root (subprocess cwd)
     dpocket_input_rel = make_relative_path(dpocket_input_file, dpocket_processing_dir)
@@ -295,30 +267,17 @@ def run_dpocket(dpocket_input_file: Path, dpocket_processing_dir: Path, prefix: 
     # print(dpocket_input_rel)
 
     print(f"[INFO] Running dpocket with input: {dpocket_input_rel}")
+    # print("[INFO] dpocket ARGV =", ["dpocket", "-f", str(dpocket_input_rel),  "-d", str(dpocket_detection_radius)])
+    # assert isinstance(prefix, str) and prefix and not prefix.startswith("-"), f"prefix is {prefix}"
 
     subprocess.run(
-        ["dpocket", "-f", str(dpocket_input_rel), "-o", prefix, "-d", str(dpocket_detection_radius)], # TODO -d pocket distance
+        ["dpocket", "-f", str(dpocket_input_rel), "-E", "-d", str(dpocket_detection_radius)],
         cwd=str(dpocket_processing_dir),
         check=True
     )
 
-    print(f"[OK] dpocket executed successfully for prefix {prefix}.")
+    # print(f"[OK] dpocket executed successfully for pocket_id {prefix}.")
 
-
-
-# def load_all_dpocket_descriptors(explicit_path: Path) -> pd.DataFrame:
-#     """
-#     Load dpocket explicit pocket descriptors for ALL pocket_ids.
-#     dpocket writes one row per input pdb, in the same order.
-#     """
-#     # print(os.getcwd())
-#     df = pd.read_csv(explicit_path, sep="\s+", engine="python")
-
-#     # Extract pocket_id from the pdb path column
-#     df["pdb"] = df["pdb"].astype(str)
-#     df["pocket_id"] = df["pdb"].apply(lambda x: Path(x).stem.replace("_complex_for_dpocket", ""))
-
-#     return df.set_index("pocket_id", drop=False)
 
 def evaluate_class_worker(pocket_dir: Path, dpocket_complex_dir: Path, dpocket_detection_radius:int ) -> pd.DataFrame:
             
@@ -329,51 +288,46 @@ def evaluate_class_worker(pocket_dir: Path, dpocket_complex_dir: Path, dpocket_d
 
         pocket_id = pocket_dir.name
 
-        # # Load dpocket row (one per pocket_id)
-        # if pocket_id not in dpocket_df.index:
-        #     print(f"[WARN] No dpocket descriptors for {pocket_id}")
-        #     dp_desc = None
-        # else:
-        #     dp_desc = dpocket_df.loc[pocket_id].to_dict()
-
-        dp_desc = ...
 
         lig_rows = []
 
-        # filtering ligand files that pass all filters prior to the clash filter
-        ligand_files = sorted(pocket_dir.glob("*_ligand.sdf"))
-        pocket_file = sorted(pocket_dir.glob("*_pocket.pdb"))[0]
-        metrics_file = Path(pocket_dir.parents[1]) / (pocket_dir.parent.name.split("_")[0] + "_metrics") / "metrics_detailed.csv"
-        prior_filters = ["sanitization", "all_atoms_connected", "aromatic_ring_flatness", "bond_angles", "bond_lengths", "double_bond_flatness", "internal_steric_clash"]
+        # # filtering ligand files that pass all filters prior to the clash filter
+        # ligand_files = sorted(pocket_dir.glob("*_ligand.sdf"))
+        # pocket_file = sorted(pocket_dir.glob("*_pocket.pdb"))[0]
+        # metrics_file = Path(pocket_dir.parents[1]) / (pocket_dir.parent.name.split("_")[0] + "_metrics") / "metrics_detailed.csv"
+        # prior_filters = ["sanitization", "all_atoms_connected", "aromatic_ring_flatness", "bond_angles", "bond_lengths", "double_bond_flatness", "internal_steric_clash"]
 
-        if metrics_file.exists():
-            bust_result = pd.read_csv(metrics_file)
-            rel_tail = ["/".join(p.parts[-2:]) for p in ligand_files]
-            abs_tail = bust_result["sdf_file"].apply(lambda p: "/".join(Path(p).parts[-2: ]))
-            mask = abs_tail.isin(rel_tail)
-            # order absolute paths *in the order they appear in list_rel*
-            order_idx = abs_tail[mask].map(
-                {k: i for i, k in enumerate(rel_tail)}
-            ).sort_values().index
+        # if metrics_file.exists():
+        #     bust_result = pd.read_csv(metrics_file)
+        #     rel_tail = ["/".join(p.parts[-2:]) for p in ligand_files]
+        #     abs_tail = bust_result["sdf_file"].apply(lambda p: "/".join(Path(p).parts[-2: ]))
+        #     mask = abs_tail.isin(rel_tail)
+        #     # order absolute paths *in the order they appear in list_rel*
+        #     order_idx = abs_tail[mask].map(
+        #         {k: i for i, k in enumerate(rel_tail)}
+        #     ).sort_values().index
 
-            # ordered result
-            updated_prior_filters = [f"posebusters.{s}" for s in prior_filters]
-            filter_mask = bust_result.loc[order_idx, updated_prior_filters].all(axis=1).values
+        #     # ordered result
+        #     updated_prior_filters = [f"posebusters.{s}" for s in prior_filters]
+        #     filter_mask = bust_result.loc[order_idx, updated_prior_filters].all(axis=1).values
             
-        else:
-            print("[INFO] No metrics file found, running PoseBusters")
-            buster = PoseBusters(config="mol")
-            bust_result = buster.bust(mol_pred=ligand_files, mol_cond=pocket_file)
-            filter_mask = bust_result[prior_filters].all(axis=1).values
+        # else:
+        #     print("[INFO] No metrics file found, running PoseBusters")
+        #     buster = PoseBusters(config="mol")
+        #     bust_result = buster.bust(mol_pred=ligand_files, mol_cond=pocket_file)
+        #     filter_mask = bust_result[prior_filters].all(axis=1).values
 
-        filtered_ligand_files = np.array(ligand_files)[filter_mask]
+        # filtered_ligand_files = np.array(ligand_files)[filter_mask]
+
+        filtered_ligand_files = sorted(pocket_dir.glob("*_ligand.sdf"))
 
 
 
         # run the dpocket evaluation of all valid ligand/pocket complexes
         dpocket_lines = []
+        dpocket_wd = dpocket_complex_dir / pocket_id # parallel running dpocket should run in seperate folders
+        dpocket_wd.mkdir(exist_ok = True)
 
-        
 
         # Evaluate all sample ligands
         for lig_file in filtered_ligand_files:
@@ -386,12 +340,13 @@ def evaluate_class_worker(pocket_dir: Path, dpocket_complex_dir: Path, dpocket_d
             pocket_pdb = pocket_dir / f"{sample_idx}_pocket.pdb"
 
             # run dpocket
-            dpocket_pdb_complex_path = build_dpocket_ready_complex(pocket_pdb, lig_file, out_root = dpocket_complex_dir)
+
+            dpocket_pdb_complex_path = build_dpocket_ready_complex(pocket_pdb, lig_file, out_root = dpocket_wd)
             # extract ligand name
             parts = pocket_id.split("-")
             lig_resname =  parts[4].upper() if len(parts) >= 5 else "LIG"
             # Compute the path relative to output_root (subprocess cwd)
-            complex_pdb_rel = make_relative_path(dpocket_pdb_complex_path, dpocket_complex_dir)
+            complex_pdb_rel = make_relative_path(dpocket_pdb_complex_path, dpocket_wd)
             dpocket_lines.append(f"{complex_pdb_rel}\t{lig_resname}")
 
 
@@ -406,11 +361,6 @@ def evaluate_class_worker(pocket_dir: Path, dpocket_complex_dir: Path, dpocket_d
             result = check_intermolecular_distance(mol_pred=ligand, mol_cond=pocket_mol)
             details = result["details"]
             clashes = details.copy() # details[details["clash"]].copy()
-            # if clashes.empty:
-            #     print(f"[INFO] No clashes detected in {lig_file}")
-            #     continue
-            # else:
-            #     print(f"[INFO] Clash detected in {lig_file}")
 
             # annotate with gemmi
             atom_table = build_protein_atom_table_gemmi(pocket_pdb)
@@ -427,14 +377,14 @@ def evaluate_class_worker(pocket_dir: Path, dpocket_complex_dir: Path, dpocket_d
             
             lig_rows.append(clashes)
         
-        dpocket_input_file = dpocket_complex_dir / f"{pocket_id}_dpocket_input.txt"
+        dpocket_input_file = dpocket_wd / f"{pocket_id}_dpocket_input.txt"
 
         with open(dpocket_input_file, "w") as f:
             f.write("\n".join(dpocket_lines))
 
-        run_dpocket(dpocket_input_file, dpocket_complex_dir, prefix=pocket_id, dpocket_detection_radius=dpocket_detection_radius)
+        run_dpocket(dpocket_input_file, dpocket_wd, dpocket_detection_radius=dpocket_detection_radius)
 
-        dpocket_descriptor_data = pd.read_csv(f"{dpocket_complex_dir}/{pocket_id}_exp.txt", sep="\s+")
+        dpocket_descriptor_data = pd.read_csv(f"{dpocket_wd}/dpout_explicitp.txt", sep="\s+")
         dpocket_descriptor_data["sample_id"] = dpocket_descriptor_data["pdb"].apply(lambda x: x.split("_complex")[0])
 
         lig_df = pd.concat(lig_rows, axis=0, ignore_index=True)
@@ -442,8 +392,11 @@ def evaluate_class_worker(pocket_dir: Path, dpocket_complex_dir: Path, dpocket_d
 
         # if available, merge metrics information from drugflow pipeline
         if metrics_file.exists():
+            print("[INFO] Merging metrics data")
             metrics_data = pd.read_csv(metrics_file)
-            metrics_data["sample_id"] = metrics_data["sdf_file"].apply(lambda x: Path(x).parent.name) + "_" + metrics_data["sample"]
+            metrics_data["sample_id"] = metrics_data["sdf_file"].apply(lambda x: Path(x).parent.name) + "_" + metrics_data["sample"].astype(str)
+            print(metrics_data["sample_id"][0])
+            # print(str(metrics_data["sample"]))
             lig_rows = lig_rows.merge(metrics_data, how="left", on="sample_id")
 
 
@@ -478,31 +431,14 @@ def full_pipeline(
 ):
     output_root = ours_samples_root.parent / (ours_samples_root.name.split("_")[0] + "_metrics") / "detailed_clash_evaluation"
     if overwrite_existing:
-        os.rmdir(output_root)
+        try:
+            shutil.rmtree(output_root)
+            print(f"[INFO] Deleted existing {output_root}")
+        except FileNotFoundError:
+            print(f"{output_root} doesn't exist and will therefore not be deleted. Creating directory...")
+    
     output_root.mkdir(parents=True, exist_ok=True)
 
-    # # ---- Stage 1: build complexes + master input ----
-    # dpocket_input = output_root / "dpocket_input_all.txt"
-
-    # build_all_dpocket_complexes(
-    #     crossdocked_root=crossdocked_root,
-    #     output_root=output_root,
-    #     dpocket_input_path=dpocket_input
-    # )
-
-    # # ---- Stage 2: run dpocket once ----
-    # run_dpocket_once(
-    #     dpocket_input_path=dpocket_input,
-    #     output_root=output_root,
-    #     prefix="dpout_all"
-    # )
-
-    # explicit_path = output_root / "dpout_all_exp.txt"
-
-    # # ---- Stage 3: load dpocket descriptor table ----
-    # dpocket_df = load_all_dpocket_descriptors(explicit_path)
-
-    # ---- Stage 4: evaluate all clashes in parellized ----
     all_rows = []
     pdb_paths = sorted(ours_samples_root.iterdir())
     available_workers = get_allowed_cpus(requested_workers)
@@ -510,7 +446,7 @@ def full_pipeline(
 
     with ProcessPoolExecutor(max_workers=available_workers) as pool:
 
-        futures = [pool.submit(evaluate_class_worker, p, output_root, dpocket_detection_radius) for p in pdb_paths]
+        futures = [pool.submit(evaluate_class_worker, p, output_root,  dpocket_detection_radius) for p in pdb_paths]
 
         for i, fut in tqdm(enumerate(as_completed(futures)), total=len(futures)):
 
@@ -518,6 +454,7 @@ def full_pipeline(
                 clash_result = fut.result()
             except Exception as e:
                 print(f"[ERROR] processing path {pdb_paths[i]}:", e)
+                traceback.print_exc()
             else:
                 all_rows.append(clash_result)
 
@@ -533,182 +470,594 @@ def full_pipeline(
 
     return final_df
 
+def write_povme_config(ligand_xyz, out="povme.yml"):
+    center = ligand_xyz.mean(axis=0)
+    radius = np.linalg.norm(ligand_xyz - center, axis=1).max() + 6.0
 
+    config = f"""
+            grid_spacing: 1.0
+            load_points_path: null
 
-if __name__ == "__main__":
-    # TODO increase dpocket radius so we're sure it detects entire pocket
-    input_folder = Path("../benchmarks/ours/ours_samples/")
-    # crossdocked_root = Path("../benchmarks/processed_crossdocked/test/")
-    # ourt_root = Path("../benchmarks/ours/ours_samples/")
+            points_inclusion_sphere:
+            - center: [{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]
+                radius: {radius:.1f}
 
-    # final_df = full_pipeline(input_folder, dpocket_detection_radius = 10, overwrite_existing=True, requested_workers=None) #, crossdocked_root, out_root)
-    # final_df.to_csv("clash_dpocket_annotated.csv", index=False)
-    # print(final_df.head())
+            save_points: true
+            distance_cutoff: 1.09
+            convex_hull_exclusion: true
 
-    # evaluate_class_worker(pocket_dir=input_folder/"14gs-A-rec-20gs-cbd-lig-tt-min", dpocket_complex_dir = input_folder.parent / (input_folder.name.split("_")[0] + "_metrics") / "detailed_clash_evaluation")
+            contiguous_pocket_seed_sphere:
+            - center: [{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]
+                radius: 4.0
+            contiguous_points_criteria: 3
 
-    # develop the pipeline further by loading final df
-    final_df = pd.read_csv("../benchmarks/ours/ours_metrics/detailed_clash_evaluation.csv")
-    print(final_df.groupby("protein_atom_name").agg(clashes = ("clash", "mean"), count = ("clash", "size"), prot_vdw = ("protein_vdw", "first")).sort_values(["clashes"], ascending=False))
+            use_ray: true
+            n_cores: 8
 
-    sys.exit(0)
+            save_individual_pocket_volumes: true
+            save_pocket_volumes_trajectory: true
+            output_equal_num_points_per_frame: true
+            save_volumetric_density_map: true
+            compress_output: false
+            """
+    
+    Path(out).write_text(config)
 
-    # test whether final_df has invalid information
+# ============================================================
+# Core analysis helpers (largely unchanged)
+# ============================================================
 
-    ## play ground ##
+def calc_means_classes(df, classes):
+    df = df.copy()
+    df["clash"] = df["clash"].astype(bool)
 
-
-    # print(len(ligand_files), len(filtered_ligand_files))
-
-    #######################################
-
-    # work on a copy if you want to be safe
-    df = final_df.copy()
-
-    def calc_means_classes(df, classes = ["protein_resname"]):
-        # ensure clash is boolean (it *should* already be)
-        df["clash"] = df["clash"].astype(bool)
-
-        # per-residue-class / resname stats
-        residue_stats = (
-            df
-            .groupby(classes)
-            .agg(
-                n_pairs      = ("clash", "size"),   # number of ligand–protein pairs
-                n_clashes    = ("clash", "sum"),    # number of pairs flagged as clash
-                clash_rate   = ("clash", "mean"),   # fraction of clashing pairs
-                mean_dist    = ("distance", "mean"),
-                mean_rel_dist= ("relative_distance", "mean"),
-                n_prot_atoms = ("protein_atom_id", "nunique"),
-                n_lig_atoms  = ("ligand_atom_id", "nunique"),
-            )
-            .sort_values(["clash_rate"], ascending=False)
-            # .sort_values(["protein_res_class", "clash_rate"], ascending=[True, False])
+    return (
+        df
+        .groupby(classes)
+        .agg(
+            n_pairs=("clash", "size"),
+            n_clashes=("clash", "sum"),
+            clash_rate=("clash", "mean"),
+            mean_dist=("distance", "mean"),
+            mean_rel_dist=("relative_distance", "mean"),
+            n_prot_atoms=("protein_atom_id", "nunique"),
+            n_lig_atoms=("ligand_atom_id", "nunique"),
         )
+        .sort_values("clash_rate", ascending=False)
+    )
 
-        print(residue_stats.head(20))
 
-    def clash_matrix(
-        df: pd.DataFrame,
-        value: str = "clash",              # column to aggregate over
-        aggfunc = "mean",                  # e.g. "mean", "sum", "count"
-        protein_axis: str = "protein_element",  # or "protein_atom_name"
-        normalize: bool = False            # True -> row-normalize
-    ) -> pd.DataFrame:
-        """
-        Build a ligand-type x protein-type matrix for clashes or any metric.
-        """
-        mat = df.pivot_table(
+def clash_matrix(
+    df,
+    value="clash",
+    aggfunc="mean",
+    protein_axis="protein_element",
+):
+    return (
+        df.pivot_table(
             index="ligand_element",
             columns=protein_axis,
             values=value,
             aggfunc=aggfunc,
             fill_value=0.0,
         )
-
-        if normalize:
-            # e.g. convert counts/sums into row-wise fractions
-            mat = mat.div(mat.sum(axis=1).replace(0, np.nan), axis=0)
-
-        return mat
-    
-        # examples:
-
-    # 1) probability of clash for each (lig_elem, prot_elem) pair
-    clash_prob_elem = clash_matrix(final_df, value="clash", aggfunc="mean",
-                                protein_axis="protein_element")
-
-    # 2) total number of clashes for each (lig_elem, atom_name) pair
-    n_clashes_name = clash_matrix(
-        final_df[final_df["clash"]],       # restrict to actual clashes if you want
-        value="clash",
-        aggfunc="sum",
-        protein_axis="protein_atom_name"
     )
 
-    print(clash_prob_elem)
-    print(n_clashes_name)
 
-    def do_chi_and_cochran(df, variable = "protein_resname"):
-        ## chi squared test ##
-        overall_clash_p = df["clash"].mean()
-        frequencies = (
-            df
-            .groupby([variable])
-            .agg(
-                size = ("clash", "size"),
-                obs = ("clash", "sum") 
-            )
+def chi_square_clash_test(df, variable):
+    contingency = pd.crosstab(df[variable], df["clash"])
+    chi2, p, _, _ = chi2_contingency(contingency)
+    return chi2, p
+
+
+def kruskal_wallis_and_posthoc_dunn(df, cat_var, num_var):
+    data = df[[cat_var, num_var]].dropna()
+
+    groups = [g[num_var].values for _, g in data.groupby(cat_var)]
+    kw = kruskal(*groups)
+
+    dunn = posthoc_dunn(
+        data,
+        val_col=num_var,
+        group_col=cat_var,
+        p_adjust="holm",
+    )
+
+    return kw, dunn
+
+def analyze_and_plot_clashes(
+    final_df: pd.DataFrame,
+    save_path: Path,
+):
+    save_path.mkdir(parents=True, exist_ok=True)
+    out_file = save_path / "detailed_clash_evaluation_analysis.png"
+
+    # =========================================================
+    # Filters (exactly as in draft)
+    # =========================================================
+    prior_posebusters_filters = [
+        f"posebusters.{f}"
+        for f in [
+            "sanitization",
+            "all_atoms_connected",
+            "aromatic_ring_flatness",
+            "bond_angles",
+            "bond_lengths",
+            "double_bond_flatness",
+            "internal_steric_clash",
+        ]
+    ]
+
+    prior_medchem_filters = [f"medchem.{f}" for f in ["valid", "connected"]]
+
+    clash_df_before_filters = final_df.copy()
+
+    medchem_mask = clash_df_before_filters[prior_medchem_filters].all(axis=1)
+    posebusters_mask = clash_df_before_filters[prior_posebusters_filters].all(axis=1)
+
+    clash_df_after_medchem = clash_df_before_filters[medchem_mask]
+    clash_df_after_posebusters = clash_df_before_filters[posebusters_mask]
+    clash_df_filtered = clash_df_before_filters[medchem_mask & posebusters_mask]
+
+    dataframes_by_filterlevel = {
+        "none": clash_df_before_filters,
+        "medchem": clash_df_after_medchem,
+        "posebusters": clash_df_after_posebusters,
+        "both": clash_df_filtered,
+    }
+
+    # =========================================================
+    # Mask agreement (EXACTLY as requested)
+    # =========================================================
+    total_mask_agreement = (medchem_mask & posebusters_mask).mean()
+    connected_agreement = (
+        clash_df_before_filters["posebusters.all_atoms_connected"]
+        & clash_df_before_filters["medchem.connected"]
+    ).mean()
+
+    # =========================================================
+    # Wasserstein distances (clash rate + relative distance)
+    # =========================================================
+    def per_sample(series, df):
+        return df.groupby("sample_id")[series].mean().values
+
+    wass_rows = []
+    for (k1, df1), (k2, df2) in combinations(dataframes_by_filterlevel.items(), 2):
+        wass_rows.append(
+            (k1, k2,
+             wasserstein_distance(per_sample("clash", df1), per_sample("clash", df2)),
+             wasserstein_distance(per_sample("relative_distance", df1),
+                                  per_sample("relative_distance", df2)))
         )
-        frequencies["exp"] = frequencies["size"] * overall_clash_p # TODO is this correct expected?
-        test = chisquare(f_obs=frequencies["obs"].values, f_exp=frequencies["exp"].values) # TODO do I need to verify chi squ assumptions?
 
+    wasserstein_df = pd.DataFrame(
+        wass_rows,
+        columns=["filter_a", "filter_b", "W_clash_rate", "W_relative_dist"],
+    )
 
-        print("Chi square results:", test)
+    # =========================================================
+    # Protein-axis comparisons
+    # =========================================================
+    prot_cols = ["protein_element", "protein_atom_name", "protein_resname"]
 
-        ## cochrans q test ##
-        frequencies["none"] = frequencies["size"] - frequencies["obs"]
+    # =========================================================
+    # Correlation setup (EXACT variables)
+    # =========================================================
+    numerical_dpocket_descriptors = [
+        "pock_vol", "mean_as_solv_acc", "apol_as_prop", "mean_loc_hyd_dens",
+        "hydrophobicity_score", "volume_score", "polarity_score",
+        "charge_score", "flex", "prop_polar_atm", "as_density",
+        "as_max_dst", "convex_hull_volume",
+        "surf_pol_vdw14", "surf_pol_vdw22",
+        "surf_apol_vdw14", "surf_apol_vdw22",
+        "n_abpa",
+    ]
+    ligand_eval_descriptors  = [
+         "medchem.size", "gnina.minimisation_rmsd"
+    ]
 
-        x = frequencies[["obs", "none"]].values.T
-        test2 = cochrans_q(x) # TODO is it okay that the classes are unevenly distirbuted?
-        print("Conchrans Q results", test2)
-
-    ## anova and kruskal wallis ##
-    def kruskal_wallis_and_posthoc_dunn(cat_var = "protein_resname", num_var = "relative_distance"):
-
-        # ANOVA assumes
-        # The samples are independent.
-        # Each sample is from a normally distributed population.
-        # The population standard deviations of the groups are all equal. This property is known as homoscedasticity.
-        # -> this is props not valid so we do KW
-
-        samples = [df[df[cat_var] == name][num_var].values for name in df[cat_var].unique()]
-        # test = f_oneway(*samples, equal_var = False)
-        test2 = kruskal(*samples)
-        print(test2)
-        # follow up KW with posthoc dunn
-
-        test = posthoc_dunn(samples)
-        print(test)
-
-    ########### correlation ##########################
-
-
-
-
-
-
-    # aggregate per sample
     per_sample_aggregation = (
-        df
+        clash_df_filtered
         .groupby("sample_id")
         .agg(
-            n_pairs    = ("clash", "size"),
-            n_clashes  = ("clash", "sum"),
-            per_ligand_clash_rate = ("clash", "mean"),
-            lig_vol    = ("dpocket_lig_vol", "first"),
-            pock_vol   = ("dpocket_pock_vol", "first"),
-            # solvent_accessibility = ("mean_as_solv_acc", "first")
-
+            n_clashes=("clash", "sum"),
+            clash_rate=("clash", "mean"),
+            relative_distance=("relative_distance", "mean"),
+            protein_dist_to_ca=("protein_dist_to_ca", "mean"),
+            lig_vol=("lig_vol", "first"),
+            **{k: (k, "first") for k in numerical_dpocket_descriptors+ligand_eval_descriptors}
         )
     )
 
-    # sanity check
-    # print(per_sample.head())
+    # =========================================================
+    # Figure layout
+    # =========================================================
+    fig = plt.figure(figsize=(28, 22))
+    gs = fig.add_gridspec(5, 3, hspace=0.45, wspace=0.3)
 
-    num_cols =  [f"dpocket_{s}" for s in ["pock_vol", "mean_as_solv_acc", "apol_as_prop", "mean_loc_hyd_dens", "hydrophobicity_score", "volume_score", "polarity_score", "charge_score", "flex", "prop_polar_atm", "as_density", "as_max_dst", "convex_hull_volume", "surf_pol_vdw14",	"surf_pol_vdw22",	"surf_apol_vdw14",	"surf_apol_vdw22",	"n_abpa"]]
+    # ---------------------------------------------------------
+    # Row 1: Filter-level histograms
+    # ---------------------------------------------------------
+    ax_hist = fig.add_subplot(gs[0, :2])
+    for name, df in dataframes_by_filterlevel.items():
+        ax_hist.hist(
+            df.groupby("sample_id")["clash"].mean(),
+            bins=40,
+            alpha=0.5,
+            label=name,
+        )
+    ax_hist.set_title("Per-sample clash-rate distributions")
+    ax_hist.legend()
 
-    # Pearson correlations
-    pearson_corr = per_sample_aggregation[["per_ligand_clash_rate", "lig_vol", "pock_vol"]].corr(method="pearson")
-    print("Pearson correlation:")
-    print(pearson_corr)
+    # ---------------------------------------------------------
+    # Wasserstein table + mask agreement
+    # ---------------------------------------------------------
+    ax_wass = fig.add_subplot(gs[0, 2])
+    ax_wass.axis("off")
 
-    # Spearman (rank-based, in case things are non-linear / heavy-tailed)
-    kendall_corr = per_sample_aggregation[["per_ligand_clash_rate", "lig_vol", "pock_vol"]].corr(method="kendall")
-    print("Kendall correlation:")
-    print(kendall_corr)
+    table = ax_wass.table(
+        cellText=[
+            [a, b, f"{w1:.4f}", f"{w2:.4f}"]
+            for a, b, w1, w2 in wasserstein_df.itertuples(index=False)
+        ],
+        colLabels=wasserstein_df.columns,
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.6)
 
-    print(df[["relative_distance"] + num_cols].corr(method="kendall"))
+    ax_wass.set_title(
+        "Wasserstein distances\n"
+        f"Mask agreement: {total_mask_agreement:.2%}\n"
+        f"Connected agreement: {connected_agreement:.2%}"
+    )
+
+    # ---------------------------------------------------------
+    # Rows 2–3: protein-axis heatmaps + tables
+    # ---------------------------------------------------------
+    clash_df_before_filters["clash_binary"] = clash_df_before_filters["clash"].apply(lambda x: 1 if x else 0)
+    for i, prot_col in enumerate(prot_cols):
+        ax_hm = fig.add_subplot(gs[1, i])
+        mat = clash_matrix(
+            clash_df_filtered,
+            value="clash",
+            aggfunc="mean",
+            protein_axis=prot_col,
+        )
+        sns.heatmap(mat, cmap="viridis", ax=ax_hm)
+        ax_hm.set_title(f"P(clash | ligand × {prot_col})")
+
+        ax_tab = fig.add_subplot(gs[2, i])
+        ax_tab.axis("off")
+        stats = calc_means_classes(clash_df_filtered, [prot_col]).head(10)
+        table = ax_tab.table(
+            cellText=np.round(stats.values, 3),
+            rowLabels=stats.index,
+            colLabels=stats.columns,
+            loc="center",
+            cellLoc="center",
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        table.scale(1, 1.4)
+        ax_tab.set_title(f"Top {prot_col} by clash rate")
+
+    # ---------------------------------------------------------
+    # Rows 4–5: Targeted Pearson & Kendall correlations
+    # ---------------------------------------------------------
+    x_vars = numerical_dpocket_descriptors + ligand_eval_descriptors + ["protein_dist_to_ca"]
+
+    for j, method in enumerate(["pearson", "kendall"]):
+
+        # ---- Row 4: clash rate vs descriptors ----
+        ax_clash = fig.add_subplot(gs[3, j])
+
+        clash_corr = pd.DataFrame(
+            {
+                "clash_rate": per_sample_aggregation[x_vars]
+                    .corrwith(per_sample_aggregation["clash_rate"], method=method),
+                "relative_distance": per_sample_aggregation[x_vars]
+                    .corrwith(per_sample_aggregation["relative_distance"], method=method),
+            }
+        )
+
+        sns.heatmap(
+            clash_corr,
+            cmap="coolwarm",
+            annot=True,
+            fmt=".2f",
+            cbar=True,
+            ax=ax_clash,
+        )
+
+        ax_clash.set_title(f"{method.capitalize()} – per sample clash rate and rel dist")
+        ax_clash.set_ylabel("Descriptor")
+        ax_clash.set_xlabel("per_ligand_clash_rate")
+        ax_clash.set_yticks(np.arange(len(clash_corr.index)) + 0.5)
+        ax_clash.set_yticklabels(clash_corr.index, rotation=0)
+
+
+        # ---- Row 5: relative distance vs descriptors ----
+        ax_dist = fig.add_subplot(gs[4, j])
+
+        rel_corr = pd.DataFrame(
+            {
+                "clash_binary": clash_df_before_filters[x_vars]
+                    .corrwith(clash_df_before_filters["clash_binary"], method=method),
+                "relative_distance": clash_df_before_filters[x_vars]
+                    .corrwith(clash_df_before_filters["relative_distance"], method=method),
+            }
+        )
+
+        sns.heatmap(
+            rel_corr,
+            cmap="coolwarm",
+            annot=True,
+            fmt=".2f",
+            cbar=True,
+            ax=ax_dist,
+        )
+
+        ax_dist.set_title(f"{method.capitalize()} – per atom clash and rel dist")
+        ax_dist.set_ylabel("Descriptor")
+        ax_dist.set_xlabel("relative_distance")
+        ax_dist.set_yticks(np.arange(len(rel_corr.index)) + 0.5)
+        ax_dist.set_yticklabels(rel_corr.index, rotation=0)
+        
+
+
+    # ---------------------------------------------------------
+    # Save
+    # ---------------------------------------------------------
+    plt.savefig(out_file, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Saved full analysis figure → {out_file}")
+
+
+# ============================================================
+# __main__ orchestration (exactly one call)
+# ============================================================
+
+if __name__ == "__main__":
+    save_path = Path("../benchmarks/ours/ours_metrics/")
+    final_df = pd.read_csv(save_path / "detailed_clash_evaluation.csv")
+
+    analyze_and_plot_clashes(
+        final_df=final_df,
+        save_path=save_path,
+    )
+
+
+
+
+
+# def calc_means_classes(df, classes = ["protein_resname"]):
+#     # ensure clash is boolean (it *should* already be)
+#     df["clash"] = df["clash"].astype(bool)
+
+#     # per-residue-class / resname stats
+#     residue_stats = (
+#         df
+#         .groupby(classes)
+#         .agg(
+#             n_pairs      = ("clash", "size"),   # number of ligand–protein pairs
+#             n_clashes    = ("clash", "sum"),    # number of pairs flagged as clash
+#             clash_rate   = ("clash", "mean"),   # fraction of clashing pairs
+#             mean_dist    = ("distance", "mean"),
+#             mean_rel_dist= ("relative_distance", "mean"),
+#             n_prot_atoms = ("protein_atom_id", "nunique"),
+#             n_lig_atoms  = ("ligand_atom_id", "nunique"),
+#         )
+#         .sort_values(["clash_rate"], ascending=False)
+#         # .sort_values(["protein_res_class", "clash_rate"], ascending=[True, False])
+#     )
+
+#     return residue_stats
+
+# def clash_matrix(
+#     df: pd.DataFrame,
+#     value: str = "clash",              # column to aggregate over
+#     aggfunc = "mean",                  # e.g. "mean", "sum", "count"
+#     protein_axis: str = "protein_element",  # or "protein_atom_name"
+#     normalize: bool = False            # True -> row-normalize
+# ) -> pd.DataFrame:
+#     """
+#     Build a ligand-type x protein-type matrix for clashes or any metric.
+#     """
+#     mat = df.pivot_table(
+#         index="ligand_element",
+#         columns=protein_axis,
+#         values=value,
+#         aggfunc=aggfunc,
+#         fill_value=0.0,
+#     )
+
+#     if normalize:
+#         # e.g. convert counts/sums into row-wise fractions
+#         mat = mat.div(mat.sum(axis=1).replace(0, np.nan), axis=0)
+
+#         return mat
+    
+# def do_chi_and_cochran(df, variable = "protein_resname"):
+#     """
+#     These test supports testing frequencies (ordinary categorical possible) across specified categorical variable to investigate independence
+#     """
+
+#     ## chi squared test ##
+#     overall_clash_p = df["clash"].mean()
+#     frequencies = (
+#         df
+#         .groupby([variable])
+#         .agg(
+#             size = ("clash", "size"),
+#             obs = ("clash", "sum") 
+#         )
+#     )
+#     frequencies["exp"] = frequencies["size"] * overall_clash_p # TODO is this correct expected?
+#     chi2_result = chisquare(f_obs=frequencies["obs"].values, f_exp=frequencies["exp"].values) # TODO do I need to verify chi squ assumptions?
+
+#     ## cochrans q test ##
+#     frequencies["none"] = frequencies["size"] - frequencies["obs"]
+
+#     x = frequencies[["obs", "none"]].values.T
+#     cq_result = cochrans_q(x) # TODO is it okay that the classes are unevenly distirbuted?
+
+#     return {
+#         "chi2": chi2_result, 
+#         "cochran-q": cq_result
+#     }
+
+# ## anova and kruskal wallis ##
+# def kruskal_wallis_and_posthoc_dunn(df, cat_var = "protein_resname", num_var = "relative_distance"):
+
+#     # ANOVA assumes
+#     # The samples are independent.
+#     # Each sample is from a normally distributed population.
+#     # The population standard deviations of the groups are all equal. This property is known as homoscedasticity.
+#     # -> this is props not valid so we do KW
+
+#     samples = [df[df[cat_var] == name][num_var].values for name in df[cat_var].unique()]
+#     # test = f_oneway(*samples, equal_var = False)
+#     kruskal_result = kruskal(*samples)
+
+#     # follow up KW with posthoc dunn
+#     dunn_result = posthoc_dunn(samples)
+
+#     return {
+#         "kruskal": kruskal_result, 
+#         "posthoc": dunn_result
+#     }
+
+
+
+
+# if __name__ == "__main__":
+#     # TODO increase dpocket radius so we're sure it detects entire pocket
+#     input_folder = Path("../benchmarks/ours/ours_samples/")
+#     # crossdocked_root = Path("../benchmarks/processed_crossdocked/test/")
+#     # ourt_root = Path("../benchmarks/ours/ours_samples/")
+
+#     final_df = full_pipeline(input_folder, dpocket_detection_radius = 10, overwrite_existing=True, requested_workers=None) #, crossdocked_root, out_root)
+#     # final_df.to_csv("clash_dpocket_annotated.csv", index=False)
+#     # print(final_df.head())
+
+#     # evaluate_class_worker(pocket_dir=input_folder/"14gs-A-rec-20gs-cbd-lig-tt-min", dpocket_complex_dir = input_folder.parent / (input_folder.name.split("_")[0] + "_metrics") / "detailed_clash_evaluation")
+#     # develop the pipeline further by loading final df
+#     save_path = Path("../benchmarks/ours/ours_metrics/")
+#     final_df = pd.read_csv(save_path / "detailed_clash_evaluation.csv")
+#     # print(final_df.groupby("protein_atom_name").agg(clashes = ("clash", "mean"), count = ("clash", "size"), prot_vdw = ("protein_vdw", "first")).sort_values(["clashes"], ascending=False))
+    
+#     # safety exit
+#     sys.exit(0)
+
+#     ### Hypothesis Tests and Analysis ###
+
+#     # EDA #
+
+#     # create different levels of filtered dataframes to assess the impact of filters
+#     prior_posebusters_filters = [f"posebusters.{f}" for f in ["sanitization", "all_atoms_connected", "aromatic_ring_flatness", "bond_angles", "bond_lengths", "double_bond_flatness", "internal_steric_clash"]]
+#     prior_medchem_filters = [f"medchem.{f}" for f in ["valid", "connected"]]
+#     clash_df_before_filters = final_df.copy()
+#     medchem_mask = clash_df_before_filters[prior_medchem_filters].all(axis=1).values
+#     clash_df_after_medchem = clash_df_before_filters[medchem_mask]
+#     posebusters_mask = clash_df_before_filters[prior_posebusters_filters].all(axis=1).values
+#     clash_df_after_posebusters = clash_df_before_filters[posebusters_mask]
+#     clash_df_filtered = clash_df_before_filters[medchem_mask & posebusters_mask]
+
+#     # assess agreement of masks
+#     total_mask_agreement = (medchem_mask & posebusters_mask).mean()
+#     connected_agreement = (clash_df_before_filters["posebusters.all_atoms_connected"] & clash_df_before_filters["medchem.connected"]).mean()
+#     print(f"Total Agreement of masks: {total_mask_agreement*100}% and agreement on connection {connected_agreement*100}%")
+
+#     dataframes_by_filterlevel = {
+#         "none": clash_df_before_filters, 
+#         "medchem": clash_df_after_medchem, 
+#         "posebusters": clash_df_after_posebusters, 
+#         "both": clash_df_filtered
+#     }
+#     # TODO wasserstein_distance matrix of df.groupby("sample_id").agg(clashes = ("clash_rate", "mean"))["clash_rate"] between the four dataframes
+
+#     for key, df in dataframes_by_filterlevel.items():
+#         ax1.hist(df.groupby("sample_id").agg(clashes = ("clash_rate", "mean"))["clash_rate"])
+#         ax2.hist(final_df["relative_distance"])
+#         ax2.hline(0.75, "red")
+
+#     print("Correlation of sizes and volumnes:", final_df["lig_vol"].corr(final_df["medchem.size"])) # report also kendall correlation
+
+
+
+#     # Protein Sidechains: Residue and atom level metrcis #
+#     # -> Cat and ordinary or continuous
+
+#     # TODO plot the below 2 as heatmap with the probability numbers in the grid instead of printing
+#     # probability of clash for each (lig_elem, prot_elem) pair
+#     for prot_col in ["protein_element", "protein_atom_name", "protein_resname"]:
+#         print(prot_col)
+#         calc_means_classes(clash_df_filtered, classes = [prot_col])
+#         # mean reporting of clashes in prot_col ligand_atom_type matrix
+#         clash_prob = clash_matrix(
+#             final_df, 
+#             value="clash", 
+#             aggfunc="mean",
+#             protein_axis="protein_element")
+#         # statistical tests
+#         chi_q_result =  do_chi_and_cochran(clash_df_filtered, variable = prot_col)
+#         kw_result = kruskal_wallis_and_posthoc_dunn(clash_df_filtered, cat_var = prot_col, num_var = "relative_distance")
+
+
+#     # Correlations #
+#     # continuous and continuous
+#     numerical_dpocket_descriptors = ["pock_vol", "mean_as_solv_acc", "apol_as_prop", "mean_loc_hyd_dens", "hydrophobicity_score", "volume_score", "polarity_score", "charge_score", "flex", "prop_polar_atm", "as_density", "as_max_dst", "convex_hull_volume", "surf_pol_vdw14",	"surf_pol_vdw22",	"surf_apol_vdw14",	"surf_apol_vdw22",	"n_abpa"]
+
+
+
+   
+#     per_sample_aggregation = (
+#         df
+#         .groupby("sample_id")
+#         .agg(
+#             # n_pairs    = ("clash", "size"),
+#             n_clashes  = ("clash", "sum"),
+#             per_ligand_clash_rate = ("clash", "mean"),
+#             lig_vol    = ("lig_vol", "first"),
+#             pock_vol   = ("pock_vol", "first"),
+#             # TODO fill the rest of the numerical dpocket descriptors here:
+#             # solvent_accessibility = ("mean_as_solv_acc", "first")
+
+#         )
+#     )
+#     # TODO the belwo has heatmaps with the values in the grid included
+#     for method in ["pearson", "kendall"]:
+#          # clash rate correlations
+#         clash_rate_corr = per_sample_aggregation.corr(method=method) # TODO do the same with kendall
+
+#         # relative distance correlations
+#         rel_dist_corr = [["relative_distance", "protein_dist_to_ca"] + numerical_dpocket_descriptors].corr(method=method) # 
+
+
+
+
+#     ###
+
+#     # sanity check
+#     # print(per_sample.head())
+
+#     num_cols =  [f"dpocket_{s}" for s in ["pock_vol", "mean_as_solv_acc", "apol_as_prop", "mean_loc_hyd_dens", "hydrophobicity_score", "volume_score", "polarity_score", "charge_score", "flex", "prop_polar_atm", "as_density", "as_max_dst", "convex_hull_volume", "surf_pol_vdw14",	"surf_pol_vdw22",	"surf_apol_vdw14",	"surf_apol_vdw22",	"n_abpa"]]
+
+#     # Pearson correlations
+#     pearson_corr = per_sample_aggregation[["per_ligand_clash_rate", "lig_vol", "pock_vol"]].corr(method="pearson")
+#     print("Pearson correlation:")
+#     print(pearson_corr)
+
+#     # Spearman (rank-based, in case things are non-linear / heavy-tailed)
+#     kendall_corr = per_sample_aggregation[["per_ligand_clash_rate", "lig_vol", "pock_vol"]].corr(method="kendall")
+#     print("Kendall correlation:")
+#     print(kendall_corr)
+
+#     print(df[["relative_distance"] + num_cols].corr(method="kendall"))
 
     # ########### learning to predict clashes ####################
 
