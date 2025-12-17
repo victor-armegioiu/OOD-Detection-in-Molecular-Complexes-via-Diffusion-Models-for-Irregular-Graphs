@@ -34,3 +34,4 @@ data_extracted_graphs/
 *.png
 mini_example_dataset_samples/
 *.yml
+tmp/
