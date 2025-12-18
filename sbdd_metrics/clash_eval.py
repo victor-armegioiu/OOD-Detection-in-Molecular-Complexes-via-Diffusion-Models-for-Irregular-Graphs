@@ -10,6 +10,7 @@ from typing import List, Dict
 from itertools import combinations
 
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 import numpy as np
 from rdkit import Chem
 import gemmi
@@ -23,13 +24,19 @@ import seaborn as sns
 
 import pyKVFinder
 
-from scipy.stats import chisquare, kruskal, f_oneway, wasserstein_distance
+from scipy.stats import chisquare, kruskal, f_oneway, wasserstein_distance, chi2_contingency
 # https://docs.scipy.org/doc/scipy-1.16.1/reference/generated/scipy.stats.chisquare.html
 # https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.f_oneway.html
 from statsmodels.stats.contingency_tables import cochrans_q
 # https://www.statsmodels.org/dev/generated/statsmodels.stats.contingency_tables.cochrans_q.html
 from scikit_posthocs import posthoc_dunn
 # https://scikit-posthocs.readthedocs.io/en/latest/generated/scikit_posthocs.posthoc_dunn.html
+import pandas as pd
+
+pd.set_option("display.width", None)
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_rows", 1000)
+pd.set_option("display.max_colwidth", None)
 
 
 os.environ["KMP_WARNINGS"] = "0"
@@ -361,6 +368,7 @@ def evaluate_class_worker(pocket_dir: Path, dpocket_complex_dir: Path, dpocket_d
 
         # filtered_ligand_files = np.array(ligand_files)[filter_mask]
 
+        metrics_file = Path(pocket_dir.parents[1]) / (pocket_dir.parent.name.split("_")[0] + "_metrics") / "metrics_detailed.csv"
         filtered_ligand_files = sorted(pocket_dir.glob("*_ligand.sdf"))
 
 
@@ -603,54 +611,46 @@ def analyze_and_plot_clashes(
     final_df: pd.DataFrame,
     save_path: Path,
 ):
+
     save_path.mkdir(parents=True, exist_ok=True)
     out_file = save_path / "detailed_clash_evaluation_analysis.png"
 
     # =========================================================
-    # Filters (exactly as in draft)
+    # Filters
     # =========================================================
     prior_posebusters_filters = [
         f"posebusters.{f}"
         for f in [
-            "sanitization",
-            "all_atoms_connected",
-            "aromatic_ring_flatness",
-            "bond_angles",
-            "bond_lengths",
-            "double_bond_flatness",
+            "sanitization", "all_atoms_connected", "aromatic_ring_flatness",
+            "bond_angles", "bond_lengths", "double_bond_flatness",
             "internal_steric_clash",
         ]
     ]
-
     prior_medchem_filters = [f"medchem.{f}" for f in ["valid", "connected"]]
 
-    clash_df_before_filters = final_df.copy()
+    df0 = final_df.copy()
+    medchem_mask = df0[prior_medchem_filters].all(axis=1)
+    posebusters_mask = df0[prior_posebusters_filters].all(axis=1)
 
-    medchem_mask = clash_df_before_filters[prior_medchem_filters].all(axis=1)
-    posebusters_mask = clash_df_before_filters[prior_posebusters_filters].all(axis=1)
+    df_filtered = df0[medchem_mask & posebusters_mask].copy()
+    df_filtered["clash_binary"] = df_filtered["clash"].astype(int)
 
-    clash_df_after_medchem = clash_df_before_filters[medchem_mask]
-    clash_df_after_posebusters = clash_df_before_filters[posebusters_mask]
-    clash_df_filtered = clash_df_before_filters[medchem_mask & posebusters_mask]
+    # mask agreement
+    total_mask_agreement = (medchem_mask & posebusters_mask).mean()
+    connected_agreement = (
+        df0["posebusters.all_atoms_connected"]
+        & df0["medchem.connected"]
+    ).mean()
 
     dataframes_by_filterlevel = {
-        "none": clash_df_before_filters,
-        "medchem": clash_df_after_medchem,
-        "posebusters": clash_df_after_posebusters,
-        "both": clash_df_filtered,
+        "none": df0,
+        "medchem": df0[medchem_mask],
+        "posebusters": df0[posebusters_mask],
+        "both": df_filtered,
     }
 
     # =========================================================
-    # Mask agreement (EXACTLY as requested)
-    # =========================================================
-    total_mask_agreement = (medchem_mask & posebusters_mask).mean()
-    connected_agreement = (
-        clash_df_before_filters["posebusters.all_atoms_connected"]
-        & clash_df_before_filters["medchem.connected"]
-    ).mean()
-
-    # =========================================================
-    # Wasserstein distances (clash rate + relative distance)
+    # Wasserstein distances (per-sample)
     # =========================================================
     def per_sample(series, df):
         return df.groupby("sample_id")[series].mean().values
@@ -658,10 +658,14 @@ def analyze_and_plot_clashes(
     wass_rows = []
     for (k1, df1), (k2, df2) in combinations(dataframes_by_filterlevel.items(), 2):
         wass_rows.append(
-            (k1, k2,
-             wasserstein_distance(per_sample("clash", df1), per_sample("clash", df2)),
-             wasserstein_distance(per_sample("relative_distance", df1),
-                                  per_sample("relative_distance", df2)))
+            (
+                k1,
+                k2,
+                wasserstein_distance(per_sample("clash", df1),
+                                     per_sample("clash", df2)),
+                wasserstein_distance(per_sample("relative_distance", df1),
+                                     per_sample("relative_distance", df2)),
+            )
         )
 
     wasserstein_df = pd.DataFrame(
@@ -670,47 +674,47 @@ def analyze_and_plot_clashes(
     )
 
     # =========================================================
-    # Protein-axis comparisons
+    # Protein axes
     # =========================================================
     prot_cols = ["protein_element", "protein_atom_name", "protein_resname"]
 
     # =========================================================
-    # Correlation setup (EXACT variables)
+    # Correlation descriptors
     # =========================================================
-    numerical_dpocket_descriptors = [
-        "pock_vol", "mean_as_solv_acc", "apol_as_prop", "mean_loc_hyd_dens",
-        "hydrophobicity_score", "volume_score", "polarity_score",
-        "charge_score", "flex", "prop_polar_atm", "as_density",
-        "as_max_dst", "convex_hull_volume",
-        "surf_pol_vdw14", "surf_pol_vdw22",
-        "surf_apol_vdw14", "surf_apol_vdw22",
-        "n_abpa",
+    pocket_descriptors = [
+        c for c in df_filtered.columns
+        if (c.startswith("pyKV_")
+        or c.startswith("fpocket_explicit_")
+        or c.startswith("fpocket_cavity_"))
+        and is_numeric_dtype(df_filtered[c])
+        # and "crit" not in c
     ]
-    ligand_eval_descriptors  = [
-         "medchem.size", "gnina.minimisation_rmsd"
-    ]
+    ligand_eval_descriptors = ["medchem.size", "gnina.minimisation_rmsd"]
+    x_vars = pocket_descriptors + ligand_eval_descriptors + ["protein_dist_to_ca"]
 
-    per_sample_aggregation = (
-        clash_df_filtered
+    per_sample_agg = (
+        df_filtered
         .groupby("sample_id")
         .agg(
-            n_clashes=("clash", "sum"),
-            clash_rate=("clash", "mean"),
+            clash_rate=("clash_binary", "mean"),
             relative_distance=("relative_distance", "mean"),
-            protein_dist_to_ca=("protein_dist_to_ca", "mean"),
-            lig_vol=("lig_vol", "first"),
-            **{k: (k, "first") for k in numerical_dpocket_descriptors+ligand_eval_descriptors}
+            **{k: (k, "first") for k in x_vars}
         )
     )
 
     # =========================================================
     # Figure layout
     # =========================================================
-    fig = plt.figure(figsize=(28, 22))
-    gs = fig.add_gridspec(5, 3, hspace=0.45, wspace=0.3)
+    fig = plt.figure(figsize=(30, 60))
+    gs = fig.add_gridspec(
+        7, 3,
+        height_ratios=[1, 2, 1, 2, 0.5, 2, 3],
+        hspace=0.35,
+        wspace=0.25,
+    )
 
     # ---------------------------------------------------------
-    # Row 1: Filter-level histograms
+    # Row 1: filter-level histograms + Wasserstein
     # ---------------------------------------------------------
     ax_hist = fig.add_subplot(gs[0, :2])
     for name, df in dataframes_by_filterlevel.items():
@@ -723,12 +727,8 @@ def analyze_and_plot_clashes(
     ax_hist.set_title("Per-sample clash-rate distributions")
     ax_hist.legend()
 
-    # ---------------------------------------------------------
-    # Wasserstein table + mask agreement
-    # ---------------------------------------------------------
     ax_wass = fig.add_subplot(gs[0, 2])
     ax_wass.axis("off")
-
     table = ax_wass.table(
         cellText=[
             [a, b, f"{w1:.4f}", f"{w2:.4f}"]
@@ -741,113 +741,153 @@ def analyze_and_plot_clashes(
     table.auto_set_font_size(False)
     table.set_fontsize(9)
     table.scale(1, 1.6)
-
     ax_wass.set_title(
         "Wasserstein distances\n"
         f"Mask agreement: {total_mask_agreement:.2%}\n"
         f"Connected agreement: {connected_agreement:.2%}"
     )
 
+
+
+
     # ---------------------------------------------------------
-    # Rows 2–3: protein-axis heatmaps + tables
+    # Rows 2–3: protein-axis tests + Dunn
     # ---------------------------------------------------------
-    clash_df_before_filters["clash_binary"] = clash_df_before_filters["clash"].apply(lambda x: 1 if x else 0)
     for i, prot_col in enumerate(prot_cols):
-        ax_hm = fig.add_subplot(gs[1, i])
-        mat = clash_matrix(
-            clash_df_filtered,
-            value="clash",
-            aggfunc="mean",
-            protein_axis=prot_col,
-        )
-        sns.heatmap(mat, cmap="viridis", ax=ax_hm)
+
+        ax_hm = fig.add_subplot(gs[1, i]) 
+        mat = clash_matrix(df_filtered, value="clash", aggfunc="mean", protein_axis=prot_col, ) 
+        sns.heatmap(mat, cmap="viridis", ax=ax_hm) 
         ax_hm.set_title(f"P(clash | ligand × {prot_col})")
+        ax_hm.set_xticks(np.arange(len(mat.columns)) + 0.5)
+        ax_hm.set_xticklabels(mat.columns, rotation=90)
 
-        ax_tab = fig.add_subplot(gs[2, i])
-        ax_tab.axis("off")
-        stats = calc_means_classes(clash_df_filtered, [prot_col]).head(10)
-        table = ax_tab.table(
-            cellText=np.round(stats.values, 3),
-            rowLabels=stats.index,
-            colLabels=stats.columns,
-            loc="center",
-            cellLoc="center",
+        ax_tab = fig.add_subplot(gs[2, i]) 
+        ax_tab.axis("off") 
+        stats = calc_means_classes(df_filtered, [prot_col]).head(20) 
+        table = ax_tab.table(cellText=np.round(stats.values, 3), rowLabels=stats.index, colLabels=stats.columns, loc="center", cellLoc="center", ) 
+        table.auto_set_font_size(False) 
+        table.set_fontsize(8) 
+        table.scale(1, 1.4) 
+        ax_tab.set_title(f"P(clash | {prot_col})", pad = 0.)
+
+        # per-sample aggregation per protein class
+        ps = (
+            df_filtered
+            .groupby(["sample_id", prot_col])
+            .agg(
+                clash_rate=("clash_binary", "mean"),
+                relative_distance=("relative_distance", "mean"),
+            )
+            .reset_index()
         )
-        table.auto_set_font_size(False)
-        table.set_fontsize(8)
-        table.scale(1, 1.4)
-        ax_tab.set_title(f"Top {prot_col} by clash rate")
+        top_20_index = ps.sort_values("clash_rate")[:20].index
 
-    # ---------------------------------------------------------
-    # Rows 4–5: Targeted Pearson & Kendall correlations
-    # ---------------------------------------------------------
-    x_vars = numerical_dpocket_descriptors + ligand_eval_descriptors + ["protein_dist_to_ca"]
+        # ----- Chi-square (binary presence of clash) -----
+        ps["has_clash"] = (ps["clash_rate"] > 0).astype(int)
+        contingency = pd.crosstab(ps[prot_col], ps["has_clash"])
+        chi2, p_chi, _, _ = chi2_contingency(contingency)
 
-    for j, method in enumerate(["pearson", "kendall"]):
 
-        # ---- Row 4: clash rate vs descriptors ----
-        ax_clash = fig.add_subplot(gs[3, j])
 
-        clash_corr = pd.DataFrame(
-            {
-                "clash_rate": per_sample_aggregation[x_vars]
-                    .corrwith(per_sample_aggregation["clash_rate"], method=method),
-                "relative_distance": per_sample_aggregation[x_vars]
-                    .corrwith(per_sample_aggregation["relative_distance"], method=method),
-            }
+        # ----- Heatmap: mean clash rate -----
+        ax_hm = fig.add_subplot(gs[3, i])
+        mat = (
+            ps.groupby(prot_col)["clash_rate"]
+            .mean()
+            .to_frame("P(clash)")
+            .sort_values("P(clash)", ascending=False)
         )
-
-        sns.heatmap(
-            clash_corr,
-            cmap="coolwarm",
-            annot=True,
-            fmt=".2f",
-            cbar=True,
-            ax=ax_clash,
-        )
-
-        ax_clash.set_title(f"{method.capitalize()} – per sample clash rate and rel dist")
-        ax_clash.set_ylabel("Descriptor")
-        ax_clash.set_xlabel("per_ligand_clash_rate")
-        ax_clash.set_yticks(np.arange(len(clash_corr.index)) + 0.5)
-        ax_clash.set_yticklabels(clash_corr.index, rotation=0)
-
-
-        # ---- Row 5: relative distance vs descriptors ----
-        ax_dist = fig.add_subplot(gs[4, j])
-
-        rel_corr = pd.DataFrame(
-            {
-                "clash_binary": clash_df_before_filters[x_vars]
-                    .corrwith(clash_df_before_filters["clash_binary"], method=method),
-                "relative_distance": clash_df_before_filters[x_vars]
-                    .corrwith(clash_df_before_filters["relative_distance"], method=method),
-            }
-        )
-
-        sns.heatmap(
-            rel_corr,
-            cmap="coolwarm",
-            annot=True,
-            fmt=".2f",
-            cbar=True,
-            ax=ax_dist,
-        )
-
-        ax_dist.set_title(f"{method.capitalize()} – per atom clash and rel dist")
-        ax_dist.set_ylabel("Descriptor")
-        ax_dist.set_xlabel("relative_distance")
-        ax_dist.set_yticks(np.arange(len(rel_corr.index)) + 0.5)
-        ax_dist.set_yticklabels(rel_corr.index, rotation=0)
         
+        sns.heatmap(mat, annot=True, fmt=".2f", cmap="viridis", ax=ax_hm)
+        ax_hm.set_title(f"P(clash | sample_id, {prot_col})")
+        ax_hm.set_yticks(np.arange(len(mat.index)) + 0.5)
+        ax_hm.set_yticklabels(mat.index, rotation=0)
 
+        # ----- Kruskal–Wallis + Dunn -----
+        kw, dunn = (
+            lambda data: (
+                kruskal(*[g["relative_distance"].values
+                          for _, g in data.groupby(prot_col)]),
+                posthoc_dunn(
+                    data, #.loc[top_20_index, :],
+                    val_col="relative_distance",
+                    group_col=prot_col,
+                    p_adjust="holm",
+                )
+            )
+        )(ps)
 
+        # ----- Stats text -----
+        ax_stats = fig.add_subplot(gs[4, i])
+        ax_stats.axis("off")
+        stats_text = (
+            f"{prot_col}\n\n"
+            f"Chi-square (per-sample clash presence)\n"
+            f"χ² = {chi2:.3f}\n"
+            f"p  = {p_chi:.2e}\n\n"
+            f"Kruskal–Wallis (relative distance)\n"
+            f"H  = {kw.statistic:.3f}\n"
+            f"p  = {kw.pvalue:.2e}"
+        )
+        ax_stats.text(0.02, 0.98, stats_text, va="top", fontsize=11)
+
+        # ----- Dunn posthoc heatmap -----
+        ax_dunn = fig.add_subplot(gs[5, i])
+        sns.heatmap(
+            dunn,
+            cmap="coolwarm",
+            center=0.05,
+            # annot=True,
+            fmt=".2e",
+            ax=ax_dunn,
+        )
+        ax_dunn.set_title("Dunn posthoc (relative_distance)\nHolm-corrected p-values")
+        ax_dunn.set_xticks(np.arange(len(dunn.columns)) + 0.5)
+        ax_dunn.set_xticklabels(dunn.columns, rotation=90)
+        ax_dunn.set_yticks(np.arange(len(dunn.index)) + 0.5)
+        ax_dunn.set_yticklabels(dunn.index, rotation=0)
+
+    # ---------------------------------------------------------
+    # Row 5: correlations (Pearson vs Kendall)
+    # ---------------------------------------------------------
+    for j, method in enumerate(["pearson", "kendall"]):
+        if j % 2 != 0:
+            j += 1
+        ax_corr = fig.add_subplot(gs[6, j])
+
+        corr_df = pd.DataFrame(
+            {
+                "clash_rate": per_sample_agg[x_vars]
+                    .corrwith(per_sample_agg["clash_rate"], method=method),
+                "relative_distance": per_sample_agg[x_vars]
+                    .corrwith(per_sample_agg["relative_distance"], method=method),
+            }
+        )
+        corr_df["absolute_combined_correlation"] = corr_df["clash_rate"].abs() + corr_df["relative_distance"].abs()
+        
+        corr_df = corr_df.sort_values("absolute_combined_correlation", ascending=False).drop(["absolute_combined_correlation"], axis=1).iloc[:30, :] # top 30 only
+
+        sns.heatmap(
+            corr_df,
+            cmap="coolwarm",
+            annot=True,
+            fmt=".2f",
+            ax=ax_corr,
+        )
+        ax_corr.set_title(f"{method.capitalize()} correlations")
+        ax_corr.set_yticks(np.arange(len(corr_df.index)) + 0.5)
+        ax_corr.set_yticklabels(corr_df.index, rotation=0)
+
+    # info:
+    # crit4: the proportion of ligand atoms that have at least one pocket vertex (alpha sphere vertex) within 3 Å of them.
     # ---------------------------------------------------------
     # Save
     # ---------------------------------------------------------
     plt.savefig(out_file, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
+    # return out_file
     print(f"Saved full analysis figure → {out_file}")
 
 
@@ -856,19 +896,36 @@ def analyze_and_plot_clashes(
 # ============================================================
 
 if __name__ == "__main__":
-    # run data extraction
-    kv_args = {"step":0.6, "probe_in":0.4, "probe_out":4.0, "removal_distance":2.4}
-    input_folder = Path("../benchmarks/ours/ours_samples/")
-    final_df = full_pipeline(input_folder, dpocket_detection_radius = 10, pykv_args = kv_args, overwrite_existing=True, requested_workers=None)
-    print(final_df[["pyKV_volume", "fpocket_cavity_pock_vol", "fpocket_explicit_pock_vol"]].corr(method="kendall"))
+    # # run data extraction
+    # kv_args = {"step":0.6, "probe_in":0.4, "probe_out":4.0, "removal_distance":2.4}
+    # input_folder = Path("../benchmarks/ours/ours_samples/")
+    # final_df = full_pipeline(input_folder, dpocket_detection_radius = 10, pykv_args = kv_args, overwrite_existing=True, requested_workers=None)
+    
     # run analysis
-    # save_path = Path("../benchmarks/ours/ours_metrics/")
-    # final_df = pd.read_csv(save_path / "detailed_clash_evaluation.csv")
+    save_path = Path("../benchmarks/ours/ours_metrics/")
+    final_df = pd.read_csv(save_path / "detailed_clash_evaluation.csv")
+    
+    # # sanity checks
+    # print("Shape:", final_df.shape)
+    # print("Index unique:", final_df.index.is_unique)
+    # print("Columns unique:", final_df.columns.is_unique)
+    # print(final_df.info())
+    # print(final_df.describe().T)
+    # na_col_frac = final_df.isna().mean().sort_values(ascending=False)
+    # print("Na columns fraction:\n", na_col_frac)
+    # full_na_cols = final_df.columns[final_df.isna().all()]
+    # print("Fully NA columns:", list(full_na_cols))
+    # na_row_frac = final_df.isna().mean(axis=1)
+    # print("Na rows fraction:\n", na_row_frac.describe())
+    # full_na_rows = final_df.index[final_df.isna().all(axis=1)]
+    # print("Fully NA rows:", list(full_na_rows))
+    # print(final_df[["pyKV_volume", "fpocket_cavity_pock_vol", "fpocket_explicit_pock_vol"]].corr(method="kendall"))
 
-    # analyze_and_plot_clashes(
-    #     final_df=final_df,
-    #     save_path=save_path,
-    # )
+
+    analyze_and_plot_clashes(
+        final_df=final_df,
+        save_path=save_path,
+    )
 
 
 
