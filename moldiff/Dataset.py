@@ -36,6 +36,7 @@ class PDBbind_Dataset(Dataset):
         root: str,
         data_split: Optional[str] = None,
         dataset: Optional[str] = None,
+        include_sidechains: Optional[bool] = False
     ) -> None:
 
         """
@@ -45,7 +46,7 @@ class PDBbind_Dataset(Dataset):
             data_split: Filepath to dictionary (JSON file) containing the data split
             dataset: Which subset to load ('train' or 'test') as defined in data_split
         """
-
+        self.include_sidechains = include_sidechains
         self.logger = logging.getLogger(__name__)
         self.data_dir = root
         self.data_split = data_split
@@ -62,6 +63,8 @@ class PDBbind_Dataset(Dataset):
         
         # Process all graphs
         self.input_data = self._process_graphs()
+
+        
 
 
 
@@ -85,7 +88,7 @@ class PDBbind_Dataset(Dataset):
             included_complexes = split_dict[self.dataset]
             dataset_filepaths = []
             for id in included_complexes:
-                search_pattern = os.path.join(self.data_dir, f"{id}*.pt")
+                search_pattern = os.path.join(self.data_dir, f"{id.upper()}*.pt") #TEMPORARILY ADDED .UPPER() DUE TO MISATO UPPER CASE KEYS
                 matching_files = glob.glob(search_pattern)
                 dataset_filepaths.extend(matching_files)
             return dataset_filepaths
@@ -105,24 +108,53 @@ class PDBbind_Dataset(Dataset):
         lig_nf = 10
         prot_nf = 21
 
-        for idx, file in enumerate(self.filepaths):
-            self.logger.info(f"Processing graph {file.split('/')[-1]}: {idx} of {len(self.filepaths)}")
+        if not self.include_sidechains:
 
-            graph = torch.load(file, weights_only=False)
-            complex_id = os.path.basename(file).replace('.pt', '')
+            for idx, file in enumerate(self.filepaths):
+                self.logger.info(f"Processing graph {file.split('/')[-1]}: {idx} of {len(self.filepaths)}")
 
-            # Combine position and feature information
-            lig_coords = graph.pos[graph.lig_mask]
-            prot_coords = graph.pos[graph.prot_mask]
-            lig_features = graph.x[graph.lig_mask][:, :lig_nf]
-            prot_features = graph.x[graph.prot_mask][:, -prot_nf:]
+                graph = torch.load(file, weights_only=False)
+                complex_id = os.path.basename(file).replace('.pt', '')
 
-            processed_data[idx] = Data(
-                                        lig_coords=lig_coords.float(),
-                                        lig_features=lig_features.float(),
-                                        prot_coords=prot_coords.float(),
-                                        prot_features=prot_features.float(),
-                                        id=complex_id)
+                # Combine position and feature information
+                lig_coords = graph.pos[graph.lig_mask]
+                prot_coords = graph.pos[graph.prot_mask]
+                lig_features = graph.x[graph.lig_mask][:, :lig_nf]
+                prot_features = graph.x[graph.prot_mask][:, -prot_nf:]
+
+                processed_data[idx] = Data(
+                                            lig_coords=lig_coords.float(),
+                                            lig_features=lig_features.float(),
+                                            prot_coords=prot_coords.float(),
+                                            prot_features=prot_features.float(),
+                                            id=complex_id
+                                            )
+        else:
+            for idx, file in enumerate(self.filepaths):
+                self.logger.info(f"Processing graph {file.split('/')[-1]}: {idx} of {len(self.filepaths)}")
+
+                graph = torch.load(file, weights_only=False)
+                complex_id = os.path.basename(file).replace('.pt', '')
+
+                # Combine position and feature information
+                lig_coords = graph.pos[graph.lig_mask]
+                prot_coords = graph.pos[graph.prot_mask & graph.ca_mask]
+                lig_features = graph.x[graph.lig_mask][:, :lig_nf]
+                prot_features = graph.x[graph.prot_mask & graph.ca_mask][:, 2*lig_nf:]
+                prot_sidechain_coords = graph.pos[graph.prot_mask]
+                prot_sidechain_features = graph.x[graph.prot_mask][:, lig_nf:2*lig_nf] # here we only want atom features
+
+                processed_data[idx] = Data(
+                                            lig_coords=lig_coords.float(),
+                                            lig_features=lig_features.float(),
+                                            prot_coords=prot_coords.float(),
+                                            prot_features=prot_features.float(),
+                                            prot_sidechain_coords=prot_sidechain_coords.float(), 
+                                            prot_sidechain_features=prot_sidechain_features.float(),
+                                            id=complex_id
+                                            )
+            
+
         return processed_data
 
 
@@ -175,6 +207,7 @@ def main() -> None:
         help="Filepath to dictionary (json file) containing the data split for the graphs in the folder")
     parser.add_argument("--dataset", default=None,
         help="If a split dict is given, which subset to load ['train', 'test']")
+    parser.add_argument("--sidechains", type=lambda x: True if x=="True" else False)
 
     args = parser.parse_args()
 
@@ -186,7 +219,8 @@ def main() -> None:
         dataset = PDBbind_Dataset(
             args.data_dir,
             data_split=args.data_split,
-            dataset=args.dataset
+            dataset=args.dataset,
+            include_sidechains=args.sidechains
         )
         
         torch.save(dataset, args.save_path)
