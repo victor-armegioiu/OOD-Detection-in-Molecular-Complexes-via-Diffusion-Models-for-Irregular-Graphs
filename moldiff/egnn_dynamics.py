@@ -17,7 +17,7 @@ import math
 from typing import NamedTuple
 from torch_scatter import scatter_mean
 
-from moldiff.constants import atom_encoder
+from moldiff.constants import atom_encoder, atom_encoder_virtual
 
 
 def unsorted_segment_sum(data, segment_ids, num_segments, normalization_factor, aggregation_method: str):
@@ -663,6 +663,9 @@ class EGNNDynamics(nn.Module):
         self.condition_time = condition_time
         self.to(device)
 
+        if self.virtual_nodes_present:
+            print("[WARNING] most likely wrong atom decoder is used, use atom_encoder and _decoder _virtual")
+
     def forward(self, xh_atoms, xh_residues, t, mask_atoms, mask_residues, 
                 target_atoms=None, target_residues=None):
         """
@@ -803,7 +806,7 @@ class EGNNDynamics(nn.Module):
 
         return edges
 
-    def remove_edges_fromto_virtual_nodes(self, h_atoms, edges, probability_threshold=0.5, virtual_atom_encoder_index=atom_encoder["NONE"]):
+    def remove_edges_fromto_virtual_nodes(self, h_atoms, edges, probability_threshold=0.5, virtual_atom_encoder_index=atom_encoder_virtual["NONE"]):
         # print("Edges before:\n", edges)
         # assess which nodes are virtual with probability > 0.5
         atom_logits =  self.atom_decoder(h_atoms)

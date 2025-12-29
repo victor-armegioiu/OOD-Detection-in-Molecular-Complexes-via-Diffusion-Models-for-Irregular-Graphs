@@ -474,7 +474,7 @@ class ProteinGraphEncoder:
                 # NOTE: here would be the place to extend feature space, e.g. bond angles hardcoded to 90 here
                 chis = list(get_nerf_params(res)["chi"])
                 
-                prot_feats.append([elem == s for s in atom_decoder] + [res_name == s for s in aa_decoder3] + chis)
+                prot_feats.append([elem == s for s in atom_decoder] + [res_name == s for s in aa_decoder3])# + chis)
                 prot_coords.append([atm['pos_x'], atm['pos_y'], atm['pos_z']])
                 ca_mask.append(atm.get("name") == "CA")
             unique_interacting_residue_identifiers.append(res) # chain, num, icode to uniquely identify
@@ -701,9 +701,8 @@ if __name__ == "__main__":
 
     protein_ligand_pairs = find_protein_ligand_pairs(args.protein_source, args.ligand_source)
     
-    encode_protein_ligand_pairs(
-        protein_ligand_pairs, 
-        encoder, 
-        args.output_dir, 
-        args.include_lig_bonds, 
-        args.detect_lig_bonds_by_distance)
+    encode_protein_ligand_pairs(protein_ligand_pairs, 
+                        encoder, 
+                        args.output_dir, 
+                        args.include_lig_bonds, 
+                        args.detect_lig_bonds_by_distance)

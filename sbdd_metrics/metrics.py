@@ -120,7 +120,7 @@ class AbstractEvaluator:
     @staticmethod
     def load_molecule(molecule):
         if isinstance(molecule, (str, Path)):
-            return  
+            return Chem.SDMolSupplier(str(molecule), sanitize=False)[0]
         return Chem.Mol(molecule)  # create copy to avoid overriding properties of the input molecule
     
     @staticmethod
@@ -648,7 +648,7 @@ class ChemblRingEvaluator(AbstractEvaluator):
     ID = 'chembl_ring_systems'
 
     def __init__(self):
-        self.ring_system_lookup = RingSystemLookup.default()  # ChEMBL
+        self.ring_system_lookup = RingSystemLookup(ring_file="sbdd_metrics/chembl_ring_file.csv")  # ChEMBL
 
     def evaluate(self, molecule, protein=None):
 

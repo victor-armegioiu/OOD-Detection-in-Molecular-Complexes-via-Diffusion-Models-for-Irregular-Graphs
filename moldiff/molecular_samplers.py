@@ -16,6 +16,7 @@ import torch.nn.functional as F
 
 from moldiff.molecular_diffusion import MolecularDiffusion, remove_mean_batch, MolecularDenoisingModel, ConditionalMolecularDenoisingModel
 import moldiff.molecular_diffusion as molecular_diffusion
+from moldiff.anti_clash_guidance import SidechainRepulsiveGuidance
 
 Tensor = torch.Tensor
 TensorMapping = Mapping[str, Tensor]
@@ -800,6 +801,7 @@ class ConditionalMolecularSdeSampler(MolecularSdeSampler):
     
         
     def _create_initial_conditioning_dict(self, pocket_batch, guidance_scale):
+        """create the pocket conditining dictionary referred to with variable name cond"""
 
         assert hasattr(self, "_model"), "Attach DenoiserModel to SdeSampler!"
 
@@ -807,6 +809,9 @@ class ConditionalMolecularSdeSampler(MolecularSdeSampler):
         pocket_features = pocket_batch["pocket_features"].to(self._model.device)  # One-hot features
         pocket_mask = pocket_batch["pocket_mask"].to(self._model.device)
 
+        # for anti clash guidance we need to extract sidechain information
+        unnormalized_sidechain_coords = pocket_batch["sidechain_coords"].to(self._model.device)
+        unnormalized_sidechain_features = pocket_batch["sidechain_features"].to(self._model.device)
 
         # normalize pocket coordinates
         normalized_pocket_coordinates = pocket_coords / self.scheme.coord_norm
@@ -829,7 +834,9 @@ class ConditionalMolecularSdeSampler(MolecularSdeSampler):
             "pocket_state": pocket_state, 
             "pocket_mask": pocket_mask, 
             "guidance_scale":guidance_scale, 
-            "pocket_com": pocket_com
+            "pocket_com": pocket_com, 
+            "unnormalized_sidechain_coords": unnormalized_sidechain_coords, 
+            "unnormalized_sidechain_features": unnormalized_sidechain_features
             }
 
     def _create_molecular_dynamics(self, cond: TensorMapping | None) -> MolecularSdeDynamics:
@@ -901,6 +908,7 @@ def create_molecular_denoiser_wrapper(
 
     conditional_sampling enables classifier free weighted sampling: denoiser must have been trained that way!
     """
+
     
     def molecular_denoiser(
         molecular_state: MolecularState,
@@ -973,7 +981,9 @@ def create_molecular_denoiser_wrapper(
             pocket_mask=molecular_state.pocket_mask,
             batch_size=molecular_state.batch_size
         )
-    
+    # initialize guidance function (trial mode)
+    sidechain_repulsive_guidance_func = SidechainRepulsiveGuidance(mode="cutoff_relu")
+
     def conditional_molecular_denoiser(
         molecular_state: MolecularState,
         sigma: Tensor,
@@ -991,6 +1001,9 @@ def create_molecular_denoiser_wrapper(
         pocket_mask = cond["pocket_mask"]
         guidance_scale = cond["guidance_scale"]
 
+        unnormalized_sidechain_coords = cond["unnormalized_sidechain_coords"]
+        unnormalized_sidechain_features = cond["unnormalized_sidechain_features"]
+
         # Debugging:
         # print("Ligand Shape:", molecular_state.ligand.shape)
         # print("Ligand NF", molecular_state.ligand[0, :])
@@ -1003,7 +1016,7 @@ def create_molecular_denoiser_wrapper(
         # classifier-free guidance sampling
         with context:
             # conditional denoising
-            cond_pred_output_lig, cond_pred_output_pocket = egnn_model( # ConditionalPreconditionEGNNDynamics
+            pred_output_lig, cond_pred_output_pocket = egnn_model( # ConditionalPreconditionEGNNDynamics
                 molecular_state.ligand,
                 pocket_state,
                 sigma,
@@ -1014,62 +1027,23 @@ def create_molecular_denoiser_wrapper(
             assert torch.allclose(pocket_state[:, :n_dims], cond_pred_output_pocket[:, :n_dims], atol=1e6, rtol=1e6), \
                 "Denoiser must not denoise fixed pocket coords in conditional sampling."
             
-            # unconditional denoising
-            uncond_pred_output_lig = egnn_model.null_residue_forward(
-                molecular_state.ligand, 
-                sigma, 
-                molecular_state.ligand_mask
-            )
-
-            # prediction guiding for ligand
-            pred_output_lig = cond_pred_output_lig + guidance_scale * (cond_pred_output_lig - uncond_pred_output_lig)
-            # conditional "prediction" pocket: only embeddings needed
-            pred_output_pocket = cond_pred_output_pocket.clone()
-
-            # TODO try once without CFG and see if it even makes a difference:
-            # pred_output_lig = cond_pred_output_lig.clone()
 
             
-        
+
 
         
-        # Ligand
+        # extract
         pred_coords_lig = pred_output_lig[:, :n_dims]              # [N_lig, 3] - clean coords
         pred_logits_lig = pred_output_lig[:, n_dims:]              # [N_lig, atom_nf] - logits
         
-        # Pocket  
-        # pred_coords_pocket = pred_output_pocket[:, :n_dims]        # [N_pocket, 3] - clean coords
-        # pred_coords_pocket = molecular_state.pocket[:, :n_dims]    # keep constant
-        # pred_logits_pocket = pred_output_pocket[:, n_dims:]        # [N_pocket, residue_nf] - logits
-        
         # Convert logits to probabilities
         probs_lig = F.softmax(pred_logits_lig, dim=-1)             # [N_lig, atom_nf]
-        # probs_pocket = F.softmax(pred_logits_pocket, dim=-1)       # [N_pocket, residue_nf]
-
-        # NOTE temporary debug
-        # none_idx = -1 
-        # p_none_mean = probs_lig[:, none_idx].mean().item()
-        # p_none_max  = probs_lig[:, none_idx].max().item()
-
-        # wandb.log(
-        #     {
-        #         "sampling/p_none_mean": p_none_mean,
-        #         "sampling/p_none_max":  p_none_max,
-        #         "sampling/sample_step_sigma": float(sigma if sigma.dim() == 0 else sigma[0]),
-        #     }
-        # )
-
         
         # Get normalized embeddings from the model
         atom_embeddings = egnn_model.egnn_dynamics.atom_encoder(
             torch.eye(pred_logits_lig.size(-1), device=pred_logits_lig.device)
         )  # [atom_nf, joint_nf]
         atom_embeddings = F.normalize(atom_embeddings, dim=-1)
-        
-        # residue_embeddings = egnn_model.egnn_dynamics.residue_encoder(
-        #     torch.eye(pred_logits_pocket.size(-1), device=pred_logits_pocket.device)
-        # )  # [residue_nf, joint_nf] 
-        # residue_embeddings = F.normalize(residue_embeddings, dim=-1)
         
         # Score interpolation: Σ p_i * (e_i - x_noisy) / σ²
         # This gives us the "effective clean embedding prediction"
@@ -1084,6 +1058,21 @@ def create_molecular_denoiser_wrapper(
         # Weighted sum of embeddings (what CDCD calls x̂_0)
         interpolated_embeddings_lig = torch.matmul(probs_lig, atom_embeddings)      # [N_lig, joint_nf]
         # interpolated_embeddings_pocket = torch.matmul(probs_pocket, residue_embeddings)  # [N_pocket, joint_nf]
+
+        # Apply Guidance
+        if guidance_scale > 0:
+            sidechain_repulsion_coord_signal = torch.concat([
+                sidechain_repulsive_guidance_func(
+                        lig_coords=pred_coords_lig[molecular_state.ligand_mask == idx] * scheme.coord_norm, # unnormalize to match atom radii scale
+                        sidechain_coords=unnormalized_sidechain_coords,
+                        lig_features=probs_lig[molecular_state.ligand_mask == idx],
+                        sidechain_features=unnormalized_sidechain_features
+                ) for idx in molecular_state.ligand_mask.unique()
+            ], dim=0)
+            assert sidechain_repulsion_coord_signal.shape ==pred_coords_lig.shape, "Score and clean prediction shape don't match"
+
+            pred_coords_lig = pred_coords_lig + guidance_scale * sidechain_repulsion_coord_signal
+
         
         # For the SDE, we need to return the "effective clean prediction"
         # This combines clean coordinates with interpolated embeddings
@@ -1238,7 +1227,7 @@ def test_molecular_samplers():
         # print(f"Model norm_values: {model.scheme.norm_values}")
         # print(f"Model norm_biases: {model.scheme.norm_biases}")
 
-def create_fake_pocket_batch(batch_size: int, pocket_sizes: list, residue_nf: int, device: str = 'cuda') -> Dict:
+def create_fake_pocket_batch(batch_size: int, pocket_sizes: list, residue_nf: int, atom_nf: int, device: str = 'cuda') -> Dict:
     """Create realistic fake molecular data for training on `device`"""
     
     total_pocket_atoms = sum(pocket_sizes)
@@ -1251,10 +1240,13 @@ def create_fake_pocket_batch(batch_size: int, pocket_sizes: list, residue_nf: in
     
     # Generate coordinates (CUDA)
     pocket_coords = torch.randn(total_pocket_atoms, 3, device=device) * 5.0
+    sidechain_coords = torch.randn(total_pocket_atoms * 10, 3, device=device) * 5.
     
     # Generate categorical features (one-hot encoded, CUDA)
     pocket_residue_types = torch.randint(0, residue_nf, (total_pocket_atoms,), device=device)
     pocket_features = F.one_hot(pocket_residue_types, residue_nf).float()
+    sidechain_atom_type = torch.randint(0, atom_nf, (total_pocket_atoms * 10,), device=device)
+    sidechain_features = F.one_hot(sidechain_atom_type, atom_nf).float()
     
     
     return {
@@ -1262,7 +1254,9 @@ def create_fake_pocket_batch(batch_size: int, pocket_sizes: list, residue_nf: in
         'pocket_features': pocket_features,
         'pocket_mask': pocket_mask,
         'batch_size': batch_size,
-        'pocket_sizes': pocket_sizes
+        'pocket_sizes': pocket_sizes, 
+        'sidechain_coords': sidechain_coords, 
+        'sidechain_features': sidechain_features
     }
 
 def test_conditional_molecular_samplers():
@@ -1300,7 +1294,7 @@ def test_conditional_molecular_samplers():
 
     assert sampler.__class__.__name__ == "ConditionalMolecularSdeSampler", f"sampler's name is {sampler.__class__.__name__}"
 
-    batch = create_fake_pocket_batch(len(pocket_sizes), pocket_sizes, residue_nf)
+    batch = create_fake_pocket_batch(len(pocket_sizes), pocket_sizes, residue_nf, atom_nf)
 
     cond = sampler._create_initial_conditioning_dict(pocket_batch = batch, guidance_scale = 1)
     

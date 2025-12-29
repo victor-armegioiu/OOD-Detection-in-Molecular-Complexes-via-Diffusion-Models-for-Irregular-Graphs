@@ -2,9 +2,8 @@
 # idea: for every ligand atom, get a gradient pulling them away from the neighbouring protein atoms
 
 import torch
-from main_optimize import create_batches_from_dataset
-from moldiff.Dataset import PDBbind_Dataset
-from moldiff.constants import atom_decoder
+
+from .constants import atom_decoder
 from torch_geometric.loader import DataLoader
 from typing import List, Dict, Tuple, Optional
 
@@ -446,6 +445,9 @@ def plot_lig_coords_over_time_with_table(
 
 
 if __name__ == "__main__":
+
+    from main_optimize import create_batches_from_dataset
+    from moldiff.Dataset import PDBbind_Dataset
     fix_all_seeds(42)
     # unpack
     batch_size = 1 # TODO make sure it works across masks (scatter funtctionof gemometric?)

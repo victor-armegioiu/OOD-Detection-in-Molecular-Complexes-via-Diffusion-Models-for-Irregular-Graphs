@@ -7,24 +7,22 @@ import warnings
 from pathlib import Path
 import math
 
-from moldiff.constants import (
-    COVALENT_RADII, 
-    bond_decoder, 
-    atom_encoder,
-    atom_decoder, 
-    aa_decoder3, 
-    metals, 
-    protein_letters_1to3, 
-    protein_letters_3to1,
-    protein_letters_3to1_extended, 
-    aa_atom_index, 
-    aa_atom_mask, 
-    aa_nerf_indices, 
-    aa_chi_indices, 
-    aa_chi_anchor_atom
-)  
+from moldiff.constants import (COVALENT_RADII, 
+                       bond_decoder, 
+                       atom_encoder,
+                       atom_decoder, 
+                       aa_decoder3, 
+                       metals, 
+                       protein_letters_1to3, 
+                       protein_letters_3to1,
+                       protein_letters_3to1_extended, 
+                       aa_atom_index, 
+                       aa_atom_mask, 
+                       aa_nerf_indices, 
+                       aa_chi_indices, 
+                       aa_chi_anchor_atom)  
 
-from moldiff.nerf import ic_to_coords, get_nerf_params_wrapper
+# from nerf import ic_to_coords, get_nerf_params_wrapper
 
 
 class AtomInfo(NamedTuple):
@@ -61,7 +59,7 @@ class Protein:
     def __init__(
             self, 
             pdb_path: str, 
-            interacting_residues: List[Dict[str, Any]] = [dict(zip(["chain_name", "seqid_num", "seqid_icode"], 3*[None]))]
+            interacting_residues: List[Dict[str, Any]] | None = None
             ):
         self.pdb_path = pdb_path
         self.interacting_residues = interacting_residues
@@ -70,14 +68,15 @@ class Protein:
         self._structure.setup_entities()
 
         # check residues
-        self.parser_type = "gemmi" if isinstance(interacting_residues[0], gemmi.Residue) else "dict"
-        if self.parser_type == "gemmi":
-            # NOTE: main barrier is that chain name is not stored in gemmi.Residue objects
-            raise NotImplementedError("Side-chain rotation for list gemmi residues not implemented yet: Chain issue")
-        else:
-            # check if elements have the necessary keys: 
-            assert all([key in interacting_residues[0].keys() for key in ["chain_name", "seqid_num", "seqid_icode"]]), (
-                "A key of "  + ",".join(["chain_name", "seqid_num", "seqid_icode"]) +f" is missing: {interacting_residues[0].keys()}")
+        if self.interacting_residues is not None:
+            self.parser_type = "gemmi" if isinstance(interacting_residues[0], gemmi.Residue) else "dict"
+            if self.parser_type == "gemmi":
+                # NOTE: main barrier is that chain name is not stored in gemmi.Residue objects
+                raise NotImplementedError("Side-chain rotation for list gemmi residues not implemented yet: Chain issue")
+            else:
+                # check if elements have the necessary keys: 
+                assert all([key in interacting_residues[0].keys() for key in ["chain_name", "seqid_num", "seqid_icode"]]), (
+                    "A key of "  + ",".join(["chain_name", "seqid_num", "seqid_icode"]) +f" is missing: {interacting_residues[0].keys()}")
         
 
     @property
@@ -146,6 +145,9 @@ class Protein:
             self, 
             new_chi
            ):
+
+        if self.interacting_residues is None:
+            raise ValueError("Pass interacting_residue list upon Protein object instantiation")
 
         get_nerf_params = get_nerf_params_wrapper(self.parser_type)
         nerf_params = [get_nerf_params(residue) for residue in self.interacting_residues]

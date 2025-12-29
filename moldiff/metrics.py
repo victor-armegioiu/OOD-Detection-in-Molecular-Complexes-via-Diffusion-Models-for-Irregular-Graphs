@@ -42,6 +42,12 @@ def load_checkpoint(checkpoint_path: str) -> MolecularDenoisingModel:
     
     # Recreate model 
     model_params = checkpoint['model_params']
+
+    # Safety guard to load ckpt before virtual nodes feature
+    if 'n_max_virtual_nodes' not in model_params.keys():
+         model_params['n_max_virtual_nodes'] = 0
+         model_params['virtual_nodes_edgecut_probability_threshold'] = 1
+
     
     # Recreate the diffusion scheme from parameters    
     scheme_params = model_params['scheme_params']
