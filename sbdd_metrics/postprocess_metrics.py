@@ -160,7 +160,8 @@ def prepare_baseline_data(root_path, baseline_name):
     distributions = flatten_distribution(distributions, name=baseline_name, table=metrics_detailed)
     distributions['energy.energy'] = [v for v in distributions['energy.energy'] if -1000 <= v <= 1000]
     for prop in MEDCHEM_PROPS + DOCKING_PROPS:
-        distributions[prop] = metrics_detailed[prop].dropna().values.tolist()
+        if prop in distributions:
+            distributions[prop] = metrics_detailed[prop].dropna().values.tolist()
 
     smiles = metrics_detailed['representation.smiles']
     atom_distribution, bond_distribution = compute_discrete_distributions(smiles, name=baseline_name)

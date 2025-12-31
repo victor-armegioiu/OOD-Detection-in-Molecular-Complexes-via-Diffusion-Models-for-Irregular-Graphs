@@ -143,17 +143,17 @@ def sample_molecule_given_all_atom_graph(
     # expand the coordinates and features to the desired n_samples
     pocket_coords_expanded = prot_coords.tile((n_samples, 1))
     pocket_feats_expanded = prot_feats.tile((n_samples, 1))
-    prot_sidechain_coords_expanded = prot_sidechain_coords.tile((n_samples, 1))
-    prot_sidechain_features_expanded = prot_sidechain_features.tile((n_samples, 1))
+    # prot_sidechain_coords_expanded = prot_sidechain_coords.tile((n_samples, 1))
+    # prot_sidechain_features_expanded = prot_sidechain_features.tile((n_samples, 1))
     pocket_mask = torch.arange(n_samples).repeat_interleave(prot_coords.shape[0])
 
 
     sample_batch = {
         'pocket_mask': pocket_mask,
         'pocket_coords': pocket_coords_expanded,
-        'sidechain_coords': prot_sidechain_coords_expanded,
-        'pocket_features': pocket_feats_expanded,
-        'sidechain_features': prot_sidechain_features_expanded
+        'sidechain_coords': prot_sidechain_coords,
+        'pocket_features': pocket_feats_expanded, # pocket_feats_expanded, -> we reuse the same sidechain coords in all of molecular sampler
+        'sidechain_features': prot_sidechain_features, # prot_sidechain_features_expanded
     }
 
     # Sample molecules conditionally

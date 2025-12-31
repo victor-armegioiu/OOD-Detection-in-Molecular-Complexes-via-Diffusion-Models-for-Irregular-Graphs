@@ -70,7 +70,7 @@ class SidechainRepulsiveGuidance:
 
     def __init__(
             self,
-            mode = "cutoff_relu", 
+            mode = "cutoff_relu", # neg_logsumexp, topk 
             search_distance: float = 4.0,
             radius_type: str = "vdw", 
             temperature: float = 0.5,
@@ -107,17 +107,26 @@ class SidechainRepulsiveGuidance:
         sidechain_features: torch.Tensor
     ):
         
-        lig_coords_grad = lig_coords.clone().detach().requires_grad_(True)
-
-        relative_distance = self.proximal_relative_distance(lig_coords_grad, sidechain_coords, lig_features, sidechain_features)
         
-        score_per_lig_atom = self.guidance_func(relative_distance)
+        with torch.enable_grad():
+            lig_coords_grad = lig_coords.clone().detach().requires_grad_(True)
 
-        score = score_per_lig_atom.sum()
+            relative_distance = self.proximal_relative_distance(
+                lig_coords_grad, sidechain_coords, lig_features, sidechain_features
+            )
 
-        score.backward()
-        
-        return lig_coords_grad.grad.clone()
+            if not torch.isfinite(relative_distance).all():
+                return torch.zeros_like(lig_coords_grad) # no guidance if there are no proximal sidechains
+
+            score_per_lig_atom = self.guidance_func(relative_distance)
+            score = score_per_lig_atom.sum()
+
+            grad = torch.autograd.grad(
+                score, lig_coords_grad, retain_graph=False, create_graph=False
+            )[0]
+
+        return grad.clone()
+            
 
 
     def proximal_relative_distance(
@@ -154,7 +163,8 @@ class SidechainRepulsiveGuidance:
         dist = torch.cdist(lig_coords, sidechain_coords)  # (N_lig, N_sc)
         mask_sc = dist.min(dim=0).values <= self.search_distance
         if mask_sc.sum().item() == 0:
-            return torch.ones(lig_coords.shape[0], sidechain_coords.shape[0]) * float("nan")
+            return torch.ones(lig_coords.shape[0], sidechain_coords.shape[0]) * float("inf")
+            # raise RuntimeError("No proximal sidechain atoms found — guidance undefined")
 
         dist = dist[:, mask_sc]
         sc_radii = sc_radii[mask_sc]
@@ -446,12 +456,12 @@ def plot_lig_coords_over_time_with_table(
 
 if __name__ == "__main__":
 
-    from main_optimize import create_batches_from_dataset
     from moldiff.Dataset import PDBbind_Dataset
+
     fix_all_seeds(42)
     # unpack
     batch_size = 1 # TODO make sure it works across masks (scatter funtctionof gemometric?)
-    graphs = create_batches_from_dataset("../bioinformatics/example_dataset_graph_level.pt", {"batch_size": batch_size})
+    graphs = create_batches_from_dataset("../bioinformatics/example_dataset_atom_level.pt", {"batch_size": batch_size})
     batch = next(iter(graphs))
     sidechain_coords =  batch["sidechain_coords"].to("cpu")
     lig_features = batch["ligand_features"].to("cpu")  # One-hot features

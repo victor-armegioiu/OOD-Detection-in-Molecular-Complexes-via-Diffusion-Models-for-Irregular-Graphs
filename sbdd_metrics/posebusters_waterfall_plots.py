@@ -423,15 +423,16 @@ if __name__ == "__main__":
         "posebusters.mol_pred_loaded",
         "posebusters.sanitization",
         "posebusters.all_atoms_connected",
+        "posebusters.internal_steric_clash",
         "posebusters.aromatic_ring_flatness",
         "posebusters.bond_angles",
         "posebusters.bond_lengths",
         "posebusters.double_bond_flatness",
         # "posebusters.inchi_convertible",
         # "posebusters.internal_energy",
-        "posebusters.internal_steric_clash",
         # "posebusters.minimum_distance_to_inorganic_cofactors",
         # "posebusters.minimum_distance_to_organic_cofactors",
+        "posebusters.volume_overlap_with_protein",
         "posebusters.minimum_distance_to_protein",
         # "posebusters.minimum_distance_to_waters",
         "posebusters.protein-ligand_maximum_distance",
@@ -505,5 +506,7 @@ if __name__ == "__main__":
 
     print("Done.")
 
+# ours vs other baselines
 # python -m sbdd_metrics.posebusters_waterfall_plots --df ../benchmarks/ours/ours_metrics/metrics_detailed.csv ../benchmarks/diffsbdd/diffsbdd_metrics/metrics_detailed.csv ../benchmarks/drugflow/drugflow_metrics/metrics_detailed.csv ../benchmarks/targetdiff/targetdiff_metrics/metrics_detailed.csv --labels ours diff_sbdd drugflow targetdiff --out ../benchmarks/posebusters_waterfall_plots --global_only
-
+# # CG guidance
+# python -m sbdd_metrics.posebusters_waterfall_plots --df ../benchmarks/ours_guidanceBL/ours_guidanceBL_metrics/metrics_detailed.csv ../benchmarks/ours_guidance_0.7neg_logsumexp/ours_guidance_0.7neg_logsumexp_metrics/metrics_detailed.csv ../benchmarks/ours_guidance_0.7cutoff_relu/ours_guidance_0.7cutoff_relu_metrics/metrics_detailed.csv ../benchmarks/ours_guidance_0.5topk/ours_guidance_0.5topk_metrics/metrics_detailed.csv --labels BL neg_logsumexp cutoff_relu topk --out ../benchmarks/posebusters_waterfall_plots --global_only

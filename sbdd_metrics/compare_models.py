@@ -4,6 +4,95 @@ import json
 from typing import Dict, List, Union, Optional
 import pandas as pd
 
+import re
+import pandas as pd
+import numpy as np
+
+_MEAN_STD_RE = re.compile(
+    r"""^\s*
+        (?P<mean>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)   # mean
+        \s*\(\s*
+        (?P<std>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)    # std
+        \s*\)\s*$
+    """,
+    re.VERBOSE,
+)
+
+def split_mean_std_columns(
+    df: pd.DataFrame,
+    *,
+    sample_size: int = 50,
+    min_match_fraction: float = 0.6,
+    decimal_comma: bool = True,
+    drop_original: bool = False,
+) -> pd.DataFrame:
+    """
+    Split columns containing values like "mean (std)" into two numeric columns:
+      <col>.mean and <col>.std
+
+    - Leaves word/text columns untouched.
+    - Only splits a column if enough non-null entries match the pattern.
+    - Returns a new DataFrame (does not mutate input unless drop_original=True with copy=False).
+
+    Args:
+        df: input dataframe
+        sample_size: number of non-null values to sample per column for deciding whether to split
+        min_match_fraction: fraction of sampled non-null values that must match pattern to split
+        decimal_comma: if True, also accept comma decimals like "12,3 (4,1)"
+        drop_original: if True, drop the original mixed column after splitting
+
+    Returns:
+        A new DataFrame with split columns added (and optionally originals dropped).
+    """
+    out = df.copy()
+
+    for col in list(out.columns):
+        s = out[col]
+        if not isinstance(s, pd.Series):
+            continue
+
+        # Work on string view for detection/parsing, but keep NaNs
+        s_str = s.astype("string")
+
+        # Take a sample of non-null values for decision
+        non_null = s_str.dropna()
+        if non_null.empty:
+            continue
+
+        sample = non_null.head(sample_size)
+
+        # Optional: normalize decimal comma for detection/parsing
+        if decimal_comma:
+            sample_norm = sample.str.replace(",", ".", regex=False)
+        else:
+            sample_norm = sample
+
+        # Count pattern matches in sample
+        matches = sample_norm.str.match(_MEAN_STD_RE)
+        match_fraction = float(matches.mean()) if len(matches) else 0.0
+
+        if match_fraction < min_match_fraction:
+            continue  # treat as non-mean/std column; leave untouched
+
+        # Parse full column
+        parse_src = s_str
+        if decimal_comma:
+            parse_src = parse_src.str.replace(",", ".", regex=False)
+
+        extracted = parse_src.str.extract(_MEAN_STD_RE)
+        # Convert to numeric; invalid becomes NaN
+        mean_vals = pd.to_numeric(extracted["mean"], errors="coerce")
+        std_vals = pd.to_numeric(extracted["std"], errors="coerce")
+
+        out[f"{col}.mean"] = mean_vals
+        out[f"{col}.std"] = std_vals
+
+        if drop_original:
+            out.drop(columns=[col], inplace=True)
+
+    return out
+
+
 def collect_metric_files(base_dir: Union[str, Path]) -> Dict[str, List[str]]:
     """
     Scan base_dir for structure: base_dir/<model_name>/<model_name>_metrics/
@@ -194,6 +283,7 @@ def stack_and_save_metrics(base_dir: Union[str, Path],
 
         # concat side-by-side (columns union)
         df_combined = pd.concat([df_agg, df_dist], axis=1)
+        df_combined = split_mean_std_columns(df_combined, drop_original=True)
         df_combined.to_csv(combined_out)
 
         return df_combined

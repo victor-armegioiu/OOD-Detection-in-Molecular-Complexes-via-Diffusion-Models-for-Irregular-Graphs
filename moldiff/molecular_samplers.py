@@ -982,7 +982,7 @@ def create_molecular_denoiser_wrapper(
             batch_size=molecular_state.batch_size
         )
     # initialize guidance function (trial mode)
-    sidechain_repulsive_guidance_func = SidechainRepulsiveGuidance(mode="cutoff_relu")
+    sidechain_repulsive_guidance_func = SidechainRepulsiveGuidance(mode="cutoff_relu") # "cutoff_relu", "neg_logsumexp", "topk" -> cutoff relu has much smaller range, remember that!
 
     def conditional_molecular_denoiser(
         molecular_state: MolecularState,
@@ -1061,6 +1061,7 @@ def create_molecular_denoiser_wrapper(
 
         # Apply Guidance
         if guidance_scale > 0:
+            # with torch.enable_grad():
             sidechain_repulsion_coord_signal = torch.concat([
                 sidechain_repulsive_guidance_func(
                         lig_coords=pred_coords_lig[molecular_state.ligand_mask == idx] * scheme.coord_norm, # unnormalize to match atom radii scale
@@ -1071,7 +1072,7 @@ def create_molecular_denoiser_wrapper(
             ], dim=0)
             assert sidechain_repulsion_coord_signal.shape ==pred_coords_lig.shape, "Score and clean prediction shape don't match"
 
-            pred_coords_lig = pred_coords_lig + guidance_scale * sidechain_repulsion_coord_signal
+            pred_coords_lig = (pred_coords_lig + guidance_scale * sidechain_repulsion_coord_signal).detach()
 
         
         # For the SDE, we need to return the "effective clean prediction"
