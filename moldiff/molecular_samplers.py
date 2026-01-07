@@ -693,7 +693,7 @@ class MolecularSdeSampler(MolecularSampler):
                 else:
                     guidance_coeff_lig = guidance_coeff
 
-                drift_ligand[:, :self.n_dims] =- guidance_coeff_lig * denoiser_output.guidance_score
+                drift_ligand[:, :self.n_dims] = drift_ligand[:, :self.n_dims] - guidance_coeff_lig * denoiser_output.guidance_score
             
             return MolecularState(
                 ligand=drift_ligand,
