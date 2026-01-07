@@ -17,7 +17,8 @@ import math
 from typing import NamedTuple
 from torch_scatter import scatter_mean
 
-from moldiff.constants import atom_encoder, atom_encoder_virtual
+from moldiff.constants import atom_encoder, atom_decoder, atom_encoder_virtual
+from rdkit.Chem.rdchem import GetPeriodicTable
 
 
 def unsorted_segment_sum(data, segment_ids, num_segments, normalization_factor, aggregation_method: str):
@@ -329,7 +330,16 @@ class EGNN(nn.Module):
 class GeometricRegularizer(nn.Module):
     """Geometric regularization losses for molecular diffusion"""
     
-    def __init__(self, device='cpu'):
+    def __init__(
+        self,
+        device: str = "cpu",
+        mode: str = "cutoff_relu",  # neg_logsumexp, topk
+        search_distance: float = 4.0,
+        radius_type: str = "vdw",
+        temperature: float = 0.5,
+        clash_cutoff: float = 0.75,
+        k: int = 3,
+    ):
         super().__init__()
         self.device = device
 
@@ -558,21 +568,155 @@ class GeometricRegularizer(nn.Module):
         
         return torch.stack(penalties).mean() if penalties else torch.tensor(0.0, device=coords.device)
 
-    def comprehensive_geometric_loss(self, coords, target_coords, mask, 
-                                   weights=(1.0, 0.8, 0.5, 0.3)):
-        """
-        Combine multiple geometric constraints
-        """
-        w_components, w_rg, w_cycles, w_distances = weights
 
-        total_loss = (
-            w_components * self.reachability_loss(coords, target_coords, mask) +
-            w_rg * self.radius_of_gyration_loss(coords, target_coords, mask) +
-            w_cycles * self.cycle_betti_loss(coords, mask) +
-            w_distances * self.pairwise_distance_loss(coords, mask)
+    # --- Sidechain repulsion ---
+
+    def sidechain_repulsion(
+        self,
+        lig_coords: torch.Tensor,
+        sidechain_coords: torch.Tensor,
+        lig_features: torch.Tensor,
+        sidechain_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Returns a scalar loss that penalizes ligand atoms getting too close
+        to proximal protein sidechain atoms (normalized by vdW radii).
+        """
+        rel = self._proximal_relative_distance(
+            lig_coords, sidechain_coords, lig_features, sidechain_features
         )
+
+        # No proximal sidechains -> no penalty (scalar zero on correct device/dtype)
+        if rel.numel() == 0:
+            return lig_coords.new_zeros(())
+
+        score_per_lig_atom = self.guidance_func(rel)  # (N_lig,)
+        loss = score_per_lig_atom.mean()  # size-normalized
+        return loss
+
+    def _proximal_relative_distance(
+        self,
+        lig_coords: torch.Tensor,
+        sidechain_coords: torch.Tensor,
+        lig_features: torch.Tensor,
+        sidechain_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute relative distances:
+            d_ij = ||x_i - y_j|| / (r_i + r_j)
+
+        Returns:
+            rel: (N_lig, N_sc_prox) tensor. If no proximal sidechains exist,
+                 returns an empty tensor of shape (N_lig, 0).
+        """
+        # NOTE: atom_decoder must exist in the outer scope or be passed in / stored.
+        # It should map class index -> atomic number (int) or element (RDKit expects atomic number).
+        lig_types = torch.argmax(lig_features, dim=1).detach().cpu().tolist()
+        sc_types = torch.argmax(sidechain_features, dim=1).detach().cpu().tolist()
+
+        lig_radii = torch.tensor(
+            [self._get_radius(atom_decoder[k]) for k in lig_types],
+            device=lig_coords.device,
+            dtype=lig_coords.dtype,
+        )
+        sc_radii = torch.tensor(
+            [self._get_radius(atom_decoder[k]) for k in sc_types],
+            device=lig_coords.device,
+            dtype=lig_coords.dtype,
+        )
+
+        dist = torch.cdist(lig_coords, sidechain_coords)  # (N_lig, N_sc)
+
+        # Select proximal sidechain atoms (within search_distance of any ligand atom)
+        mask_sc = dist.min(dim=0).values <= self.search_distance
+        if mask_sc.sum().item() == 0:
+            # Return empty "no-contact" tensor on correct device/dtype
+            return lig_coords.new_empty((lig_coords.size(0), 0))
+
+        dist = dist[:, mask_sc]          # (N_lig, N_sc_prox)
+        sc_radii = sc_radii[mask_sc]     # (N_sc_prox,)
+
+        rel = dist / (lig_radii[:, None] + sc_radii[None, :])  # (N_lig, N_sc_prox)
+        return rel
+
+    def _guideby_topk(self, relative_distance: torch.Tensor) -> torch.Tensor:
+        # (N_lig, N_sc_prox) -> (N_lig,)
+        distance_score_per_atom = (
+            relative_distance.topk(k=self.k, dim=1, largest=False).values.mean(dim=1)
+        )
+        return distance_score_per_atom
+
+    def _guideby_neg_logsumexp(self, relative_distance: torch.Tensor) -> torch.Tensor:
+        """
+        Soft-min over sidechain neighbors:
+            softmin(d) = -T * logsumexp(-d/T)
+        """
+        return -self.temperature * torch.logsumexp(-relative_distance / self.temperature, dim=1)
+
+    def _guideby_cutoff_relu(self, relative_distance: torch.Tensor) -> torch.Tensor:
+        """
+        Penalize distances below clash_cutoff with a smooth barrier (Softplus).
+        We then aggregate across neighbors with a soft-min like operator.
+        """
+        # Positive when (cutoff - d) is positive -> "clashy"; smooth instead of ReLU
+        barrier = self.softplus(self.clash_cutoff - relative_distance)  # (N_lig, N_sc_prox)
+
+        # Aggregate over neighbors: emphasize the worst offenders
+        # (smaller relative distance -> larger barrier -> larger contribution)
+        distance_score_per_atom = self.temperature * torch.logsumexp(
+            barrier / self.temperature, dim=1
+        )
+        return distance_score_per_atom
+
+    def _get_radius(self, atomic_num: int) -> float:
+        # RDKit periodic table expects atomic numbers
+        return float(GetPeriodicTable().GetRvdw(int(atomic_num)))
+
+    # --- Wrapper ---
+    
+    def comprehensive_geometric_loss(
+        self,
+        coords: torch.Tensor,
+        target_coords: torch.Tensor,
+        mask: torch.Tensor,
+        lig_features: torch.Tensor | None = None,
+        sidechain_coords: torch.Tensor | None = None,
+        sidechain_features: torch.Tensor | None = None,
+        weights=(1.0, 0.8, 0.5, 0.3),
+    ) -> torch.Tensor:
+        """
+        Combine multiple geometric constraints (currently only sidechain repulsion).
+        """        
+
+
+
+        # w_components, w_rg, w_cycles, w_distances = weights
+
+        # total_loss = (
+        #     w_components * self.reachability_loss(coords, target_coords, mask) +
+        #     w_rg * self.radius_of_gyration_loss(coords, target_coords, mask) +
+        #     w_cycles * self.cycle_betti_loss(coords, mask) +
+        #     w_distances * self.pairwise_distance_loss(coords, mask)
+        # )
         
-        return total_loss
+        have_repulsion_inputs = (
+            lig_features is not None
+            and sidechain_coords is not None
+            and sidechain_features is not None
+        )
+        if not have_repulsion_inputs:
+            return coords.new_zeros(())
+        
+        final_loss = torch.stack([
+            self.sidechain_repulsion(
+                lig_coords=coords[mask == i],
+                sidechain_coords=sidechain_coords,
+                lig_features=lig_features[mask == i],
+                sidechain_features=sidechain_features,
+            ) for i in mask.unique()
+        ]).mean()
+
+        return final_loss
 
 
 class EGNNDynamics(nn.Module):
@@ -667,7 +811,7 @@ class EGNNDynamics(nn.Module):
             print("[WARNING] most likely wrong atom decoder is used, use atom_encoder and _decoder _virtual")
 
     def forward(self, xh_atoms, xh_residues, t, mask_atoms, mask_residues, 
-                target_atoms=None, target_residues=None):
+                target_atoms=None, target_residues=None, sidechain_repulsion_dict={}):
         """
         Forward pass of EGNN Dynamics
         
@@ -747,6 +891,15 @@ class EGNNDynamics(nn.Module):
                                      batch_mask=mask, edge_attr=edge_types)
         vel = (x_final - x)
 
+        if self.condition_time:
+            # Slice off last dimension which represented time.
+            h_final = h_final[:, :-1]
+
+        # decode atom and residue features
+        h_final_atoms = self.atom_decoder(h_final[:len(mask_atoms)])
+        h_final_residues = self.residue_decoder(h_final[len(mask_atoms):]) # TODO clarify if this has to stay. is does because we're still learning these embeddings, right?
+
+
         # Geometric regularization loss (computed on predicted coordinates)
         if self.geometric_regularization and target_atoms is not None and self.training:
             # Extract predicted and target coordinates for ligands only
@@ -755,19 +908,12 @@ class EGNNDynamics(nn.Module):
             
             # Compute geometric loss
             geom_loss = self.geometric_regularizer.comprehensive_geometric_loss(
-                pred_ligand_coords, target_ligand_coords, mask_atoms
+                pred_ligand_coords, target_ligand_coords, mask_atoms, lig_features = h_final_atoms, **sidechain_repulsion_dict
             )
             self.last_geometric_loss = geom_loss * self.geom_loss_weight
         else:
             self.last_geometric_loss = torch.tensor(0.0, device=self.device)
 
-        if self.condition_time:
-            # Slice off last dimension which represented time.
-            h_final = h_final[:, :-1]
-
-        # decode atom and residue features
-        h_final_atoms = self.atom_decoder(h_final[:len(mask_atoms)])
-        h_final_residues = self.residue_decoder(h_final[len(mask_atoms):]) # TODO clarify if this has to stay. is does because we're still learning these embeddings, right?
 
         if torch.any(torch.isnan(vel)):
             if self.training:
@@ -998,7 +1144,7 @@ class PreconditionedEGNNDynamics(nn.Module):
     
         
     def forward(self, xh_atoms, xh_residues, sigma, mask_atoms, mask_residues,
-                target_atoms=None, target_residues=None):
+                target_atoms=None, target_residues=None, sidechain_repulsion_dict={}):
         """
         Preconditioned forward pass with separate handling for coordinates and categorical features.
 
@@ -1054,7 +1200,7 @@ class PreconditionedEGNNDynamics(nn.Module):
         # Takes input of shape [N, joint_nf] and output of shape [N, logits] (logits are of len atom_nf or residue_nf, resp.)
         f_ligand, f_pocket = self.egnn_dynamics(
             xh_ligand_scaled, xh_residues_scaled, t, mask_atoms, mask_residues,
-            target_atoms=target_atoms, target_residues=target_residues
+            target_atoms=target_atoms, target_residues=target_residues, sidechain_repulsion_dict=sidechain_repulsion_dict
         )
         
         # Split EGNN output into coordinates and logits
@@ -1381,7 +1527,7 @@ def test_egnn_dynamics_conditional():
     n_dims = 3
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     joint_nf = 8
-    virtual_atoms_present = True
+    virtual_atoms_present = False
     virtual_nodes_edgecut_probability_threshold=0.2 # for testing random embeddings, otherwise 0.5
     # n_virtual_atoms = 2
     

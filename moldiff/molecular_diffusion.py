@@ -701,6 +701,12 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         pocket_mask = batch["pocket_mask"].to(self.device)
         batch_size = len(torch.unique(torch.cat([lig_mask, pocket_mask])))
 
+        sidechain_repulsion_dict = {
+            "sidechain_coords": batch["sidechain_coords"], 
+            "sidechain_features": batch["sidechain_features"]
+
+        }
+
         # print('Feature before virtual nodes:\n', lig_features.shape, '\n', lig_coords.shape)
         # # print values ligand one as example
 
@@ -781,6 +787,7 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
             pocket_mask,
             target_atoms=lig_coords_centered,
             target_residues=pocket_coords_centered,
+            sidechain_repulsion_dict=sidechain_repulsion_dict
         )
 
         losses = self._calculate_loss_from_noisy_embeddings_cond(

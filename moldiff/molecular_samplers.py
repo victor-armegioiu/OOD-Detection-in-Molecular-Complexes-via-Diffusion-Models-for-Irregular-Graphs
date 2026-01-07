@@ -12,7 +12,7 @@ from typing import Tuple, Optional, Callable, Mapping, Any, NamedTuple, Protocol
 from torch.autograd import grad
 from torch_scatter import scatter_mean
 import torch.nn.functional as F
-
+from dataclasses import dataclass
 
 from moldiff.molecular_diffusion import MolecularDiffusion, remove_mean_batch, MolecularDenoisingModel, ConditionalMolecularDenoisingModel
 import moldiff.molecular_diffusion as molecular_diffusion
@@ -39,13 +39,15 @@ def add_back_pocket_com(state, pc, n_dims):
 # Molecular State and Protocols
 # ********************
 
-class MolecularState(NamedTuple):
+@dataclass(frozen=True)
+class MolecularState:
     """Molecular state representation for SDE solving"""
     ligand: Tensor      # [total_lig_atoms, n_dims + atom_nf]
     pocket: Tensor      # [total_pocket_atoms, n_dims + residue_nf]
     ligand_mask: Tensor # [total_lig_atoms] - molecule indices
     pocket_mask: Tensor # [total_pocket_atoms] - molecule indices
     batch_size: int
+    guidance_score: Optional[Tensor] = None # [total_lig_atoms, n_dims] - place holder for potential guidance score
 
 
 class MolecularDenoiseFn(Protocol):
@@ -312,10 +314,14 @@ class MolecularSampler:
             molecular_state1.ligand[:, :self.n_dims] -= cond["pocket_com"][molecular_state1.ligand_mask]
 
             # second, attach the zero com pocket and ligand noise states
-            molecular_state1 = molecular_state1._replace(
+            molecular_state1 = MolecularState(
+                ligand=molecular_state1.ligand,
                 pocket=cond["pocket_state"],
-                pocket_mask=cond["pocket_mask"]
+                ligand_mask=molecular_state1.ligand_mask,
+                pocket_mask=cond["pocket_mask"],
+                batch_size=molecular_state1.batch_size
             )
+        
             
         
         # # DEBUG PRINT
@@ -634,7 +640,7 @@ class MolecularSdeSampler(MolecularSampler):
             # Compute derivatives using automatic differentiation.
             # Note that d/dt log(s) = d/dt s / s
             dlog_sigma_dt = dlog_dt(self.scheme.sigma)(t)
-            dlog_s_dt = 0#dlog_dt(self.scheme.scale)(t)
+            dlog_s_dt = 0 # dlog_dt(self.scheme.scale)(t)
             
             # Create normalized molecular state for denoiser.
             if isinstance(s, Tensor):
@@ -676,6 +682,18 @@ class MolecularSdeSampler(MolecularSampler):
             
             drift_ligand = drift_coeff_lig * molecular_state.ligand - denoiser_coeff_lig * denoiser_output.ligand
             drift_pocket = drift_coeff_pocket * molecular_state.pocket - denoiser_coeff_pocket * denoiser_output.pocket
+
+            if isinstance(denoiser_output.guidance_score, Tensor):
+                # coefficient from updating SDE with guidance to:
+                # dx = [[2σ̇/σ + ṡ/s]x - [2sσ̇/σ]D(x/s, σ) [2σ̇σs^2]Score*λ] dt + s√[2σ̇σ] dW
+                # dsquare_dt: note that dx σ^2 = 2σ̇σ 
+                guidance_coeff = dsquare_dt(self.scheme.sigma)(t) * s**2
+                if isinstance(denoiser_coeff, Tensor):
+                    guidance_coeff_lig = guidance_coeff.expand_as(denoiser_output.guidance_score)
+                else:
+                    guidance_coeff_lig = guidance_coeff
+
+                drift_ligand[:, :self.n_dims] =- guidance_coeff_lig * denoiser_output.guidance_score
             
             return MolecularState(
                 ligand=drift_ligand,
@@ -1059,6 +1077,11 @@ def create_molecular_denoiser_wrapper(
         interpolated_embeddings_lig = torch.matmul(probs_lig, atom_embeddings)      # [N_lig, joint_nf]
         # interpolated_embeddings_pocket = torch.matmul(probs_pocket, residue_embeddings)  # [N_pocket, joint_nf]
 
+        # For the SDE, we need to return the "effective clean prediction"
+        # This combines clean coordinates with interpolated embeddings
+        effective_clean_lig = torch.cat([pred_coords_lig, interpolated_embeddings_lig], dim=1)
+        # effective_clean_pocket = torch.cat([pred_coords_pocket, interpolated_embeddings_pocket], dim=1)
+
         # Apply Guidance
         if guidance_scale > 0:
             # with torch.enable_grad():
@@ -1070,24 +1093,27 @@ def create_molecular_denoiser_wrapper(
                         sidechain_features=unnormalized_sidechain_features
                 ) for idx in molecular_state.ligand_mask.unique()
             ], dim=0)
-            assert sidechain_repulsion_coord_signal.shape ==pred_coords_lig.shape, "Score and clean prediction shape don't match"
+            assert sidechain_repulsion_coord_signal.shape == pred_coords_lig.shape, "Score and clean prediction shape don't match"
 
-            pred_coords_lig = (pred_coords_lig + guidance_scale * sidechain_repulsion_coord_signal).detach()
+            guidance_score = (guidance_scale * sidechain_repulsion_coord_signal).detach()
 
-        
-        # For the SDE, we need to return the "effective clean prediction"
-        # This combines clean coordinates with interpolated embeddings
-        effective_clean_lig = torch.cat([pred_coords_lig, interpolated_embeddings_lig], dim=1)
-        # effective_clean_pocket = torch.cat([pred_coords_pocket, interpolated_embeddings_pocket], dim=1)
+            return MolecularState(
+                ligand=effective_clean_lig,
+                pocket=pocket_state,
+                ligand_mask=molecular_state.ligand_mask,
+                pocket_mask=pocket_mask,
+                batch_size=molecular_state.batch_size, 
+                guidance_score=guidance_score
+            )
 
-        
-        return MolecularState(
-            ligand=effective_clean_lig,
-            pocket=pocket_state,
-            ligand_mask=molecular_state.ligand_mask,
-            pocket_mask=pocket_mask,
-            batch_size=molecular_state.batch_size
-        )
+        else: 
+            return MolecularState(
+                ligand=effective_clean_lig,
+                pocket=pocket_state,
+                ligand_mask=molecular_state.ligand_mask,
+                pocket_mask=pocket_mask,
+                batch_size=molecular_state.batch_size
+            )
     
     if not conditional_sampling: 
         return molecular_denoiser
@@ -1276,7 +1302,7 @@ def test_conditional_molecular_samplers():
         hidden_nf=16,
         n_layers=1, 
         update_pocket_coords=False, 
-        n_max_virtual_nodes=12
+        n_max_virtual_nodes=0
 
     )
 
@@ -1297,7 +1323,7 @@ def test_conditional_molecular_samplers():
 
     batch = create_fake_pocket_batch(len(pocket_sizes), pocket_sizes, residue_nf, atom_nf)
 
-    cond = sampler._create_initial_conditioning_dict(pocket_batch = batch, guidance_scale = 1)
+    cond = sampler._create_initial_conditioning_dict(pocket_batch = batch, guidance_scale = 0)
     
     # Generate samples with try-catch
     print("Generating samples...")
