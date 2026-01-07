@@ -294,7 +294,7 @@ def plot_posebusters_metric_waterfall_multi(
 #                         help="Only generate global waterfall plot")
 #     args = parser.parse_args()
 
-#     df_path = Path(args.df)
+#     df_path = Path(args.exp_name)
 #     out_dir = Path(args.out)
 #     out_dir.mkdir(exist_ok=True, parents=True)
 
@@ -375,7 +375,7 @@ def plot_posebusters_metric_waterfall_multi(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--df",
+        "--exp_name",
         type=str,
         nargs="+",
         required=True,
@@ -399,10 +399,10 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Validate input
     # ------------------------------------------------------------------
-    if len(args.df) > 4:
-        raise ValueError("Maximum of 4 paths supported.")
+    if len(args.exp_name) > 5:
+        raise ValueError("Maximum of 5 paths supported.")
 
-    if args.labels and len(args.labels) != len(args.df):
+    if args.labels and len(args.labels) != len(args.exp_name):
         raise ValueError("Number of --labels must match number of --df files.")
 
     out_dir = Path(args.out)
@@ -412,7 +412,9 @@ if __name__ == "__main__":
     # Load all dataframes
     # ------------------------------------------------------------------
     dfs = []
-    for df_path in args.df:
+    for df in args.exp_name:
+        # ./benchmarks/ours_guidanceBL/ours_guidanceBL_metrics/metrics_detailed.csv
+        df_path = f"../benchmarks/ours{df}/ours{df}_metrics/metrics_detailed.csv"
         df = pd.read_csv(df_path)
         dfs.append(df)
 
