@@ -1095,7 +1095,8 @@ def create_molecular_denoiser_wrapper(
             ], dim=0)
             assert sidechain_repulsion_coord_signal.shape == pred_coords_lig.shape, "Score and clean prediction shape don't match"
 
-            guidance_score = (guidance_scale * sidechain_repulsion_coord_signal).detach()
+            # we derive for the normalized coordinates, which lead to chain rule: du f(u*c) = c*f'(u*c) , where (u*c=x)
+            guidance_score = (guidance_scale * sidechain_repulsion_coord_signal * scheme.coord_norm).detach()
 
             return MolecularState(
                 ligand=effective_clean_lig,
