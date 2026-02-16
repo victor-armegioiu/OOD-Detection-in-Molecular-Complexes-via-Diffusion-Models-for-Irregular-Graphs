@@ -1000,7 +1000,7 @@ def create_molecular_denoiser_wrapper(
             batch_size=molecular_state.batch_size
         )
     # initialize guidance function (trial mode)
-    sidechain_repulsive_guidance_func = SidechainRepulsiveGuidance(mode="cutoff_relu") # "cutoff_relu", "neg_logsumexp", "topk" -> cutoff relu has much smaller range, remember that!
+    sidechain_repulsive_guidance_func = SidechainRepulsiveGuidance(mode="neg_logsumexp") # "cutoff_relu", "neg_logsumexp", "topk" -> cutoff relu has much smaller range, remember that!
 
     def conditional_molecular_denoiser(
         molecular_state: MolecularState,

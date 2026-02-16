@@ -4,9 +4,12 @@ import json
 from typing import Dict, List, Union, Optional
 import pandas as pd
 
+
 import re
 import pandas as pd
 import numpy as np
+
+from moldiff.constants import bond_decoder, atom_decoder
 
 _MEAN_STD_RE = re.compile(
     r"""^\s*
@@ -289,6 +292,13 @@ def stack_and_save_metrics(base_dir: Union[str, Path],
         return df_combined
 
 
+
+
+
+
+
+
+
 def main():
     parser = argparse.ArgumentParser(description="Collect .csv and .pkl metric files per model.")
     parser.add_argument("base_dir", nargs="?", default=".", help="Base directory containing model subfolders")
@@ -306,5 +316,58 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main()
     #  python -m sbdd_metrics.compare_models ../benchmarks/
+
+    import pickle
+
+    # IMPORT to test
+    with open("../PDBbind_train/trainingPDB_discrete_distributions.pkl", "rb") as f:
+        PDB_distribution_data = pickle.load(f)
+    # use this for testing of PDB counts
+    atom_counts = dict(zip(atom_decoder, PDB_distribution_data["atom_types"]))
+    bond_counts = dict(zip(atom_decoder, PDB_distribution_data["bond_types"]))
+    
+    with open("../benchmarks/ours_guidanceBL/ours_guidanceBL_metrics/samples_discrete_distributions.pkl", "rb") as f:
+        ours_distribution_data = pickle.load(f) # use this for testing by extracting same way as above for ours_guidanceBL
+
+
+    # extract data
+    folders_of_interest = [
+        "ours_guidanceBL", # test and report deviance
+        "targetdiff", 
+        "diffsbdd", 
+        "pocket2mol", 
+        "drugflow"
+    ]
+    
+    for folder in folders_of_interest:
+
+        folder_data = pd.read_csv(f"../benchmarks/{folder}/{folder}_metrics/metrics_detailed.csv")
+        smiles_list = folder_data["representation.smiles"]
+        atom_counts, bond_counts, ring_counts = atom_bond_ring_distributions_from_smiles(smiles_list)
+    
+    # for training data
+    smiles_list = np.load(f"../benchmarks/preprocessed_crossdocked/train_smiles.npy", allow_pickle=False)
+    atom_counts, bond_counts, ring_counts = atom_bond_ring_distributions_from_smiles(smiles_list)
+
+    # for training data
+    smiles_list = np.load(f"../PDB_train/train_smiles.npy", allow_pickle=False)
+    atom_counts, bond_counts, ring_counts = atom_bond_ring_distributions_from_smiles(smiles_list) # test and report deviance
+
+
+    
+    # TODO: 
+    # - barplot the three distributions with 1, 3 subplots labelled iwth letter A-C:
+    # ax.text(
+    #     -0.1, 1.05, label,
+    #     transform=ax.transAxes,
+    #     va="top", ha="left",
+    #     # fontname="Arial",
+    #     fontsize=14,
+    #     fontweight="bold",
+    # )
+    # - color ours_guidanceBL/PDB in blueish colors and targetdiff, crossdocked etc in redish colors
+    
+
+

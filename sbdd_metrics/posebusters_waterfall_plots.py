@@ -121,13 +121,17 @@ def plot_posebusters_metric_waterfall_multi(
     import numpy as np
 
     n_paths = len(dfs)
-    assert 1 <= n_paths <= 4, "Supports 1–4 paths."
+    assert 1 <= n_paths <= 6, "Supports 1–6 paths."
 
     if labels is None:
         labels = [f"Path {i+1}" for i in range(n_paths)]
 
+    # fontsizes
+    textfontsize = 10
+    labelfontsize = 12
+
     # Model hatch patterns
-    hatch_patterns = ['/', '\\', 'x', '.'][:n_paths]
+    hatch_patterns = ['/', '\\', 'x', '.', 'o', '+'][:n_paths]
 
     # Colors
     RED = "#e41a1c"
@@ -211,7 +215,7 @@ def plot_posebusters_metric_waterfall_multi(
                 txt,
                 ha="center",
                 va="bottom",
-                fontsize=7,
+                fontsize=textfontsize,
                 rotation=90 if n_paths > 1 else 0
             )
 
@@ -238,7 +242,7 @@ def plot_posebusters_metric_waterfall_multi(
             f"{final_survival:.0f}%",
             ha="center",
             va="bottom",
-            fontsize=7,
+            fontsize=textfontsize,
             rotation=90 if n_paths > 1 else 0
         )
 
@@ -252,11 +256,13 @@ def plot_posebusters_metric_waterfall_multi(
     ] + ["overall survival"]
 
     ax.set_xticks(xticks)
-    ax.set_xticklabels(xtick_labels, rotation=70, ha="right")
+    ax.set_xticklabels(xtick_labels, rotation=70, fontsize=labelfontsize, ha="right")
 
     ax.set_ylim(0, 110)
-    ax.set_ylabel("Remaining %")
-    ax.set_title(title)
+    ax.set_ylabel("% survived", fontsize=labelfontsize)
+    ax.set_yticks([0, 25, 50, 75, 100])
+    ax.set_yticklabels(["0", "25", "50", "75", "100"], fontsize=labelfontsize)
+    # ax.set_title(title)
 
     # -----------------------------------------------------
     # Legend
@@ -272,7 +278,9 @@ def plot_posebusters_metric_waterfall_multi(
         )
         legend_handles.append(patch)
 
-    ax.legend(legend_handles, labels, title="Models", loc=(0.95, 0.5))
+    ax.legend(legend_handles, labels, fontsize=textfontsize, loc=(0.97, 0.5))
+    ax.grid(axis="y", linestyle="--", alpha=0.5)
+    ax.set_axisbelow(True)
 
     for s in ax.spines.values():
         s.set_visible(False)
@@ -379,7 +387,7 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         required=True,
-        help="One or more dataframes (max 4) for side-by-side comparison"
+        help="One or more dataframes (max 5) for side-by-side comparison"
     )
     parser.add_argument(
         "--labels",
@@ -399,8 +407,8 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Validate input
     # ------------------------------------------------------------------
-    if len(args.exp_name) > 5:
-        raise ValueError("Maximum of 5 paths supported.")
+    if len(args.exp_name) > 6:
+        raise ValueError("Maximum of 6 paths supported.")
 
     if args.labels and len(args.labels) != len(args.exp_name):
         raise ValueError("Number of --labels must match number of --df files.")
@@ -414,7 +422,7 @@ if __name__ == "__main__":
     dfs = []
     for df in args.exp_name:
         # ./benchmarks/ours_guidanceBL/ours_guidanceBL_metrics/metrics_detailed.csv
-        df_path = f"../benchmarks/ours{df}/ours{df}_metrics/metrics_detailed.csv"
+        df_path = f"../benchmarks/{df}/{df}_metrics/metrics_detailed.csv"
         df = pd.read_csv(df_path)
         dfs.append(df)
 
@@ -422,7 +430,7 @@ if __name__ == "__main__":
     # PoseBusters column order
     # ------------------------------------------------------------------
     pb_cols_order = [
-        "posebusters.mol_pred_loaded",
+        # "posebusters.mol_pred_loaded",
         "posebusters.sanitization",
         "posebusters.all_atoms_connected",
         "posebusters.internal_steric_clash",
@@ -434,10 +442,10 @@ if __name__ == "__main__":
         # "posebusters.internal_energy",
         # "posebusters.minimum_distance_to_inorganic_cofactors",
         # "posebusters.minimum_distance_to_organic_cofactors",
-        "posebusters.volume_overlap_with_protein",
-        "posebusters.minimum_distance_to_protein",
         # "posebusters.minimum_distance_to_waters",
-        "posebusters.protein-ligand_maximum_distance",
+        "posebusters.volume_overlap_with_protein",
+        # "posebusters.protein-ligand_maximum_distance",
+        "posebusters.minimum_distance_to_protein"
         # "posebusters.volume_overlap_with_inorganic_cofactors",
         # "posebusters.volume_overlap_with_organic_cofactors",
         # "posebusters.volume_overlap_with_protein",
@@ -506,9 +514,13 @@ if __name__ == "__main__":
         title="PoseBusters Breakdown – Global"
     )
 
-    print("Done.")
+    print(f"Saved in {out_dir / 'global_posebusters_multi_breakdown.png'}")
 
-# ours vs other baselines
-# python -m sbdd_metrics.posebusters_waterfall_plots --df ../benchmarks/ours/ours_metrics/metrics_detailed.csv ../benchmarks/diffsbdd/diffsbdd_metrics/metrics_detailed.csv ../benchmarks/drugflow/drugflow_metrics/metrics_detailed.csv ../benchmarks/targetdiff/targetdiff_metrics/metrics_detailed.csv --labels ours diff_sbdd drugflow targetdiff --out ../benchmarks/posebusters_waterfall_plots --global_only
-# # CG guidance
-# python -m sbdd_metrics.posebusters_waterfall_plots --df ../benchmarks/ours_guidanceBL/ours_guidanceBL_metrics/metrics_detailed.csv ../benchmarks/ours_guidance_0.7neg_logsumexp/ours_guidance_0.7neg_logsumexp_metrics/metrics_detailed.csv ../benchmarks/ours_guidance_0.7cutoff_relu/ours_guidance_0.7cutoff_relu_metrics/metrics_detailed.csv ../benchmarks/ours_guidance_0.5topk/ours_guidance_0.5topk_metrics/metrics_detailed.csv --labels BL neg_logsumexp cutoff_relu topk --out ../benchmarks/posebusters_waterfall_plots --global_only
+# python -m sbdd_metrics.posebusters_waterfall_plots --exp_name ours_guidanceBL  ours_guidance_reworked_1cutoff_relu ours_guidance_reworked_2cutoff_relu ours_guidance_reworked_5cutoff_relu ours_guidance_reworked_10cutoff_relu --labels BL 1 2 5 10 --out ../benchmarks/posebusters_waterfall_plots --global_only
+# python -m sbdd_metrics.posebusters_waterfall_plots --exp_name ours_guidanceBL  ours_guidance_reworked_2topk ours_guidance_reworked_5topk ours_guidance_reworked_10topk --labels BL 2 5 10 --out ../benchmarks/posebusters_waterfall_plots --global_only
+# python -m sbdd_metrics.posebusters_waterfall_plots --exp_name ours_guidanceBL  ours_guidance_reworked_2neg_logsumexp ours_guidance_reworked_5neg_logsumexp ours_guidance_reworked_10neg_logsumexp --labels BL 2 5 10 --out ../benchmarks/posebusters_waterfall_plots --global_only
+
+# python -m sbdd_metrics.posebusters_waterfall_plots --exp_name ours_guidanceBL  ours_guidance_reworked_2neg_logsumexp ours_guidance_reworked_10neg_logsumexp ours_guidance_reworked_15neg_logsumexp ours_guidance_reworked_50neg_logsumexp --labels BL 2 10 15 30 --out ../benchmarks/posebusters_waterfall_plots --global_only
+
+
+# python -m sbdd_metrics.posebusters_waterfall_plots --exp_name diffsbdd_reeval drugflow pocket2mol_reeval targetdiff_reeval ours_guidanceBL PDBbind_train --labels DiffSBDD DrugFlow Pocket2Mol TargetDiff Ours PDBbind --out ../benchmarks/posebusters_waterfall_plots --global_only

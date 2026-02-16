@@ -281,7 +281,7 @@ def sample_molecules_conditionally(
         sample_batch: Dict,
         num_steps: int = 50, 
         schedule_type: str = "exponential",
-        guidance_scale: float = 3, 
+        guidance_scale: float = 3
         
             ):
 
