@@ -353,8 +353,8 @@ class MolecularSampler:
                 print("✅ Pocket state remained constant throughout sampling!")
             else:
                 print("❌ Pocket state changed during sampling!")
-        
-        
+
+
         
         # Apply final denoising if requested.
         if self.apply_denoise_at_end:
@@ -375,8 +375,10 @@ class MolecularSampler:
 
         # add back pocket com
         if cond is not None and "pocket_com" in cond:
-            current_pocket_coms = scatter_mean(denoised_state.pocket[:, :self.n_dims], 
-                                               denoised_state.pocket_mask, dim = 0)
+            is_only_terminal = denoised_state.pocket.dim() == 2
+            current_pocket_coms = scatter_mean(denoised_state.pocket[..., :self.n_dims], 
+                                               denoised_state.pocket_mask if is_only_terminal else denoised_state.pocket_mask.unsqueeze(0), 
+                                               dim = 0 if is_only_terminal else 1)
             assert torch.allclose(current_pocket_coms, torch.zeros_like(current_pocket_coms), atol=1e-4, rtol = 1e-4), \
                     f"Pocket not zero-COM before add-back; check anchoring:\n{current_pocket_coms}"
             
@@ -384,7 +386,8 @@ class MolecularSampler:
                 denoised_state, 
                 cond["pocket_com"], # shape [B, 3], in normalized units
                 self.n_dims)
-        
+            
+
         # Convert to molecular batch format.
         samples = self._molecular_state_to_batch(denoised_state, discretize_features=True)
 
@@ -470,68 +473,85 @@ class MolecularSampler:
         denoised_state = self.denoise_fn(current_state, final_sigma, cond)
         return denoised_state
     
-    def _molecular_state_to_batch(self, state: MolecularState, discretize_features: bool = False) -> dict:
-        """Convert molecular state back to batch format"""
-        
-        # Handle trajectory case
-        if state.ligand.dim() == 3:  # [time, atoms, features]
-            ligand_data = state.ligand[-1]
-            pocket_data = state.pocket[-1]
-        else:
-            ligand_data = state.ligand
-            pocket_data = state.pocket
-        
-        # Split coordinates and features
-        lig_coords = ligand_data[:, :self.n_dims]
-        lig_features = ligand_data[:, self.n_dims:]
-        pocket_coords = pocket_data[:, :self.n_dims]
-        pocket_features = pocket_data[:, self.n_dims:]
-        
+    def _molecular_state_to_batch(
+        self,
+        state: MolecularState,
+        discretize_features: bool = False
+    ) -> dict:
+        """Convert molecular state back to batch format.
+
+        Supports:
+        - single state: state.ligand shape [n_atoms, n_dims + feat_dim]
+        - trajectory:  state.ligand shape [T, n_atoms, n_dims + feat_dim]
+        In the trajectory case, outputs keep the leading time dimension T.
+        """
+
+        ligand_data = state.ligand
+        pocket_data = state.pocket
+
+        if ligand_data.dim() not in (2, 3):
+            raise ValueError(f"Expected state.ligand dim 2 or 3, got {ligand_data.dim()}")
+        if pocket_data.dim() != ligand_data.dim():
+            raise ValueError(
+                f"state.pocket dim ({pocket_data.dim()}) must match state.ligand dim ({ligand_data.dim()})"
+            )
+        if ligand_data.size(-1) < self.n_dims or pocket_data.size(-1) < self.n_dims:
+            raise ValueError("Last dim must be at least self.n_dims to split coords/features.")
+
+        # Split coordinates and features (works for both [A,F] and [T,A,F])
+        lig_coords = ligand_data[..., : self.n_dims]
+        lig_features = ligand_data[..., self.n_dims :]
+        pocket_coords = pocket_data[..., : self.n_dims]
+        pocket_features = pocket_data[..., self.n_dims :]
+
         if discretize_features:
-            # OPTION 1: Use the embeddings to get probabilities via similarity
+            # Compute vocab embeddings once; then discretize per node (and per time step if present)
             with torch.no_grad():
-                # Get the vocabulary embeddings
+                # [atom_nf, emb_dim]
                 atom_embeddings = self._model.denoiser.egnn_dynamics.atom_encoder(
-                    torch.eye(self.atom_nf, device=lig_features.device)
+                    torch.eye(self.atom_nf, device=lig_features.device, dtype=lig_features.dtype)
                 )
                 atom_embeddings = F.normalize(atom_embeddings, dim=-1)
-                
+
+                # [residue_nf, emb_dim]
                 residue_embeddings = self._model.denoiser.egnn_dynamics.residue_encoder(
-                    torch.eye(self.residue_nf, device=pocket_features.device)
+                    torch.eye(self.residue_nf, device=pocket_features.device, dtype=pocket_features.dtype)
                 )
                 residue_embeddings = F.normalize(residue_embeddings, dim=-1)
-                
+
                 # Normalize current embeddings
                 lig_features_norm = F.normalize(lig_features, dim=-1)
                 pocket_features_norm = F.normalize(pocket_features, dim=-1)
-                
-                # Compute similarities (this preserves the diversity!)
-                lig_similarities = torch.matmul(lig_features_norm, atom_embeddings.T)
-                pocket_similarities = torch.matmul(pocket_features_norm, residue_embeddings.T)
-                
-                # Convert to one-hot
-                lig_types = torch.argmax(lig_similarities, dim=-1)
-                pocket_types = torch.argmax(pocket_similarities, dim=-1)
-                
-                ligand_features_final = F.one_hot(lig_types, self.atom_nf).float()
-                pocket_features_final = F.one_hot(pocket_types, self.residue_nf).float()
+
+                # Similarities:
+                #   dim=2: [A, emb] @ [emb, V] -> [A, V]
+                #   dim=3: [T, A, emb] x [V, emb] -> [T, A, V]
+                lig_similarities = torch.einsum("...d,vd->...v", lig_features_norm, atom_embeddings)
+                pocket_similarities = torch.einsum("...d,vd->...v", pocket_features_norm, residue_embeddings)
+
+                lig_types = lig_similarities.argmax(dim=-1)       # [..., A]
+                pocket_types = pocket_similarities.argmax(dim=-1) # [..., P]
+
+                ligand_features_final = F.one_hot(lig_types, num_classes=self.atom_nf).to(lig_features.dtype)
+                pocket_features_final = F.one_hot(pocket_types, num_classes=self.residue_nf).to(pocket_features.dtype)
         else:
             ligand_features_final = lig_features
             pocket_features_final = pocket_features
-        
-        # Unnormalize coordinates
+
+        # Unnormalize coordinates (preserves time axis if present)
         lig_coords_unnorm = lig_coords * self.scheme.coord_norm
         pocket_coords_unnorm = pocket_coords * self.scheme.coord_norm
-        
+
         return {
-            'ligand_coords': lig_coords_unnorm,
-            'ligand_features': ligand_features_final,
-            'pocket_coords': pocket_coords_unnorm,
-            'pocket_features': pocket_features_final,
-            'ligand_mask': state.ligand_mask,
-            'pocket_mask': state.pocket_mask,
-            'batch_size': state.batch_size
+            "ligand_coords": lig_coords_unnorm,              # [A,3] or [T,A,3]
+            "ligand_features": ligand_features_final,        # [A,V] or [T,A,V]
+            "pocket_coords": pocket_coords_unnorm,           # [P,3] or [T,P,3]
+            "pocket_features": pocket_features_final,        # [P,R] or [T,P,R]
+            "ligand_mask": state.ligand_mask,
+            "pocket_mask": state.pocket_mask,
+            "batch_size": state.batch_size,
         }
+
 
 
 # ********************

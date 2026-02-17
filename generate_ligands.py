@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import os
 import moldiff.utils as utils
+from rdkit import Chem
 from rdkit.Chem import SDWriter
 import argparse
 from moldiff.metrics import (
@@ -10,6 +11,7 @@ from moldiff.metrics import (
     build_molecule, 
     process_molecule
 )
+from moldiff.constants import atom_decoder
 from moldiff.molecular_diffusion import ConditionalMolecularDenoisingModel
 from moldiff.protlig_encoder import find_protein_ligand_pairs,  encode_protein_ligand_pairs, ProteinGraphEncoder
 from datetime import datetime
@@ -102,6 +104,128 @@ def sample_molecule_given_graph(graph_path: str,
 
     return samples
 
+def save_diffusion_trajectories_as_sdf(
+    samples: dict,
+    pocket_output_dir: str
+):
+    # Save each molecule in its own file
+    for i, (atom_coords, atom_types) in enumerate(zip(
+        utils.batch_to_list(samples["ligand_coords"], samples["ligand_mask"]),
+        utils.batch_to_list(samples["ligand_features"], samples["ligand_mask"])
+        )):
+        index_atom_types = torch.argmax(atom_types, dim=-1)
+        mol = build_molecule(atom_coords, index_atom_types)
+        mol = process_molecule(mol,
+                                add_hydrogens=False,
+                                sanitize=False,          # bool
+                                relax_iter=0,       # int
+                                largest_frag=False          # bool
+                                )
+        if mol is not None:
+            # Create individual SDF file for this molecule
+            save_path = os.path.join(pocket_output_dir, f"{i}_ligand.sdf")
+            w = SDWriter(save_path)
+            w.SetKekulize(False)
+            mol.SetProp("_Name", f"ligand_{i}")
+            w.write(mol)
+            w.close()
+
+def _rdkit_atom_only_mol_from_coords_and_types(coords_tA3, types_tA):
+    """
+    Build an RDKit Mol with atoms + a conformer, but NO bonds.
+    coords_tA3: torch.Tensor [A, 3] (float)
+    types_tA:   torch.Tensor [A]    (long), values index into atom_decoder
+    """
+    # Safety: detach -> cpu -> python types
+    coords = coords_tA3.detach().cpu().float().numpy()
+    types = types_tA.detach().cpu().long().numpy()
+
+    rw = Chem.RWMol()
+    for idx in types:
+        sym = atom_decoder[int(idx)]
+        rw.AddAtom(Chem.Atom(sym))
+
+    mol = rw.GetMol()
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    for i in range(mol.GetNumAtoms()):
+        x, y, z = coords[i]
+        conf.SetAtomPosition(i, Chem.rdGeometry.Point3D(float(x), float(y), float(z)))
+    mol.AddConformer(conf, assignId=True)
+    return mol
+
+def save_diffusion_trajectories_as_multiframe_sdf(
+    samples: dict,
+    pocket_output_dir: str, 
+    path_save_step: int = 1
+):
+    """
+    Assumes samples contain (batched):
+      - samples["ligand_coords"]   : [B, T, A, 3] OR compatible with utils.batch_to_list -> [T, A, 3]
+      - samples["ligand_features"] : [B, T, A, 10] OR compatible -> [T, A, 10]
+      - samples["ligand_mask"]     : mask for utils.batch_to_list
+
+    Writes per-sample SDF:
+      frames 0..T-2  : atom-only mol (no bonds)
+      frame  T-1     : atom-only mol (no bonds)
+      frame  T-1     : full mol with bonds via build_molecule/process_molecule
+    """
+
+    os.makedirs(pocket_output_dir, exist_ok=True)
+
+    # You said you handle dim==2 elsewhere; we assume per-sample tensors are [T, A, ...]
+    coords_list = utils.batch_to_list(samples["ligand_coords"], samples["ligand_mask"], atom_dim=1)
+    feats_list  = utils.batch_to_list(samples["ligand_features"], samples["ligand_mask"], atom_dim=1)
+
+    for i, (traj_coords, traj_feats) in enumerate(zip(coords_list, feats_list)):
+        # traj_coords: [T, A, 3]
+        # traj_feats : [T, A, 10]
+        if traj_coords.dim() != 3 or traj_feats.dim() != 3:
+            raise ValueError(
+                f"Expected trajectory tensors with dim==3. Got coords dim {traj_coords.dim()}, feats dim {traj_feats.dim()}."
+            )
+        T = traj_coords.shape[0]
+
+        # Decode atom types per frame: [T, A]
+        traj_types = torch.argmax(traj_feats, dim=-1)
+
+        save_path = os.path.join(pocket_output_dir, f"{i}_ligand.sdf")
+        w = SDWriter(save_path)
+        w.SetKekulize(False)
+
+        # ---- 1) Write frames 0..T-2 as "atom-only" ----
+        for t in range(0, max(T - 1, 0), path_save_step):
+            mol_t = _rdkit_atom_only_mol_from_coords_and_types(
+                coords_tA3=traj_coords[t],
+                types_tA=traj_types[t],
+            )
+            mol_t.SetProp("_Name", f"ligand_{i}_t{t:04d}_atoms_only")
+            w.write(mol_t)
+
+        # ---- 2) Write last frame once as "atom-only" ----
+        t_last = T - 1
+        mol_last_atoms = _rdkit_atom_only_mol_from_coords_and_types(
+            coords_tA3=traj_coords[t_last],
+            types_tA=traj_types[t_last],
+        )
+        mol_last_atoms.SetProp("_Name", f"ligand_{i}_t{t_last:04d}_atoms_only")
+        w.write(mol_last_atoms)
+
+        # ---- 3) Write last frame again as "full" molecule with bonds ----
+        # Your build_molecule expects coords [A,3] and index_atom_types [A]
+        mol_full = build_molecule(traj_coords[t_last], traj_types[t_last])
+        mol_full = process_molecule(
+            mol_full,
+            add_hydrogens=False,
+            sanitize=False,
+            relax_iter=0,
+            largest_frag=False,
+        )
+        if mol_full is not None:
+            mol_full.SetProp("_Name", f"ligand_{i}_t{t_last:04d}_with_bonds")
+            w.write(mol_full)
+
+        w.close()
+
 def sample_molecule_given_all_atom_graph(
         graph_path: str,
         model: ConditionalMolecularDenoisingModel,
@@ -110,7 +234,9 @@ def sample_molecule_given_all_atom_graph(
         n_samples: int = 2,
         num_steps: int = 600,
         schedule_type: str = "exponential",
-        guidance_scale: float = 0
+        guidance_scale: float = 0, 
+        return_full_paths: bool = False, 
+        path_save_step: int = 1
     ):
     """Generate new molecules conditioned on a given pocket graph file and save them in individual files"""
 
@@ -162,36 +288,14 @@ def sample_molecule_given_all_atom_graph(
         sample_batch=sample_batch,
         num_steps=num_steps,
         schedule_type=schedule_type,
-        guidance_scale=guidance_scale
+        guidance_scale=guidance_scale, 
+        return_full_paths=return_full_paths
     )
 
-    # Save each molecule in its own file
-    for i, (atom_coords, atom_types) in enumerate(zip(
-        utils.batch_to_list(samples["ligand_coords"], samples["ligand_mask"]),
-        utils.batch_to_list(samples["ligand_features"], samples["ligand_mask"])
-        )):
-        index_atom_types = torch.argmax(atom_types, dim=-1)
-        mol = build_molecule(atom_coords, index_atom_types)
-        mol = process_molecule(mol,
-                                add_hydrogens=False,
-                                sanitize=False,          # bool
-                                relax_iter=0,       # int
-                                largest_frag=False          # bool
-                                )
-        if mol is not None:
-            # Create individual SDF file for this molecule
-            save_path = os.path.join(pocket_output_dir, f"{i}_ligand.sdf")
-            w = SDWriter(save_path)
-            w.SetKekulize(False)
-            mol.SetProp("_Name", f"ligand_{i}")
-            w.write(mol)
-            w.close()
-        
-        # w = Chem.SDWriter(str(save_path))
-        # w.SetKekulize(False)
-        # for m in molecules:
-        #     if m is not None:
-        #         w.write(m)
+    if not return_full_paths:
+        save_diffusion_trajectories_as_sdf(samples, pocket_output_dir)
+    else:
+        save_diffusion_trajectories_as_multiframe_sdf(samples, pocket_output_dir, path_save_step=path_save_step)
 
     return samples
 

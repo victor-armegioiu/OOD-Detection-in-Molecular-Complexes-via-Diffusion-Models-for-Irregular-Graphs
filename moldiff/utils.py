@@ -128,19 +128,59 @@ def get_pocket_from_ligand(pdb_model, ligand, dist_cutoff=8.0):
     return pocket_residues
 
 
-def batch_to_list(data, batch_mask):
-    # data_list = []
-    # for i in torch.unique(batch_mask):
-    #     data_list.append(data[batch_mask == i])
-    # return data_list
+def batch_to_list(data: torch.Tensor, batch_mask: torch.Tensor, atom_dim: int = 0):
+    """
+    Split batched tensor into a list across atom dimension A.
 
-    # make sure batch_mask is increasing
+    Parameters
+    ----------
+    data : Tensor
+        Shape:
+            [A, ...]         if atom_dim=0
+            [T, A, ...]      if atom_dim=1
+    batch_mask : Tensor
+        Shape [A], contains batch indices (must align with atom dimension)
+    atom_dim : int
+        0  -> data shape [A, ...]
+        1  -> data shape [T, A, ...]
+
+    Returns
+    -------
+    List[Tensor]
+        If atom_dim=0:
+            list of tensors with shape [A_i, ...]
+        If atom_dim=1:
+            list of tensors with shape [T, A_i, ...]
+    """
+
+    if atom_dim not in (0, 1):
+        raise ValueError("atom_dim must be 0 ([A,...]) or 1 ([T,A,...])")
+
+    if batch_mask.dim() != 1:
+        raise ValueError("batch_mask must be 1D over atom dimension")
+
+    if data.size(atom_dim) != batch_mask.size(0):
+        raise ValueError(
+            f"Mismatch: data.size(atom_dim)={data.size(atom_dim)} "
+            f"but batch_mask.size(0)={batch_mask.size(0)}"
+        )
+
+    # Sort by batch index
     idx = torch.argsort(batch_mask)
-    batch_mask = batch_mask[idx]
-    data = data[idx]
+    batch_mask_sorted = batch_mask[idx]
 
-    chunk_sizes = torch.unique(batch_mask, return_counts=True)[1].tolist()
-    return torch.split(data, chunk_sizes)
+    if atom_dim == 0:
+        data_sorted = data[idx]
+    else:
+        # reorder along atom dimension
+        data_sorted = data.index_select(atom_dim, idx)
+
+    # compute chunk sizes
+    _, counts = torch.unique(batch_mask_sorted, return_counts=True)
+    chunk_sizes = counts.tolist()
+
+    # split along atom dimension
+    return torch.split(data_sorted, chunk_sizes, dim=atom_dim)
 
 
 def num_nodes_to_batch_mask(n_samples, num_nodes, device):

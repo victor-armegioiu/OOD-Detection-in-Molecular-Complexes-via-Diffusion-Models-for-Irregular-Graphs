@@ -281,7 +281,8 @@ def sample_molecules_conditionally(
         sample_batch: Dict,
         num_steps: int = 50, 
         schedule_type: str = "exponential",
-        guidance_scale: float = 3
+        guidance_scale: float = 3, 
+        return_full_paths: bool = False
         
             ):
 
@@ -309,7 +310,7 @@ def sample_molecules_conditionally(
         pocket_sizes=pocket_sizes,
         num_steps=num_steps,
         schedule_type=schedule_type,
-        return_full_paths=False
+        return_full_paths=return_full_paths
     )
     
     print("Sampling conditional molecules...")
@@ -323,27 +324,29 @@ def sample_molecules_conditionally(
     samples = sampler.generate(conditioning_batch)
     end_time = time.time()
     print(f"GENERATION PROCESS COMPLETED in {end_time - start_time:.2f} SECONDS")
+
     
-    print(f"\nGenerated molecules:")
-    print(f"  Total ligand atoms: {samples['ligand_coords'].shape[0]}")
-    print(f"  Total pocket residues: {samples['pocket_coords'].shape[0]}")
-    print(f"  Ligand coordinate range: [{samples['ligand_coords'].min():.2f}, {samples['ligand_coords'].max():.2f}]")
-    print(f"  Pocket coordinate range: [{samples['pocket_coords'].min():.2f}, {samples['pocket_coords'].max():.2f}]")
-    
-    # Check that categorical features are properly discretized 
-    lig_feature_sums = samples['ligand_features'].sum(dim=1)
-    pocket_feature_sums = samples['pocket_features'].sum(dim=1)
-    
-    print(f"  Ligand features properly one-hot: {torch.allclose(lig_feature_sums, torch.ones_like(lig_feature_sums))}")
-    print(f"  Pocket features properly one-hot: {torch.allclose(pocket_feature_sums, torch.ones_like(pocket_feature_sums))}")
-    
-    # Show some statistics
-    ligand_types = torch.argmax(samples['ligand_features'], dim=1)
-    pocket_types = torch.argmax(samples['pocket_features'], dim=1)
-    
-    print(f"  Ligand atom type distribution: {torch.bincount(ligand_types)}")
-    print(f"  Pocket residue type distribution: {torch.bincount(pocket_types)}")
-    
+    if not return_full_paths:
+        print(f"\nGenerated molecules:")
+        print(f"  Total ligand atoms: {samples['ligand_coords'].shape[0]}")
+        print(f"  Total pocket residues: {samples['pocket_coords'].shape[0]}")
+        print(f"  Ligand coordinate range: [{samples['ligand_coords'].min():.2f}, {samples['ligand_coords'].max():.2f}]")
+        print(f"  Pocket coordinate range: [{samples['pocket_coords'].min():.2f}, {samples['pocket_coords'].max():.2f}]")
+        
+        # Check that categorical features are properly discretized 
+        lig_feature_sums = samples['ligand_features'].sum(dim=1)
+        pocket_feature_sums = samples['pocket_features'].sum(dim=1)
+        
+        print(f"  Ligand features properly one-hot: {torch.allclose(lig_feature_sums, torch.ones_like(lig_feature_sums))}")
+        print(f"  Pocket features properly one-hot: {torch.allclose(pocket_feature_sums, torch.ones_like(pocket_feature_sums))}")
+        
+        # Show some statistics
+        ligand_types = torch.argmax(samples['ligand_features'], dim=1)
+        pocket_types = torch.argmax(samples['pocket_features'], dim=1)
+        
+        print(f"  Ligand atom type distribution: {torch.bincount(ligand_types)}")
+        print(f"  Pocket residue type distribution: {torch.bincount(pocket_types)}")
+        
     print(f"\n✅ Sampling completed successfully!")
 
     # TODO: return some metric to log to wanbd to overview sample quality

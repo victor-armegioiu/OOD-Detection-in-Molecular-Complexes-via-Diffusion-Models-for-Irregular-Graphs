@@ -62,14 +62,14 @@ def exponential_noise_schedule(clip_max: float = 100.0, base: float = np.e**0.5,
     if not (start < end and base > 1.0):
         raise ValueError("Must have `base` > 1 and `start` < `end`.")
 
-    in_rescale = _linear_rescale(
+    in_rescale = _linear_rescale( # maps diffusion time linearly between start and end
         in_min=MIN_DIFFUSION_TIME,
         in_max=MAX_DIFFUSION_TIME,
         out_min=start,
         out_max=end,
         device=device,
     )
-    out_rescale = _linear_rescale(in_min=base**start, in_max=base**end, out_min=0.0, out_max=clip_max, device=device)
+    out_rescale = _linear_rescale(in_min=base**start, in_max=base**end, out_min=0.0, out_max=clip_max, device=device) # maps the exponential curve e**0.05**(in_rescale(t)) to range 0, 100
 
     def sigma(t):
         t_tensor = torch.as_tensor(t, device=device, dtype=torch.float32)
