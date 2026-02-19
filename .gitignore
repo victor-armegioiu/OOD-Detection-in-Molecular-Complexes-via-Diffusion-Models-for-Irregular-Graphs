@@ -21,3 +21,4 @@ samples/
 distribution_analysis/
 plots_paper/
 train_GEMS_for_diff.py
+old_code/
