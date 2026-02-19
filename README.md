@@ -230,10 +230,13 @@ The output JSON files contain likelihood scores and trajectory features that can
 If you use this code in your research, please cite:
 
 ```bibtex
-@article{your_paper_2024,
-  title={Out-of-Distribution Detection for 3D Molecular Graphs via Diffusion Trajectory Analysis},
-  author={Your Name and Collaborators},
-  journal={Your Journal},
-  year={2024}
+@misc{graber2026outofdistributiondetectionmolecularcomplexes,
+      title={Out-of-Distribution Detection in Molecular Complexes via Diffusion Models for Irregular Graphs}, 
+      author={David Graber and Victor Armegioiu and Rebecca Buller and Siddhartha Mishra},
+      year={2026},
+      eprint={2512.18454},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2512.18454}, 
 }
 ```
