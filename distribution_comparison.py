@@ -32,12 +32,37 @@ from typing import Dict, List, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
-# Set style for better plots
-plt.style.use('seaborn-v0_8')
+# MATPLOTLIB PLOTTING SETTINGS
+# -----------------------------------------------------------------------------------------
+# Fix Arial font issue by using a fallback font family
+plt.rcParams.update({
+    "font.family": "sans serif",
+    "svg.fonttype": "none",          # keep text as text in SVG
+    'font.size': 12,                 # Set the base font size 
+    'axes.labelsize': 12,            # X and Y axis labels
+    'xtick.labelsize': 10,           # X-axis tick labels
+    'ytick.labelsize': 10,           # Y-axis tick labels
+    'legend.fontsize': 10,           # Legend font size
+    'axes.titlesize': 13,            # Plot title size
+    'axes.linewidth': 0.5            # Thinner axis lines
+})
 
-# Create the colormap
+# For figure width 1/2 A4 page --> figsize = (6, x), then reduce figure width by half in AI
+# For figure width 1/3 A4 page --> figsize = (4, x), then reduce figure width by half in AI
+# For figure width 1/4 A4 page --> figsize = (3, x), then reduce figure width by half in AI
+# plt.style.use('seaborn-v0_8')
+
+# Define custom box properties
+boxprops = dict(linewidth=0.5, facecolor='None', color='black')
+medianprops = dict(linewidth=0.5, color='black')
+flierprops = dict(marker='o', markersize=3, linestyle='none', markeredgewidth=0.5, markeredgecolor='black')
+whiskerprops = dict(linewidth=0.5)
+capprops = dict(linewidth=0.5)
+
+# Create CUSTOM colormap for heatmaps
 colors = ["#ffffff", "#ff0000"]
 custom_cmap = LinearSegmentedColormap.from_list("white_to_red", colors)
+# -----------------------------------------------------------------------------------------
 
 
 def parse_arguments():
@@ -49,7 +74,6 @@ def parse_arguments():
 
     # Export options
     parser.add_argument('--export', help='Path to export processed data as CSV file')
-    parser.add_argument('--figsize', nargs=2, type=int, default=[20, 16], help='Figure size as [width, height]')
 
     # Preprocessing options
     parser.add_argument('--remove_outliers', action='store_true', help='Remove outliers using IQR method')
@@ -65,7 +89,7 @@ def parse_arguments():
                         help='Path to the error distribution file mapping IDs to error values')
     parser.add_argument('--plot_heatmaps', action='store_true',
                         help='Create individual heatmap plots for each distribution')
-    parser.add_argument('--plot_exponential_scatterplots', nargs='+', type=str, metavar='DIST_NAME',
+    parser.add_argument('--plot_exponential_scatterplot', nargs='+', type=str, metavar='DIST_NAME',
                         help='Create scatterplot with exponential curve fitting for specified distributions (provide 2 or more distribution names)')
     return parser.parse_args()
 
@@ -107,9 +131,6 @@ class DistributionComparator:
         self.metrics = {}
         self.pairwise_metrics = {}
         self.asinh_scaling = asinh_scaling
-        # Ordering preference for displays (boxplots, heatmaps)
-        # First, any name containing these substrings (in order), then the rest
-        self.order_priority = ['train', 'val', 'casf2016']
 
         self.global_min = None
         self.global_max = None
@@ -127,7 +148,6 @@ class DistributionComparator:
         print(f"  Normalize: {self.normalize}")
         print(f"  Merge patterns: {self.merge_patterns}")
         print(f"  Asinh scaling: {self.asinh_scaling}")
-        print(f"  Display order priority: {self.order_priority}")
 
     
     def _load_distributions(self) -> None:
@@ -185,6 +205,7 @@ class DistributionComparator:
         self.distributions, self.distributions_ids = self._merge_distributions_by_patterns(loaded_distributions, loaded_distributions_ids)
         self.distributions = dict(sorted(self.distributions.items()))
         self.distributions_ids = dict(sorted(self.distributions_ids.items()))
+        self.colors = plt.cm.tab10(np.linspace(0, 1, len(self.distributions)))
             
         # Apply preprocessing to distributions individually
         for name, data in self.distributions.items():
@@ -670,88 +691,158 @@ class DistributionComparator:
         return error_data, error_mask    
 
 
-    def create_comparison_plot(self, 
-                               figsize: Tuple[int, int] = (16, 12),
+    def create_comparison_plots(self, 
+                               figsize: Tuple[int, int] = (12, 8),
+                               x_range = [None, None],
                                show_outliers: bool = False) -> None:
-        """Create histogram and box plot comparison visualization."""
+        """
+        Create separate histogram, step plot, and individual distribution plots.
+        Saves multiple files:
+        - Combined histogram of all distributions
+        - Combined step plot of all distributions  
+        - Individual histogram for each distribution
+        """
 
         if not self.distributions:
             raise ValueError("No distributions loaded. Call _load_distributions() first.")
+
+        if x_range[0] is None:
+            x_range[0] = self.global_min
+        if x_range[1] is None:
+            x_range[1] = self.global_max
         
-        # Create figure with subplots (histogram + box plot)
-        fig = plt.figure(figsize=figsize)
-        gs = fig.add_gridspec(2, 1, height_ratios=[3, 2], hspace=0.35)
+        # Apply matplotlib settings before plotting to ensure consistency
+        plt.rcParams.update({
+            "font.family": "sans serif",
+            "svg.fonttype": "none",
+            'font.size': 12,
+            'axes.labelsize': 12,
+            'xtick.labelsize': 10,
+            'ytick.labelsize': 10,
+            'legend.fontsize': 10,
+            'axes.titlesize': 13,
+            'axes.linewidth': 0.5
+        })
+
+        save_path_base = os.path.join(self.directory_path, f'distcomp_{self.metric}')
         
-        # Main histogram plot
-        ax1 = fig.add_subplot(gs[0, 0])
+
+        # ========== 1. COMBINED HISTOGRAM PLOT ==========
+        fig_hist, ax_hist = plt.subplots(figsize=(figsize[0], figsize[1]*1.5))
         
-        # Plot histograms
-        colors = plt.cm.Set3(np.linspace(0, 1, len(self.distributions)))
-        for (name, data), color in zip(self.distributions.items(), colors):
-            ax1.hist(data, bins=50, alpha=0.6, label=name, color=color, density=True)
+        # Define consistent bin edges 
+        bin_edges = np.linspace(x_range[0], x_range[1], 51)  # 50 bins from x_range[0] to x_range[1]
         
-        ax1.set_xlabel('Value')
-        ax1.set_ylabel('Density')
-        ax1.set_title(f'Distribution Comparison - {self.metric}', fontsize=16, fontweight='bold')
-        ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        ax1.grid(True, alpha=0.3)
+        for (name, data), color in zip(self.distributions.items(), self.colors):
+            ax_hist.hist(data, bins=bin_edges, alpha=0.5, label=name, color=color, density=True)
         
-        # Box plot
-        ax4 = fig.add_subplot(gs[1, 0])
-        data_for_box = [data for _, data in self.distributions.items()]
-        labels = [name for name, _ in self.distributions.items()]
+        ax_hist.set_ylabel('Density')
+        ax_hist.set_title(f'Combined Histogram - {self.metric}')
+        ax_hist.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax_hist.grid(True, alpha=0.3)
+        # ax_hist.set_ylim(0, 7.5)
+        ax_hist.set_xlim(x_range[0], x_range[1])
         
-        bp = ax4.boxplot(data_for_box, labels=labels, patch_artist=True, showfliers=show_outliers)
+        # Save combined histogram
+        hist_path = f"{save_path_base}_combined_histogram.svg"
+        plt.savefig(hist_path, dpi=300, bbox_inches='tight', facecolor='white', format='svg')
+        print(f"Saved combined histogram to: {hist_path}")
+        plt.close(fig_hist)
+
+        # ========== 2. INDIVIDUAL HISTOGRAMS FOR EACH DISTRIBUTION ==========
+        # Define consistent bin edges (same as combined plot)
+        bin_edges = np.linspace(x_range[0], x_range[1], 51)  # 50 bins from x_range[0] to x_range[1]
+        
+        for i, (name, data) in enumerate(self.distributions.items()):
+            fig_indiv, ax_indiv = plt.subplots(figsize=figsize)
+            
+            color = self.colors[i]
+            ax_indiv.hist(data, bins=bin_edges, alpha=0.6, color=color, density=True, linewidth=0.5)
+            
+            # Add vertical line at median
+            median_val = np.median(data)
+            ax_indiv.axvline(median_val, color='black', linestyle='--', linewidth=2, alpha=0.8)
+            
+            ax_indiv.set_ylabel('Density')
+            # ax_indiv.set_title(f'{name} - {self.metric}')
+            ax_indiv.grid(True, alpha=0.3)
+            # ax_indiv.set_ylim(0, 6.5)
+            ax_indiv.set_xlim(x_range[0], x_range[1])
+            
+            # Add some statistics as text
+            mean_val = np.mean(data)
+            std_val = np.std(data)
+            
+            stats_text = f'Dataset: {name}\nMean: {mean_val:.3f}\nMedian: {median_val:.3f}\nN: {len(data):,}'
+            ax_indiv.text(0.015, 0.95, stats_text, transform=ax_indiv.transAxes, fontsize=10,
+                         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=1.0))
+            
+            # Save individual histogram
+            safe_name = ''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in name)
+            indiv_path = f"{save_path_base}_histogram_{safe_name}.svg"
+            plt.savefig(indiv_path, dpi=300, bbox_inches='tight', facecolor='white', format='svg')
+            print(f"Saved individual histogram to: {indiv_path}")
+            plt.close(fig_indiv)
+
+
+        # ========== 3. Boxplot ==========
+        # Create the plot
+        fig, ax = plt.subplots(figsize=(figsize[0], figsize[1]*1.3))
+
+        # hide_box = ["cleansplit_3dd0_ood_test_similarity", "cleansplit_train_similarity"]
+        hide_box = ["cleansplit_train_similarity"]
+
+        data_for_box = []
+        color_for_box = []
+        labels = []
+        for (name, data), color in zip(self.distributions.items(), self.colors):
+            if name not in hide_box:
+                data_for_box.append(data)
+                color_for_box.append(color)
+                labels.append(name)
+        
+        bp = ax.boxplot(data_for_box, 
+                        labels=labels,
+                        patch_artist=True, 
+                        showfliers=show_outliers,
+                        boxprops=boxprops,
+                        medianprops=medianprops,
+                        whiskerprops=whiskerprops,
+                        flierprops=flierprops,
+                        capprops=capprops
+                        )
         
         # Color the boxes
-        for patch, color in zip(bp['boxes'], colors):
+        for patch, color in zip(bp['boxes'], color_for_box):
             patch.set_facecolor(color)
-            patch.set_alpha(0.7)
+            patch.set_alpha(0.6)
         
-        ax4.set_ylabel('Value')
-        # ax4.set_ylabel('Value (log scale)')
-        # ax4.set_yscale('symlog')
-        ax4.set_title(f'Distribution Summary (Box Plot) - {self.metric}', fontsize=14, fontweight='bold')
-        ax4.grid(True, alpha=0.3)
+        ax.set_ylabel(self.metric.replace("_", " ").capitalize())
+        ax.grid(True, alpha=0.3)
+        
+        # Move x-axis labels to the top
+        ax.tick_params(top=True, labeltop=True, bottom=False, labelbottom=False)
         
         # Rotate x-axis labels if they're long
         if max(len(label) for label in labels) > 10:
-            plt.setp(ax4.get_xticklabels(), rotation=45, ha='right')
+            plt.setp(ax.get_xticklabels(), rotation=45, ha='left')
         
-        # Add overall title
-        title_parts = [f'Distribution Comparison - {self.metric}\nDirectory: {self.directory_path}']
-        
-        # Add preprocessing information to title
-        preprocessing_info = []
-        if self.merge_patterns:
-            preprocessing_info.append(f"Merged: {', '.join(self.merge_patterns)}")
-        if self.remove_outliers:
-            preprocessing_info.append("Outliers removed")
-        if self.robust_scaling:
-            preprocessing_info.append("Robust scaling")
-        if self.asinh_scaling:
-            preprocessing_info.append("Asinh scaling")
-        if self.normalize:
-            preprocessing_info.append("Normalized to [-1,0] range")
+        # Save the boxplot
+        svg_path = f"{save_path_base}_boxplot" + ".svg"
+        plt.savefig(svg_path, dpi=300, bbox_inches='tight', facecolor='white', format='svg')
+        # png_path = f"{save_path_base}_boxplot" + ".png"
+        # plt.savefig(png_path, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
 
-        if preprocessing_info:
-            title_parts.append(f"Preprocessing: {', '.join(preprocessing_info)}")
-        
-        fig.suptitle('\n'.join(title_parts), fontsize=18, fontweight='bold', y=0.98)
 
-        save_path = os.path.join(self.directory_path, f'distcomp_{self.metric}')
-        
-        # Save plot if path provided (always SVG) and export tables as CSV
-        # svg_path = save_path + '.svg'
-        # plt.savefig(svg_path, dpi=300, bbox_inches='tight', facecolor='white'), format='svg')
-        png_path = save_path + '.png'
-        plt.savefig(png_path, dpi=300, bbox_inches='tight', facecolor='white')
-        
         # Export metrics tables
         self._export_summary_csv()
         
-        plt.tight_layout()
-        plt.show()
+        print(f"\n✅ Created {len(self.distributions) + 2} separate plots:")
+        print(f"   - 1 combined histogram")
+        print(f"   - 1 combined step plot") 
+        print(f"   - {len(self.distributions)} individual histograms")
+        print(f"All plots saved with consistent width: {figsize[0]} units")
         
 
     def plot_heatmaps(self, 
@@ -772,6 +863,19 @@ class DistributionComparator:
             error_range: Y-axis range for error values
             metric_range: X-axis range for metric values
         """
+
+        plt.rcParams.update({
+        "font.family": "sans serif",
+        "svg.fonttype": "none",          # keep text as text in SVG
+        'font.size': 12,                 # Set the base font size 
+        'axes.labelsize': 12,            # X and Y axis labels
+        'xtick.labelsize': 10,           # X-axis tick labels
+        'ytick.labelsize': 10,           # Y-axis tick labels
+        'legend.fontsize': 10,           # Legend font size
+        'axes.titlesize': 13,            # Plot title size
+        'axes.linewidth': 0.5            # Thinner axis lines
+        })  
+
         if not self.error_values:
             raise ValueError("No error distribution loaded. Call _load_error_distribution() first.")
         
@@ -790,21 +894,6 @@ class DistributionComparator:
             error_range[1] = self.global_error_max
         print(f"Error range for heatmaps: [{error_range[0]:.2e}, {error_range[1]:.2e}]")
 
-        # Get quadrant boundaries from train distribution
-        train_error_upper_bound = None
-        train_metric_lower_bound = None
-        for idx, (name, metric_data) in enumerate(self.distributions.items()):
-            if 'train' in name:
-                error_data, _ = self._get_error_data_for_distribution(name)
-
-                # Upper boundary of error data
-                train_error_upper_bound = np.percentile(error_data, 90)
-                print(f"  {name} 90th percentile of error data: {train_error_upper_bound:.2e}")
-
-                # Lower boundary of metric data
-                train_metric_lower_bound = np.percentile(metric_data, 10)
-                print(f"  {name} 10th percentile of metric data: {train_metric_lower_bound:.2e}")
-                break
 
         # Create one figure per distribution
         for idx, (name, metric_data) in enumerate(self.distributions.items()):
@@ -816,6 +905,7 @@ class DistributionComparator:
             error_data, error_mask = self._get_error_data_for_distribution(name)
             metric_data = np.array(metric_data)[error_mask] # Only include points with error values
 
+            print(f"  N = {len(metric_data)} points with log-likelihoods and error values")
             print(f"  Range of metric data: [{np.min(metric_data):.2e}, {np.max(metric_data):.2e}]")
             print(f"  Range of error data: [{np.min(error_data):.2e}, {np.max(error_data):.2e}]")
             print(f"  RMSD: {np.sqrt(np.mean(np.square(error_data))):.2e}")
@@ -853,12 +943,12 @@ class DistributionComparator:
                 
                 # # Add colorbar for this subplot
                 # cbar = plt.colorbar(im, ax=ax, shrink=0.82)
-                # cbar.set_label('Density (0–1)', fontsize=10)
+                # cbar.set_label('Density (0–1)')
                 # cbar.set_ticks([0.0, 0.25, 0.5, 0.75, 1.0])
                 
-                ax.set_xlabel(f'{self.metric}', fontsize=10, fontweight='bold')
-                ax.set_ylabel('Error Value', fontsize=10, fontweight='bold')
-                ax.set_title(f'{name}\n({len(metric_data)} points)', fontsize=12, fontweight='bold')
+                ax.set_xlabel(f'{self.metric}', fontweight='bold')
+                ax.set_ylabel('Error Value', fontweight='bold')
+                # ax.set_title(f'{name}\n({len(metric_data)} points)', fontweight='bold')
                 ax.set_xlim(metric_range[0], metric_range[1])  # Fixed x-axis limits
                 ax.set_ylim(error_range[0], error_range[1])  # Fixed y-axis limits
                 for spine in ax.spines.values():
@@ -875,172 +965,58 @@ class DistributionComparator:
                 ax.set_ylim(error_range[0], error_range[1])  # Fixed y-axis limits
             
             safe_name = ''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in name)
-            # svg_path = f"{save_path}_{safe_name}.svg"
-            # plt.savefig(svg_path, dpi=300, bbox_inches='tight', facecolor='white'), format='svg')
-            png_path = f"{save_path}_{safe_name}.png"
-            plt.savefig(png_path, dpi=300, bbox_inches='tight', facecolor='white')
+            svg_path = f"{save_path}_{safe_name}.svg"
+            plt.savefig(svg_path, dpi=300, bbox_inches='tight', facecolor='white', format='svg')
+            # png_path = f"{save_path}_{safe_name}.png"
+            # plt.savefig(png_path, dpi=300, bbox_inches='tight', facecolor='white')
             plt.close(fig)
-            
-            # Create confusion-matrix-like quadrant plot
-            if train_error_upper_bound is not None and train_metric_lower_bound is not None and len(error_data) > 0:
-                fig_quad, ax_quad = plt.subplots(figsize=figsize)
-                
-                total_points = len(metric_data)
-                
-                # Bottom-left: metric <= train_metric_lower_bound, error <= train_error_upper_bound
-                q1_mask = (metric_data <= train_metric_lower_bound) & (error_data <= train_error_upper_bound)
-                q1_count = np.sum(q1_mask)
-                q1_pct = (q1_count / total_points) * 100
-                
-                # Bottom-right: metric > train_metric_lower_bound, error <= train_error_upper_bound
-                q2_mask = (metric_data > train_metric_lower_bound) & (error_data <= train_error_upper_bound)
-                q2_count = np.sum(q2_mask)
-                q2_pct = (q2_count / total_points) * 100
-                
-                # Top-left: metric <= train_metric_lower_bound, error > train_error_upper_bound
-                q3_mask = (metric_data <= train_metric_lower_bound) & (error_data > train_error_upper_bound)
-                q3_count = np.sum(q3_mask)
-                q3_pct = (q3_count / total_points) * 100
-                
-                # Top-right: metric > train_metric_lower_bound, error > train_error_upper_bound
-                q4_mask = (metric_data > train_metric_lower_bound) & (error_data > train_error_upper_bound)
-                q4_count = np.sum(q4_mask)
-                q4_pct = (q4_count / total_points) * 100
-                
-                # Normalize percentages to [0, 1] for colormap
-                percentages = np.array([q1_pct, q2_pct, q3_pct, q4_pct])
-                max_pct = np.max(percentages) if np.max(percentages) > 0 else 1.0
-                normalized_pcts = percentages / max_pct
-                
-                # Create quadrant rectangles with colors based on percentage
-                # Bottom-left (Q1)
-                rect1 = mpl.patches.Rectangle(
-                    (metric_range[0], error_range[0]),
-                    train_metric_lower_bound - metric_range[0],
-                    train_error_upper_bound - error_range[0],
-                    facecolor=custom_cmap(normalized_pcts[0]),
-                    edgecolor='black',
-                    linewidth=1.0
-                )
-                ax_quad.add_patch(rect1)
-                ax_quad.text(
-                    (metric_range[0] + train_metric_lower_bound) / 2,
-                    (error_range[0] + train_error_upper_bound) / 2,
-                    f'{q1_pct:.1f}%',
-                    ha='center', va='center',
-                    fontsize=14, fontweight='bold'
-                )
-                
-                # Bottom-right (Q2)
-                rect2 = mpl.patches.Rectangle(
-                    (train_metric_lower_bound, error_range[0]),
-                    metric_range[1] - train_metric_lower_bound,
-                    train_error_upper_bound - error_range[0],
-                    facecolor=custom_cmap(normalized_pcts[1]),
-                    edgecolor='black',
-                    linewidth=1.0
-                )
-                ax_quad.add_patch(rect2)
-                ax_quad.text(
-                    (train_metric_lower_bound + metric_range[1]) / 2,
-                    (error_range[0] + train_error_upper_bound) / 2,
-                    f'{q2_pct:.1f}%',
-                    ha='center', va='center',
-                    fontsize=14, fontweight='bold'
-                )
-                
-                # Top-left (Q3)
-                rect3 = mpl.patches.Rectangle(
-                    (metric_range[0], train_error_upper_bound),   
-                    train_metric_lower_bound - metric_range[0],
-                    error_range[1] - train_error_upper_bound,
-                    facecolor=custom_cmap(normalized_pcts[2]),
-                    edgecolor='black',
-                    linewidth=1.0
-                )
-                ax_quad.add_patch(rect3)
-                ax_quad.text(
-                    (metric_range[0] + train_metric_lower_bound) / 2,
-                    (train_error_upper_bound + error_range[1]) / 2,
-                    f'{q3_pct:.1f}%',
-                    ha='center', va='center',
-                    fontsize=14, fontweight='bold'
-                )
-                
-                # Top-right (Q4)
-                rect4 = mpl.patches.Rectangle(
-                    (train_metric_lower_bound, train_error_upper_bound),
-                    metric_range[1] - train_metric_lower_bound,
-                    error_range[1] - train_error_upper_bound,
-                    facecolor=custom_cmap(normalized_pcts[3]),
-                    edgecolor='black',
-                    linewidth=1.0
-                )
-                ax_quad.add_patch(rect4)
-                ax_quad.text(
-                    (train_metric_lower_bound + metric_range[1]) / 2,
-                    (train_error_upper_bound + error_range[1]) / 2,
-                    f'{q4_pct:.1f}%',
-                    ha='center', va='center',
-                    fontsize=14, fontweight='bold'
-                )
-                
-                # Add quadrant boundary lines
-                ax_quad.axvline(train_metric_lower_bound, color='black', linewidth=1.5, linestyle='--')
-                ax_quad.axhline(train_error_upper_bound, color='black', linewidth=1.5, linestyle='--')
-                
-                # Customize axes
-                ax_quad.set_xlabel(f'{self.metric}', fontsize=10, fontweight='bold')
-                ax_quad.set_ylabel('Error Value', fontsize=10, fontweight='bold')
-                ax_quad.set_title(f'{name} - Quadrants\n({total_points} points)', fontsize=12, fontweight='bold')
-                ax_quad.set_xlim(metric_range[0], metric_range[1])
-                ax_quad.set_ylim(error_range[0], error_range[1])
-                
-                # Set frame styling
-                for spine in ax_quad.spines.values():
-                    spine.set_visible(True)
-                    spine.set_color('black')
-                    spine.set_linewidth(1.0)
-                ax_quad.grid(False)
-                ax_quad.set_facecolor('white')
-                
-                # Save quadrant plot
-                # quad_svg_path = f"{save_path}_{safe_name}_quadrants.svg"
-                # plt.savefig(quad_svg_path, dpi=300, bbox_inches='tight', facecolor='white'), format='svg')
-                
-                quad_png_path = f"{save_path}_{safe_name}_quadrants.png"
-                plt.savefig(quad_png_path, dpi=300, bbox_inches='tight', facecolor='white')
-                
-                plt.close(fig_quad)
 
 
-    def plot_exponential_scatterplots(self, 
+    def plot_exponential_scatterplot(self, 
                                       save_path: str, 
                                       distribution_names: List[str],
+                                      max_points_for_fitting: int = 500,
                                       figsize: Tuple[int, int] = (8, 6),
                                       error_range = [None, None],
                                       metric_range = [None, None]
                                       ) -> None:
         """
         Create scatterplot with hierarchical exponential curve fitting (5-curve system).
-        Forces exponential fits using parameter bounds to avoid linear fallbacks.
         
         The scatterplot and curve fitting are based on the specified distributions,
         but error range analysis is performed on ALL loaded distributions for comprehensive statistics.
         
         Args:
-            save_path: Path to save plot (.png)
+            save_path: Path to save plot
             distribution_names: List of distribution names (or patterns) to use for plotting and curve fitting
             figsize: Figure size (default: (8, 6))
             error_range: Y-axis range for error values
             metric_range: X-axis range for metric values
         """
+
+        # Apply matplotlib settings before plotting to ensure consistency
+        plt.rcParams.update({
+            "font.family": "sans serif",
+            "svg.fonttype": "none",
+            'font.size': 12,
+            'axes.labelsize': 12,
+            'xtick.labelsize': 10,
+            'ytick.labelsize': 10,
+            'legend.fontsize': 10,
+            'axes.titlesize': 13,
+            'axes.linewidth': 0.5
+        })
+
         if not self.error_values:
             raise ValueError("No error distribution loaded. Call _load_error_distribution() first.")
         
         if not self.distributions or not self.distributions_ids:
             raise ValueError("No distributions loaded. Call _load_distributions() first.")
-        
+
+        if len(distribution_names) < 2:
+            raise ValueError("At least 2 distributions must be specified.")
+
+
         # Validate distribution names and match patterns
         distribution_names_validated = distribution_names.copy()
         
@@ -1051,9 +1027,6 @@ class DistributionComparator:
                         distribution_names_validated[i] = dist_name
                         break
         distribution_names = [dist_name for dist_name in distribution_names_validated if dist_name in self.distributions]
-
-        if len(distribution_names) < 2:
-            raise ValueError("At least 2 distributions must be specified.")
 
         if metric_range[0] is None:
             metric_range[0] = self.global_min
@@ -1090,12 +1063,12 @@ class DistributionComparator:
                 
                 # Initial guesses with weak to strong exponential character
                 initial_guesses = [
-                    ([y_span, -2.0/x_span, np.min(y)], "Strong decay"),
-                    ([y_span, 2.0/x_span, np.min(y)], "Strong growth"),
-                    ([y_span, -5.0/x_span, np.min(y)], "Very strong decay"),
-                    ([y_span, 5.0/x_span, np.min(y)], "Very strong growth"),
-                    ([y_mean, -1.0/x_span, y_mean/2], "Moderate decay (centered)"),
-                    ([y_mean, 1.0/x_span, y_mean/2], "Moderate growth (centered)"),
+                    ([y_span, -5.0/x_span, np.min(y)], "Strong decay"),
+                    ([y_span, 5.0/x_span, np.min(y)], "Strong growth"),
+                    ([y_span, -8.0/x_span, np.min(y)], "Very strong decay"),
+                    ([y_span, 8.0/x_span, np.min(y)], "Very strong growth"),
+                    ([y_mean, -3.0/x_span, y_mean/2], "Moderate decay (centered)"),
+                    ([y_mean, 3.0/x_span, y_mean/2], "Moderate growth (centered)"),
                     ([2*y_span, -0.5/x_span, np.min(y)], "Wide amplitude decay"),
                     ([2*y_span, 0.5/x_span, np.min(y)], "Wide amplitude growth"),
                 ]
@@ -1282,7 +1255,7 @@ class DistributionComparator:
                                 y_below_at_data = exponential_func(x_below, a_below, b_below, c_below)
                                 below_below_mask = y_below < y_below_at_data
                                 
-                                print(f"  📈 FITTING BELOW-BELOW-CURVE on {np.sum(below_below_mask)} points...")
+                                print(f"  FITTING BELOW-BELOW-CURVE on {np.sum(below_below_mask)} points...")
                                 if np.sum(below_below_mask) >= 3:
                                     x_below_below = x_below[below_below_mask]
                                     y_below_below = y_below[below_below_mask]
@@ -1317,64 +1290,78 @@ class DistributionComparator:
         print(f"  Y-range (error): [{error_range[0]:.3e}, {error_range[1]:.3e}] (span: {error_range[1] - error_range[0]:.3e})")
         
         # Create the plot
-        colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
         fig, ax = plt.subplots(figsize=figsize)
         
-        # Collect all data from specified distributions
-        all_metric_data = []
-        all_error_data = []
+        max_points_for_plotting = 100
         distribution_data = {}
+        metric_data_subsampled_all = []
+        error_data_subsampled_all = []
 
-        for i, name in enumerate(distribution_names):
-            # Get error and metric data for this distribution
+        for i, (name, data) in enumerate(self.distributions.items()):
+            if name not in distribution_names:
+                continue
             error_data, error_mask = self._get_error_data_for_distribution(name)
-            metric_data_filtered = np.array(self.distributions[name])[error_mask]
+            metric_data_filtered = np.array(data)[error_mask]
             
             if len(error_data) == 0:
                 print(f"Warning: No error values found for distribution {name}")
                 continue
-                
+
             print(f"  {name}: {len(metric_data_filtered)} points")
             print(f"    Metric range: [{np.min(metric_data_filtered):.2e}, {np.max(metric_data_filtered):.2e}]")
             print(f"    Error range: [{np.min(error_data):.2e}, {np.max(error_data):.2e}]")
             print(f"    RMSD: {np.sqrt(np.mean(np.square(error_data))):.2e}")
-            
-            # Store data for this distribution
-            distribution_data[name] = {
-                'metric_data': metric_data_filtered,
-                'error_data': np.array(error_data),
-                'color': colors[i % len(colors)]}
-            
-            all_metric_data.extend(metric_data_filtered)
-            all_error_data.extend(error_data)
-        
-        all_metric_data = np.array(all_metric_data)
-        all_error_data = np.array(all_error_data)
-        
-        if len(all_metric_data) == 0:
-            print("Error: No valid data found in any of the specified distributions")
-            return
-        
-        print(f"  Combined: {len(all_metric_data)} total points")
 
+            # Subsample to specific number od data points for plotting
+            indeces = np.arange(len(metric_data_filtered))
+            if len(indeces) > max_points_for_plotting:
+                np.random.seed(42)
+                indeces = np.random.choice(indeces, size=max_points_for_plotting, replace=False)
+            metric_data_subsampled = metric_data_filtered[indeces]
+            error_data_subsampled = np.array(error_data)[indeces]
+
+            distribution_data[name] = {
+                'metric_data': metric_data_subsampled,
+                'error_data': error_data_subsampled,
+                'color': self.colors[i % len(self.colors)]}       
+
+
+            # Subsample to a specific number of data points for fitting
+            indeces = np.arange(len(metric_data_filtered))
+            if len(indeces) > max_points_for_fitting:
+                np.random.seed(42)
+                indeces = np.random.choice(indeces, size=max_points_for_fitting, replace=False)
+            metric_data_subsampled = metric_data_filtered[indeces]
+            error_data_subsampled = np.array(error_data)[indeces]
+
+            metric_data_subsampled_all.extend(metric_data_subsampled)
+            error_data_subsampled_all.extend(error_data_subsampled) 
+
+        metric_data_subsampled_all = np.array(metric_data_subsampled_all)
+        error_data_subsampled_all = np.array(error_data_subsampled_all)
+
+        
         # Create scatterplot
+        hide_markers = ["cleansplit_ood_train_combined", 
+                        "cleansplit_3dd0_test"]
+                        # ,"cleansplit_2vw5_test"]
         try:
-            # Plot each distribution with different colors
             for name, data in distribution_data.items():
-                ax.scatter(
-                    data['metric_data'],
-                    data['error_data'],
-                    alpha=0.6,
-                    s=20,
-                    color=data['color'],
-                    edgecolors='none',
-                    label=f'{name} ({len(data["metric_data"])} pts)'
-                )
+                if name not in hide_markers:
+                    ax.scatter(
+                        data['metric_data'],
+                        data['error_data'],
+                        alpha=0.6,
+                        s=50,
+                        color=data['color'],
+                        edgecolors='none',
+                        label=f'{name} ({len(data["metric_data"])} pts)'
+                    )
                 
             # Fit exponential curves using hierarchical approach
-            if len(all_metric_data) >= 3:
+            if len(metric_data_subsampled_all) >= 3:
                 print(f"  STARTING HIERARCHICAL EXPONENTIAL CURVE FITTING...")
-                fits = hierarchical_exponential_fit(all_metric_data, all_error_data, metric_range)
+                fits = hierarchical_exponential_fit(metric_data_subsampled_all, error_data_subsampled_all, metric_range)
                 
                 # Plot all fitted curves and provide summary
                 fit_labels = {
@@ -1393,7 +1380,7 @@ class DistributionComparator:
                         ax.plot(
                             fit_data['x_fit'], 
                             fit_data['y_fit'], 
-                            label=fit_labels[fit_name],
+                            # label=fit_labels[fit_name],
                             **fit_data['style']
                         )
                         curves_fitted += 1
@@ -1406,26 +1393,27 @@ class DistributionComparator:
                 
                 print(f"\n  TOTAL CURVES FITTED: {curves_fitted}/5")
                 
+
                 # Print statistics about data separation
                 if 'main' in fits and fits['main']['params'][0] is not None:
                     a_main, b_main, c_main = fits['main']['params']
-                    y_main_at_data = exponential_func(all_metric_data, a_main, b_main, c_main)
-                    above_mask = all_error_data > y_main_at_data
-                    below_mask = all_error_data <= y_main_at_data
+                    y_main_at_data = exponential_func(metric_data_subsampled_all, a_main, b_main, c_main)
+                    above_mask = error_data_subsampled_all > y_main_at_data
+                    below_mask = error_data_subsampled_all <= y_main_at_data
                     print(f"\n  DATA SEPARATION STATISTICS:")
                     print(f"    Main curve separates: {np.sum(above_mask)} points above, {np.sum(below_mask)} points below")
                     
                     if 'above' in fits and np.sum(above_mask) > 0 and fits['above']['params'][0] is not None:
-                        x_above_data = all_metric_data[above_mask]
-                        y_above_data = all_error_data[above_mask]
+                        x_above_data = metric_data_subsampled_all[above_mask]
+                        y_above_data = error_data_subsampled_all[above_mask]
                         a_above, b_above, c_above = fits['above']['params']
                         y_above_at_data = exponential_func(x_above_data, a_above, b_above, c_above)
                         above_above_mask = y_above_data > y_above_at_data
                         print(f"    Above curve separates: {np.sum(above_above_mask)} points above, {np.sum(~above_above_mask)} points below")
                     
                     if 'below' in fits and np.sum(below_mask) > 0 and fits['below']['params'][0] is not None:
-                        x_below_data = all_metric_data[below_mask]
-                        y_below_data = all_error_data[below_mask]
+                        x_below_data = metric_data_subsampled_all[below_mask]
+                        y_below_data = error_data_subsampled_all[below_mask]
                         a_below, b_below, c_below = fits['below']['params']
                         y_below_at_data = exponential_func(x_below_data, a_below, b_below, c_below)
                         below_below_mask = y_below_data < y_below_at_data
@@ -1435,10 +1423,10 @@ class DistributionComparator:
                 self._analyze_exponential_error_ranges(fits, exponential_func)
                 
             else:
-                print(f"  INSUFFICIENT DATA: Only {len(all_metric_data)} points available (minimum 3 required)")
+                print(f"  INSUFFICIENT DATA: Only {len(metric_data_subsampled_all)} points available (minimum 3 required)")
             
             # Add legend for data points and fitted curves (positioned outside plot area)
-            ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+            ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
             
             # Ensure background is white
             ax.set_facecolor('white')
@@ -1450,13 +1438,12 @@ class DistributionComparator:
             ax.grid(False)
             
             # Customize subplot
-            ax.set_xlabel(f'{self.metric}', fontsize=10, fontweight='bold')
-            ax.set_ylabel('Error Value', fontsize=10, fontweight='bold')
+            ax.set_xlabel(f'{self.metric}', fontweight='bold')
+            ax.set_ylabel('Error Value', fontweight='bold')
             
             # Create title with distribution names
-            dist_names_str = ' + '.join(distribution_names)
-            ax.set_title(f'{dist_names_str}\n({len(all_metric_data)} total points)', 
-                       fontsize=12, fontweight='bold')
+            # dist_names_str = ' + '.join(distribution_names)
+            # ax.set_title(f'{dist_names_str}\n({len(metric_data_subsampled_all)} total points)')
             ax.set_xlim(metric_range[0], metric_range[1])  # Fixed x-axis limits
             ax.set_ylim(error_range[0], error_range[1])  # Fixed y-axis limits
             
@@ -1475,7 +1462,10 @@ class DistributionComparator:
             ax.set_ylim(error_range[0], error_range[1])  # Fixed y-axis limits
         
         # Save the plot
-        plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+        svg_path = save_path + '.svg'
+        plt.savefig(svg_path, dpi=300, bbox_inches='tight', facecolor='white', format='svg')
+        # png_path = save_path + '.png'
+        # plt.savefig(png_path, dpi=300, bbox_inches='tight', facecolor='white')
         plt.close(fig)
         print(f"Saved combined scatterplot to: {save_path}")
 
@@ -1785,7 +1775,9 @@ def main():
     
     # Create plots
     print("Creating comparison plot...")
-    comparator.create_comparison_plot(figsize=tuple(args.figsize), show_outliers=args.show_outliers)
+    comparator.create_comparison_plots(
+        figsize=(12, 2), 
+        show_outliers=args.show_outliers)
 
     # Plots including error values
     if args.error_dict:
@@ -1804,20 +1796,20 @@ def main():
             print("\nCreating individual heatmap plots...")
             comparator.plot_heatmaps(
                 save_path=os.path.join(save_dir, 'heatmaps_' + args.metric),
-                figsize=(12, 8),
-                n_bins=16,
+                figsize=(4, 3),
+                n_bins=24,
                 error_range=[None, 6]
                 )
         
         # Create exponential scatterplot if requested
-        if args.plot_exponential_scatterplots:
-            print(f"\nCreating combined scatterplot with exponential curve fitting for: {args.plot_exponential_scatterplots}")
+        if args.plot_exponential_scatterplot:
+            print(f"\nCreating combined scatterplot with exponential curve fitting for: {args.plot_exponential_scatterplot}")
             try:
-                comparator.plot_exponential_scatterplots(
-                    save_path=os.path.join(save_dir, 'combined_exponential_scatterplot.png'),
-                    distribution_names=args.plot_exponential_scatterplots,
+                comparator.plot_exponential_scatterplot(
+                    save_path=os.path.join(save_dir, 'combined_exponential_scatterplot'),
+                    distribution_names=args.plot_exponential_scatterplot,
                     figsize=(12, 8),
-                    error_range=[None, 3.5]
+                    error_range=[None, 6]
                 )
             except ValueError as e:
                 print(f"Error creating exponential scatterplot: {e}")
