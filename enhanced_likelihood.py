@@ -948,6 +948,8 @@ def save_dict_to_json(data, output_path):
         with open(output_path, 'w') as f:
             json.dump(existing_data, f, indent=4)
     else:
+        if not os.path.exists(os.path.dirname(output_path)):
+            os.makedirs(os.path.dirname(output_path))
         with open(output_path, 'w') as f:
             json.dump(data, f, indent=4)
     print(f"Results saved to: {output_path}")
