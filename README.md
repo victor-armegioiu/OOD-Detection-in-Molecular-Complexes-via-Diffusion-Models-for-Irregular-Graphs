@@ -4,9 +4,11 @@ This repository contains the implementation for the paper **"Out-of-Distribution
 
 The framework operates on 3D protein-ligand interaction graphs, which combine discrete chemical features (atom/residue types) with continuous 3D coordinates. We unify these attributes through a continuous spherical embedding space, enabling end-to-end training via a single SE(3)-equivariant graph neural network.
 
-**Paper**: [https://arxiv.org/abs/2512.18454](https://arxiv.org/abs/2512.18454)<br> 
-**📊 Data and pre-trained models**: [https://doi.org/10.5281/zenodo.XXXXXXX](https://doi.org/10.5281/zenodo.XXXXXXX)<br>
-**📊 Source Data**: [https://www.pdbbind-plus.org.cn/](https://www.pdbbind-plus.org.cn/)
+📝 **Paper**: [https://arxiv.org/abs/2512.18454](https://arxiv.org/abs/2512.18454)<br>
+💾 **Graph datasets**: [https://doi.org/10.5281/zenodo.18700811](https://doi.org/10.5281/zenodo.18700811)<br>
+🤖 **Pretrained model**: [https://doi.org/10.5281/zenodo.18700811](https://doi.org/10.5281/zenodo.18700811)<br>
+📊 **Log-likelihoods and trajectory features for all datasets**: [https://doi.org/10.5281/zenodo.18700811](https://doi.org/10.5281/zenodo.18700811)<br>
+🧬 **Source data (PDBbind)**: [https://www.pdbbind-plus.org.cn/](https://www.pdbbind-plus.org.cn/)
 
 ## Repository Structure
 
@@ -78,11 +80,11 @@ Contains the carefully constructed train-test split with CASF2016 and seven OOD 
 #### [`data_split/combined_train_val_split.json`](data_split/combined_train_val_split.json)
 Further splits the `train` dataset from [`data_split/combined_train_test_split.json`](data_split/combined_train_test_split.json) into a final training and validation dataset with a 90/10 ratio.
 
-## Reproduction Instructions
+## Usage Instructions
 
 ### 1. Data Preparation
 
-**Option A: Download pre-processed Datasets**
+**Option A: Download Pre-processed Datasets (Recommended)**
 
 Download the pre-processed datasets from Zenodo and place them in your working directory:
 ```bash
@@ -139,36 +141,60 @@ python Dataset.py \
 ```bash
 python main.py \
     --mode single \
-    --train_dataset cleansplit_ood_train_combined.pt \
-    --eval_dataset cleansplit_ood_val_combined.pt \
+    --train_dataset dataset_train.pt \
+    --eval_dataset dataset_val.pt \
+    --num_epochs 1000 \
     --batch_size 16 \
     --learning_rate 0.0001
 
-# To resume training from a saved checkpoint
-    --resume_checkpoint_path training_runs/.../checkpoint_epoch_990.pt
+# To resume training from a saved checkpoint:
+python main.py \
+    --mode single \
+    --train_dataset dataset_train.pt \
+    --eval_dataset dataset_val.pt \
+    --resume_checkpoint_path training_runs/.../checkpoint_epoch_100.pt
 ```
+Training checkpoints are saved in `training_runs/` with automatic experiment naming.
+
 
 **Advanced training with hyperparameter optimization:**
 ```bash
 # Bayesian optimization
 python main.py \
     --mode bayesian \
-    --num_trials 50 \
-    --train_dataset cleansplit_ood_train_combined.pt \
-    --eval_dataset cleansplit_ood_val_combined.pt \
+    --num_trials 10 \
+    --train_dataset dataset_train.pt \
+    --eval_dataset dataset_val.pt \
+    --num_epochs 1000
+
+# To resume an existing study:
+python main.py \
+    --mode bayesian \
+    --num_trials 10 \
+    --train_dataset dataset_train.pt \
+    --eval_dataset dataset_val.pt \
+    --study_name existing_study_name \
+    --storage sqlite:///existing_study.db
 ```
+Training checkpoints and trial results are saved in `optimization_runs/` with automatic experiment naming. An SQLite file date_bayesian.db is automatically initialized with a new study record.
 
-**Key hyperparameters:**
+**Sampling Evaluation:**
+- During training, the quality of sampled protein-ligand structures is automatically evaluated at regular intervals (default: every 10 epochs)
+- Metrics include: molecular validity, fragment count, ring statistics, and Jensen-Shannon divergences between training and sampled atom/residue distributions
+- Early stopping is based on three key metrics: `percent_fragmented`, `mean_num_fragments`, and `mean_ring_size`
+- Training automatically stops when sample quality stops improving  
+
+**Key Hyperparameters:**
 - `--n_layers`: Number of EGNN layers (default: 6)
-- `--joint_nf`: Joint embedding dimension (default: 256) 
+- `--joint_nf`: Joint embedding dimension (default: 256)
 - `--hidden_nf`: Hidden layer dimension (default: 256)
-- `--edge_embedding_dim`: Size of the edge embedding (default: 64)
+- `--edge_embedding_dim`: Size of edge embeddings (default: 64)
 - `--num_sampling_steps`: Diffusion sampling steps (default: 400)
-- `--learning_rate`: (default: 0.0001)
-- `--batch_size`: Size of graph batches (default: 16)
-- `--early_stopping_patience`: Number of epochs without improvement before stopping training(default:100)
+- `--learning_rate`: Learning rate (default: 0.0001)
+- `--batch_size`: Graph batch size (default: 16)
+- `--early_stopping_patience`: Evaluation intervals without improvement before stopping (default: 10)
 
-Training checkpoints are saved in `training_runs/` with automatic experiment naming.
+
 
 ### 3. Computing Likelihoods and Trajectory Features
 
@@ -177,8 +203,8 @@ Once you have a trained model, compute log-likelihoods and trajectory statistics
 **Basic usage:**
 ```bash
 python enhanced_likelihood.py \
-    --dataset_path cleansplit_1nvq_test.pt \
-    --checkpoint_path training_runs/your_run/checkpoint_epoch_999.pt \
+    --dataset_path dataset_1nvq_test.pt \
+    --checkpoint_path training_runs/.../checkpoint_epoch_100.pt \
     --results_folder likelihood_results \
     --num_steps 5 \
     --num_hutchinson_samples 20
@@ -197,7 +223,7 @@ The script generates a JSON file containing:
   - Curvature and smoothness indicators
   - Flow energy and Lipschitz stability estimates
 
-### Example OOD Detection Workflow
+<!-- ### Example OOD Detection Workflow
 
 1. **Train model on in-distribution data:**
 ```bash
@@ -216,20 +242,25 @@ done
 ```
 
 3. **Analyze results:**
-The output JSON files contain likelihood scores and trajectory features that can be used to train binary OOD classifiers or compute ROC curves for evaluation.
+The output JSON files contain likelihood scores and trajectory features that can be used to train binary OOD classifiers or compute ROC curves for evaluation. -->
 
-## Requirements
+## 🛠️ Requirements
 
 - Python 3.8+
 - PyTorch 1.12+ with CUDA support
 - PyTorch Geometric
+- openbabel (conda install openbabel -c conda-forge)
 - Additional dependencies: numpy, scipy, matplotlib, wandb, optuna
 
-## Citation
+**Additionally for graph construction from structure files**:
+- gemmi (0.7.0)
+
+## 📄 Citation
 
 If you use this code in your research, please cite:
 
 ```bibtex
+<<<<<<< HEAD
 @misc{graber2026outofdistributiondetectionmolecularcomplexes,
       title={Out-of-Distribution Detection in Molecular Complexes via Diffusion Models for Irregular Graphs}, 
       author={David Graber and Victor Armegioiu and Rebecca Buller and Siddhartha Mishra},
@@ -238,5 +269,12 @@ If you use this code in your research, please cite:
       archivePrefix={arXiv},
       primaryClass={cs.LG},
       url={https://arxiv.org/abs/2512.18454}, 
+=======
+@article{armegioiu2024molecular,
+  title={Out-of-Distribution Detection in Molecular Complexes via Diffusion Models for Irregular Graphs},
+  author={Armegioiu, Victor and Graber, David and others},
+  journal={arXiv preprint arXiv:2512.18454},
+  year={2024}
+>>>>>>> 587b061 (updated documentation)
 }
 ```
