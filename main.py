@@ -51,26 +51,26 @@ except ImportError:
 
 
 CONFIG = {
-    'train_dataset_path': 'dataset_pdbbind_train.pt',
-    'eval_dataset_path': 'dataset_pdbbind_validation.pt',
+    'train_dataset_path': 'dataset_train.pt',
+    'eval_dataset_path': 'dataset_val.pt',
 
     # Model parameters
     'atom_nf': 10,           
     'residue_nf': 21,         
     'n_dims': 3,             
-    'n_layers': 4,           
+    'n_layers': 6,           
     'joint_nf': 256,          
-    'hidden_nf': 128,         
-    'edge_embedding_dim': 32, 
+    'hidden_nf': 256,         
+    'edge_embedding_dim': 64, 
     
     # Training parameters
-    'num_epochs': 1000,
+    'num_epochs': 2000,
     'learning_rate': 1e-4,
     'batch_size': 16,
     'log_interval': 20,
     'eval_interval': 10,
     'num_eval_samples': 50,
-    'early_stopping_patience': 5,
+    'early_stopping_patience': 100,
     
     # Diffusion parameters
     'sigma_max': 100.0,      # Maximum noise level
@@ -80,7 +80,7 @@ CONFIG = {
     'geom_loss_weight': 0.0,
     
     # Sampling parameters
-    'num_sampling_steps': 16,
+    'num_sampling_steps': 400,
     'schedule_type': "exponential",
     
     # I/O
@@ -123,7 +123,7 @@ def set_random_seeds(seed: int):
     print(f"✅ Random seeds set to {seed}")
 
 def parse_arguments():
-    """Parse command line arguments"""
+    """Parse command line arguments to overwrite the default setting in config"""
     
     parser = argparse.ArgumentParser(description="Molecular Diffusion Pipeline with Hyperparameter Optimization")
     
