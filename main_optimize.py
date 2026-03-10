@@ -107,7 +107,7 @@ CONFIG = {
     'cfg_guidance_scale': 0,
     
     # Diffusion parameters
-    'sigma_max': 5, # 100.0,      # Maximum noise level
+    'sigma_max': 80, # 100.0,      # Maximum noise level
     'sigma_min': 2e-3, #1e-4,      # Minimum noise level -> raised to prevent instabilities
     'update_pocket_coords': True,  # Joint modeling
     'freeze_pocket_embeddings': False, # No CE loss on residue classes

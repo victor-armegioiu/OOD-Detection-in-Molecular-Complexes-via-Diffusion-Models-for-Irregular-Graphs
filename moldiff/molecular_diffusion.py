@@ -702,9 +702,8 @@ class ConditionalMolecularDenoisingModel(MolecularDenoisingModel):
         batch_size = len(torch.unique(torch.cat([lig_mask, pocket_mask])))
 
         sidechain_repulsion_dict = {
-            "sidechain_coords": batch["sidechain_coords"], 
-            "sidechain_features": batch["sidechain_features"]
-
+            # "sidechain_coords": batch["sidechain_coords"], 
+            # "sidechain_features": batch["sidechain_features"]
         }
 
         # print('Feature before virtual nodes:\n', lig_features.shape, '\n', lig_coords.shape)

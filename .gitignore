@@ -1,3 +1,4 @@
+# wildcards
 __pycache__/
 wandb/
 *.out
@@ -6,17 +7,22 @@ wandb/
 *.db
 *.txt
 dataset*.pt
-datasets/
+datasets/*
 *.pdf
 *.pdb
 *.csv
 *.sdf
 *.pkl*
 *.pt
+*.json
+*.xyz
+*bayesian.db*
+*.yml
+*.png
+
+# folders
 logs/
 .vscode/
-*.json
-
 optimization_runs/
 optimization_results/
 GEMS_errors/
@@ -26,12 +32,24 @@ lkhd_results*/
 samples/
 distribution_analysis/
 combine_csvs.py
-*.xyz
-*bayesian.db*
 example_dataset/
 mini_example_dataset/
 data_extracted_graphs/
-*.png
 mini_example_dataset_samples/
-*.yml
 tmp/
+json/
+test_output/
+test_output_multiframe/
+single_use_scripts/
+.ipynb_checkpoints/
+
+# files
+analyze_molecules_old.py
+debugging.py
+distribution_comparison.py
+enhanced_likelihood.py
+
+# exceptions
+# !datasets/datasetmd_pdbbind_train.pt
+# !datasets/datasetmd_pdbbind_validation.pt
+# !datasets/training_validation_ids.json

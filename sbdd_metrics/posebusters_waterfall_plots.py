@@ -518,9 +518,11 @@ if __name__ == "__main__":
 
 # python -m sbdd_metrics.posebusters_waterfall_plots --exp_name ours_guidanceBL  ours_guidance_reworked_1cutoff_relu ours_guidance_reworked_2cutoff_relu ours_guidance_reworked_5cutoff_relu ours_guidance_reworked_10cutoff_relu --labels BL 1 2 5 10 --out ../benchmarks/posebusters_waterfall_plots --global_only
 # python -m sbdd_metrics.posebusters_waterfall_plots --exp_name ours_guidanceBL  ours_guidance_reworked_2topk ours_guidance_reworked_5topk ours_guidance_reworked_10topk --labels BL 2 5 10 --out ../benchmarks/posebusters_waterfall_plots --global_only
-# python -m sbdd_metrics.posebusters_waterfall_plots --exp_name ours_guidanceBL  ours_guidance_reworked_2neg_logsumexp ours_guidance_reworked_5neg_logsumexp ours_guidance_reworked_10neg_logsumexp --labels BL 2 5 10 --out ../benchmarks/posebusters_waterfall_plots --global_only
-
+# python -m sbdd_metrics.posebusters_waterfall_plots --exp_name ours_guidanceBL  ours_guidance_reworked_1cutoff_relu ours_guidance_reworked_2cutoff_relu ours_guidance_reworked_5cutoff_relu ours_guidance_reworked_10cutoff_relu --labels BL 1 2 5 10 --out ../benchmarks/posebusters_waterfall_plots --global_only
 # python -m sbdd_metrics.posebusters_waterfall_plots --exp_name ours_guidanceBL  ours_guidance_reworked_2neg_logsumexp ours_guidance_reworked_10neg_logsumexp ours_guidance_reworked_15neg_logsumexp ours_guidance_reworked_50neg_logsumexp --labels BL 2 10 15 30 --out ../benchmarks/posebusters_waterfall_plots --global_only
 
 
+# for report
+# python -m sbdd_metrics.posebusters_waterfall_plots --exp_name ours_guidanceBL  ours_guidance_reworked_10cutoff_relu ours_guidance_reworked_2topk ours_guidance_reworked_2neg_logsumexp --labels BL "Cutoff ReLU (10)" "TopK (2)" "Neg. LogSumExp (2)" --out ../benchmarks/posebusters_waterfall_plots --global_only
+# python -m sbdd_metrics.posebusters_waterfall_plots --exp_name ours_guidanceBL  ours_guidance_reworked_2neg_logsumexp ours_guidance_reworked_10neg_logsumexp ours_guidance_reworked_15neg_logsumexp ours_guidance_reworked_50neg_logsumexp --labels BL 2 10 15 30 --out ../benchmarks/posebusters_waterfall_plots --global_only
 # python -m sbdd_metrics.posebusters_waterfall_plots --exp_name diffsbdd_reeval drugflow pocket2mol_reeval targetdiff_reeval ours_guidanceBL PDBbind_train --labels DiffSBDD DrugFlow Pocket2Mol TargetDiff Ours PDBbind --out ../benchmarks/posebusters_waterfall_plots --global_only

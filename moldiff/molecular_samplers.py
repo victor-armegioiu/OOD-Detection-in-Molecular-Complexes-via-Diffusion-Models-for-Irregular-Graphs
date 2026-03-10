@@ -847,9 +847,14 @@ class ConditionalMolecularSdeSampler(MolecularSdeSampler):
         pocket_features = pocket_batch["pocket_features"].to(self._model.device)  # One-hot features
         pocket_mask = pocket_batch["pocket_mask"].to(self._model.device)
 
-        # for anti clash guidance we need to extract sidechain information
-        unnormalized_sidechain_coords = pocket_batch["sidechain_coords"].to(self._model.device)
-        unnormalized_sidechain_features = pocket_batch["sidechain_features"].to(self._model.device)
+        if guidance_scale > 0:
+            # for anti clash guidance we need to extract sidechain information
+            unnormalized_sidechain_coords = pocket_batch["sidechain_coords"].to(self._model.device)
+            unnormalized_sidechain_features = pocket_batch["sidechain_features"].to(self._model.device)
+        else:
+            unnormalized_sidechain_coords = None
+            unnormalized_sidechain_features = None
+
 
         # normalize pocket coordinates
         normalized_pocket_coordinates = pocket_coords / self.scheme.coord_norm
