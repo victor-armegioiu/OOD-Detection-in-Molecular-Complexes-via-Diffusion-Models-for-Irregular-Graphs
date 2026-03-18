@@ -253,6 +253,10 @@ The output JSON files contain likelihood scores and trajectory features that can
 
 ## 🛠️ Requirements
 
+### Hardware
+Both training and computation of log-likelihoods and trajectory features require a GPU with >30GB GPU memory
+
+### Software
 - Python 3.8+
 - PyTorch 1.12+ with CUDA support
 - PyTorch Geometric
