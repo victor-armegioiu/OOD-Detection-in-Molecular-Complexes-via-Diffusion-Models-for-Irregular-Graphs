@@ -89,13 +89,17 @@ Further splits the `train` dataset from [`data_split/combined_train_test_split.j
 Download the pre-processed datasets from Zenodo and place them in your working directory:
 ```bash
 # Training and validation sets
-wget https://zenodo.org/record/XXXXXXX/files/cleansplit_ood_train_combined.pt
-wget https://zenodo.org/record/XXXXXXX/files/cleansplit_ood_val_combined.pt
+wget https://zenodo.org/records/18700812/files/dataset_train.pt
+wget https://zenodo.org/records/18700812/files/dataset_val.pt
 
 # OOD test sets  
-wget https://zenodo.org/record/XXXXXXX/files/cleansplit_1nvq_test.pt
-wget https://zenodo.org/record/XXXXXXX/files/cleansplit_1sqa_test.pt
-# ... additional test sets
+wget https://zenodo.org/records/18700812/files/dataset_1nvq_test.pt
+wget https://zenodo.org/records/18700812/files/dataset_1sqa_test.pt
+wget https://zenodo.org/records/18700812/files/dataset_2p15_test.pt
+wget https://zenodo.org/records/18700812/files/dataset_2vw5_test.pt
+wget https://zenodo.org/records/18700812/files/dataset_3dd0_test.pt
+wget https://zenodo.org/records/18700812/files/dataset_3f3e_test.pt
+wget https://zenodo.org/records/18700812/files/dataset_3o9i_test.pt
 ```
 
 **Option B: Process Raw Data from Scratch**
@@ -202,9 +206,12 @@ Once you have a trained model, compute log-likelihoods and trajectory statistics
 
 **Basic usage:**
 ```bash
+# To download pretrained model checkpoint:
+wget https://zenodo.org/records/18700812/files/checkpoint_epoch_1390.pt
+
 python enhanced_likelihood.py \
-    --dataset_path dataset_1nvq_test.pt \
-    --checkpoint_path training_runs/.../checkpoint_epoch_100.pt \
+    --dataset_path example_dataset.pt \
+    --checkpoint_path checkpoint_epoch_1390.pt \
     --results_folder likelihood_results \
     --num_steps 5 \
     --num_hutchinson_samples 20

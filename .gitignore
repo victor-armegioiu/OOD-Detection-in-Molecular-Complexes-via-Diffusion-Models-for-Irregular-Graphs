@@ -5,10 +5,11 @@ wandb/
 *.sh
 *.db
 *.txt
-*.pt
 
 export/
 datasets/
+datasets_final/
+processed_graphs/
 optimization_runs/
 optimization_results/
 GEMS_errors*/
