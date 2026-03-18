@@ -230,31 +230,12 @@ The script generates a JSON file containing:
   - Curvature and smoothness indicators
   - Flow energy and Lipschitz stability estimates
 
-<!-- ### Example OOD Detection Workflow
 
-1. **Train model on in-distribution data:**
-```bash
-python main.py --mode single --train_dataset cleansplit_ood_train_combined.pt --eval_dataset cleansplit_ood_val_combined.pt --num_epochs 1500
-```
-
-2. **Compute likelihoods for test sets:**
-```bash
-# In-distribution validation set
-python enhanced_likelihood.py --dataset_path cleansplit_ood_val_combined.pt --checkpoint_path training_runs/latest/checkpoint.pt --results_folder results
-
-# OOD test sets
-for dataset in cleansplit_1nvq_test.pt cleansplit_1sqa_test.pt cleansplit_2p15_test.pt; do
-    python enhanced_likelihood.py --dataset_path $dataset --checkpoint_path training_runs/latest/checkpoint.pt --results_folder results
-done
-```
-
-3. **Analyze results:**
-The output JSON files contain likelihood scores and trajectory features that can be used to train binary OOD classifiers or compute ROC curves for evaluation. -->
 
 ## 🛠️ Requirements
 
-### Hardware
-Both training and computation of log-likelihoods and trajectory features require a GPU with >30GB GPU memory
+### Hardware and Expected Run Time
+Both training and computation of log-likelihoods and trajectory features require a GPU with >30GB GPU memory. Using the provided training dataset and the default hyperparameters, training will take 1-3 days to reach the level of our model (recommended: download  [pretrained model](https://doi.org/10.5281/zenodo.18700811). Computation of log-likelihoods currently takes several hours for 100 samples, depending on complex sizes. We provide all computed metrics on [Zenodo](https://doi.org/10.5281/zenodo.18700811) (json files).
 
 ### Software
 - Python 3.8+
