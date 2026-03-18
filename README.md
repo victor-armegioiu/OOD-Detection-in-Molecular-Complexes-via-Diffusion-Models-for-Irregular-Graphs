@@ -261,10 +261,44 @@ Both training and computation of log-likelihoods and trajectory features require
 - PyTorch 1.12+ with CUDA support
 - PyTorch Geometric
 - openbabel (conda install openbabel -c conda-forge)
-- Additional dependencies: numpy, scipy, matplotlib, wandb, optuna
+- Additional dependencies: numpy, scipy
 
-**Additionally for graph construction from structure files**:
-- gemmi (0.7.0)
+**Optional**:
+- wandb (for tracking)
+- optuna (for running bayesian optimization)
+- matplotlib (for plotting results with [`distribution_comparison.py`](distribution_comparison.py))
+- gemmi (for graph construction from structure files)
+
+### Tested versions:
+
+The code was tested using the following versions
+
+**For graph construction**:
+- Python (3.10.13)
+- PyTorch (2.7.0)
+- PyTorch Geometric (2.6.1)
+- numpy (1.26.4)
+- gemmi (0.7.0) 
+
+**For training**:
+- Python 3.10.16
+- PyTorch 2.0.1 (with CUDA 11.8)
+- PyTorch Geometric (2.6.1)
+- openbabel (3.1.1)
+- numpy (1.22.4)
+- scipy (1.7.3)
+- wandb (0.13.1)
+- optuna (4.4.0)
+
+**For inference and computation of trajectory features**:
+- Python 3.12.11
+- PyTorch 2.5.1 (with CUDA 12.1)
+- PyTorch Geometric (2.6.1)
+- numpy (2.3.3)
+- scipy (1.16.1)
+
+
+
 
 ## 📄 Citation
 
