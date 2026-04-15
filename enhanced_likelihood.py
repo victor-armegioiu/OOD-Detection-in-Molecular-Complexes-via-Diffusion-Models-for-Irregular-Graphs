@@ -1137,10 +1137,10 @@ if __name__ == '__main__':
     # test_trajectory_ood_detection()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset_path', default='dataset_cleansplit_train.pt', type=str)
-    parser.add_argument('--checkpoint_path', default='training_runs/0725_115513_dataset_cleansplit_train/checkpoint_epoch_579.pt', type=str)
+    parser.add_argument('--dataset_path', default='example_dataset.pt', type=str)
+    parser.add_argument('--checkpoint_path', default='checkpoint_epoch_1390.pt', type=str)
     parser.add_argument('--results_folder', default='likelihood_results', type=str)
-    parser.add_argument('--num_steps', type=int, default=10)
+    parser.add_argument('--num_steps', type=int, default=5)
     parser.add_argument('--num_hutchinson_samples', type=int, default=20)
     parser.add_argument('--start_idx', type=int, default=None, help='Start index for dataset slicing (inclusive)')
     parser.add_argument('--stop_idx', type=int, default=None, help='Stop index for dataset slicing (exclusive)')
